@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::ir::{FunctionIr, ModuleIr};
+use crate::ir::{FunctionIr, NormalizedModule};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FunctionMatch {
@@ -27,7 +27,7 @@ pub enum MatchReason {
     SameCanonicalBodyHash,
 }
 
-pub fn match_functions(old: &ModuleIr, new: &ModuleIr) -> Vec<FunctionMatch> {
+pub fn match_functions(old: &NormalizedModule, new: &NormalizedModule) -> Vec<FunctionMatch> {
     let mut matches = Vec::new();
     let mut matched_old = BTreeSet::new();
     let mut matched_new = BTreeSet::new();
@@ -83,7 +83,10 @@ pub fn match_functions(old: &ModuleIr, new: &ModuleIr) -> Vec<FunctionMatch> {
     matches
 }
 
-pub fn unmatched_old_function_ids(old: &ModuleIr, matches: &[FunctionMatch]) -> Vec<String> {
+pub fn unmatched_old_function_ids(
+    old: &NormalizedModule,
+    matches: &[FunctionMatch],
+) -> Vec<String> {
     let matched = matches
         .iter()
         .map(|function_match| function_match.old_id.as_str())
@@ -96,7 +99,10 @@ pub fn unmatched_old_function_ids(old: &ModuleIr, matches: &[FunctionMatch]) -> 
         .collect()
 }
 
-pub fn unmatched_new_function_ids(new: &ModuleIr, matches: &[FunctionMatch]) -> Vec<String> {
+pub fn unmatched_new_function_ids(
+    new: &NormalizedModule,
+    matches: &[FunctionMatch],
+) -> Vec<String> {
     let matched = matches
         .iter()
         .map(|function_match| function_match.new_id.as_str())
@@ -111,8 +117,8 @@ pub fn unmatched_new_function_ids(new: &ModuleIr, matches: &[FunctionMatch]) -> 
 
 #[allow(clippy::too_many_arguments)]
 fn match_by_key(
-    old: &ModuleIr,
-    new: &ModuleIr,
+    old: &NormalizedModule,
+    new: &NormalizedModule,
     key: impl Fn(&FunctionIr) -> Option<String>,
     reason: MatchReason,
     confidence: f32,
@@ -150,7 +156,7 @@ fn match_by_key(
 }
 
 fn unique_candidates(
-    module: &ModuleIr,
+    module: &NormalizedModule,
     key: &impl Fn(&FunctionIr) -> Option<String>,
     already_matched: &BTreeSet<usize>,
 ) -> BTreeMap<String, usize> {
@@ -197,7 +203,14 @@ fn function_similarity(old: &FunctionIr, new: &FunctionIr) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{match_functions, unmatched_new_function_ids, MatchReason};
+    use crate::normalize::normalize_module;
     use crate::parse::parse_module;
+    use crate::resolve::resolve_module;
+
+    fn normalized(bytes: &[u8]) -> crate::ir::NormalizedModule {
+        let resolved = resolve_module(parse_module(bytes).unwrap());
+        normalize_module(&resolved)
+    }
 
     fn make_simple_wasm(with_import: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -223,8 +236,8 @@ mod tests {
 
     #[test]
     fn matches_canonical_fixture_by_stable_id_not_source_index() {
-        let old_module = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let new_module = parse_module(include_bytes!("../tests/fixtures/new.wasm")).unwrap();
+        let old_module = normalized(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = normalized(include_bytes!("../tests/fixtures/new.wasm"));
 
         let matches = match_functions(&old_module, &new_module);
 
@@ -240,8 +253,8 @@ mod tests {
         let no_import = make_simple_wasm(false);
         let with_import = make_simple_wasm(true);
 
-        let mod_no_import = parse_module(&no_import).unwrap();
-        let mod_with_import = parse_module(&with_import).unwrap();
+        let mod_no_import = normalized(&no_import);
+        let mod_with_import = normalized(&with_import);
 
         let matches = match_functions(&mod_no_import, &mod_with_import);
 

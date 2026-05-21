@@ -1,9 +1,12 @@
+pub mod analysis;
 mod diff;
 mod fingerprint;
 pub mod ir;
 mod matcher;
+mod normalize;
 pub mod parse;
 mod report;
+mod resolve;
 
 use std::io::Read;
 
@@ -52,13 +55,15 @@ fn cmd_inspect(args: &[String]) {
         std::process::exit(1);
     }
 
-    let module = match parse::parse_module(&bytes) {
-        Ok(m) => m,
+    let parsed = match parse::parse_module(&bytes) {
+        Ok(module) => module,
         Err(err) => {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
     };
+    let resolved = resolve::resolve_module(parsed);
+    let module = normalize::normalize_module(&resolved);
 
     let json = report::inspect_json(&module);
     println!("{json}");
@@ -103,7 +108,7 @@ fn parse_diff_format(args: &[String]) -> String {
     }
 }
 
-fn read_module(filepath: &str) -> ir::ModuleIr {
+fn read_module(filepath: &str) -> ir::NormalizedModule {
     let mut file = match std::fs::File::open(filepath) {
         Ok(f) => f,
         Err(err) => {
@@ -119,7 +124,10 @@ fn read_module(filepath: &str) -> ir::ModuleIr {
     }
 
     match parse::parse_module(&bytes) {
-        Ok(module) => module,
+        Ok(parsed) => {
+            let resolved = resolve::resolve_module(parsed);
+            normalize::normalize_module(&resolved)
+        }
         Err(err) => {
             eprintln!("error: {err}");
             std::process::exit(1);

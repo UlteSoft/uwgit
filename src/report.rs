@@ -176,27 +176,26 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
             for operator in &function.operators {
                 match operator {
                     OperatorDelta::Replace { index, old, new } => lines.push(format!(
-                        "    {} {}",
+                        "    {} op[{}]: {} -> {}",
                         "~".yellow(),
-                        format!(
-                            "op[{}]: {} -> {}",
-                            index,
-                            old.text.as_str().red(),
-                            new.text.as_str().green()
-                        )
+                        index,
+                        old.text.as_str().red(),
+                        new.text.as_str().green()
                     )),
                     OperatorDelta::Insert { index, operator } => {
                         lines.push(format!(
-                            "    {} {}",
+                            "    {} op[{}]: {}",
                             "+".green(),
-                            format!("op[{}]: {}", index, operator.text)
+                            index,
+                            operator.text
                         ));
                     }
                     OperatorDelta::Delete { index, operator } => {
                         lines.push(format!(
-                            "    {} {}",
+                            "    {} op[{}]: {}",
                             "-".red(),
-                            format!("op[{}]: {}", index, operator.text)
+                            index,
+                            operator.text
                         ));
                     }
                 }
@@ -209,12 +208,19 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
 mod tests {
     use super::{diff_json, diff_text};
     use crate::diff::diff_modules;
+    use crate::normalize::normalize_module;
     use crate::parse::parse_module;
+    use crate::resolve::resolve_module;
+
+    fn normalized(bytes: &[u8]) -> crate::ir::NormalizedModule {
+        let resolved = resolve_module(parse_module(bytes).unwrap());
+        normalize_module(&resolved)
+    }
 
     #[test]
     fn renders_canonical_text_and_json_diff() {
-        let old_module = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let new_module = parse_module(include_bytes!("../tests/fixtures/new.wasm")).unwrap();
+        let old_module = normalized(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = normalized(include_bytes!("../tests/fixtures/new.wasm"));
         let report = diff_modules("old.wasm", &old_module, "new.wasm", &new_module);
 
         // make sure color codes are stripped from the output for test

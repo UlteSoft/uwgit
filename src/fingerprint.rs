@@ -1,11 +1,14 @@
 //! Deterministic function fingerprints for exact-body and canonical-body matching.
 //! Used as input to the matcher module for stable diff comparison.
+//!
+//! Phase 1: fingerprint calculation now uses typed ParsedOperator (Opcode + Immediate)
+//! instead of parsing wasmparser Debug strings.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ir::{FunctionIr, FunctionKindIr, ModuleIr};
+use crate::ir::{FunctionIr, FunctionKindIr, Immediate, ModuleIr, ParsedOperator, ResolvedModule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct FingerprintHash(#[serde(serialize_with = "serialize_fingerprint_hash")] u64);
@@ -45,11 +48,11 @@ pub struct StableFuncRef {
     pub stable_id: String,
 }
 
-pub fn module_fingerprints(module: &ModuleIr) -> Vec<FuncFingerprint> {
+pub fn module_fingerprints(module: &ResolvedModule) -> Vec<FuncFingerprint> {
     module
         .functions
         .iter()
-        .map(|function| function_fingerprint(module, function))
+        .map(|function| function_fingerprint(&module.module, function))
         .collect()
 }
 
@@ -101,7 +104,7 @@ fn exact_body_hash(function: &FunctionIr) -> FingerprintHash {
         function
             .operators
             .iter()
-            .map(|operator| format!("op:{}", operator.text)),
+            .map(|operator| format!("op:{}", operator.display_text())),
     );
     hash_owned_parts(parts)
 }
@@ -117,27 +120,31 @@ fn canonical_body_hash(module: &ModuleIr, function: &FunctionIr) -> FingerprintH
     parts.extend(function.operators.iter().map(|operator| {
         format!(
             "op:{}:{}",
-            operator.kind,
-            canonical_operator_text(module, &operator.text)
+            operator.opcode.as_str(),
+            canonical_operator_text(module, operator)
         )
     }));
     hash_owned_parts(parts)
 }
 
-fn canonical_operator_text(module: &ModuleIr, text: &str) -> String {
-    match parse_call_target(text) {
-        Some(index) => module.functions.get(index as usize).map_or_else(
-            || "Call { function: <unresolved> }".to_owned(),
+/// Produce canonical text for an operator's immediate, replacing
+/// raw call target indices with stable function IDs.
+fn canonical_operator_text(module: &ModuleIr, operator: &ParsedOperator) -> String {
+    match &operator.immediate {
+        Immediate::Call(index) => module.functions.get(*index as usize).map_or_else(
+            || format!("function_index:{index}"),
             |target| format!("Call {{ function: {} }}", target.id),
         ),
-        None => text.to_owned(),
+        immediate => immediate.as_hash_text(),
     }
 }
 
 fn opcode_histogram(function: &FunctionIr) -> Vec<OpcodeCount> {
     let mut counts = BTreeMap::<String, u32>::new();
     for operator in &function.operators {
-        *counts.entry(operator.kind.clone()).or_default() += 1;
+        *counts
+            .entry(operator.opcode.as_str().to_owned())
+            .or_default() += 1;
     }
     counts
         .into_iter()
@@ -157,12 +164,6 @@ fn direct_call_targets(module: &ModuleIr, function: &FunctionIr) -> Vec<StableFu
     targets.sort();
     targets.dedup();
     targets
-}
-
-fn parse_call_target(text: &str) -> Option<u32> {
-    let rest = text.strip_prefix("Call { function_index: ")?;
-    let index = rest.strip_suffix(" }")?;
-    index.parse().ok()
 }
 
 fn hash_owned_parts(parts: Vec<String>) -> FingerprintHash {
@@ -187,6 +188,11 @@ fn hash_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> FingerprintHash {
 mod tests {
     use super::{function_fingerprint, module_fingerprints};
     use crate::parse::parse_module;
+    use crate::resolve::resolve_module;
+
+    fn resolved(bytes: &[u8]) -> crate::ir::ResolvedModule {
+        resolve_module(parse_module(bytes).unwrap())
+    }
 
     fn make_simple_wasm(with_import: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -212,19 +218,19 @@ mod tests {
 
     #[test]
     fn fingerprints_are_deterministic_for_canonical_fixtures() {
-        let first = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let second = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
+        let first = resolved(include_bytes!("../tests/fixtures/old.wasm"));
+        let second = resolved(include_bytes!("../tests/fixtures/old.wasm"));
 
         assert_eq!(module_fingerprints(&first), module_fingerprints(&second));
     }
 
     #[test]
     fn exact_and_canonical_body_hashes_detect_fixture_delta() {
-        let old_module = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let new_module = parse_module(include_bytes!("../tests/fixtures/new.wasm")).unwrap();
+        let old_module = resolved(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = resolved(include_bytes!("../tests/fixtures/new.wasm"));
 
-        let old_fingerprint = function_fingerprint(&old_module, &old_module.functions[0]);
-        let new_fingerprint = function_fingerprint(&new_module, &new_module.functions[0]);
+        let old_fingerprint = function_fingerprint(&old_module.module, &old_module.functions[0]);
+        let new_fingerprint = function_fingerprint(&new_module.module, &new_module.functions[0]);
 
         assert_eq!(old_fingerprint.stable_id, new_fingerprint.stable_id);
         assert_eq!(old_fingerprint.type_sig_hash, new_fingerprint.type_sig_hash);
@@ -240,8 +246,8 @@ mod tests {
 
     #[test]
     fn exported_function_stable_id_ignores_source_index_and_body_change() {
-        let old_module = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let new_module = parse_module(include_bytes!("../tests/fixtures/new.wasm")).unwrap();
+        let old_module = resolved(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = resolved(include_bytes!("../tests/fixtures/new.wasm"));
 
         assert_eq!(old_module.functions[0].source_index, 0);
         assert_eq!(new_module.functions[0].source_index, 0);
@@ -257,11 +263,12 @@ mod tests {
         let no_import = make_simple_wasm(false);
         let with_import = make_simple_wasm(true);
 
-        let mod_no_import = parse_module(&no_import).unwrap();
-        let mod_with_import = parse_module(&with_import).unwrap();
+        let mod_no_import = resolved(&no_import);
+        let mod_with_import = resolved(&with_import);
 
-        let fp_no_import = function_fingerprint(&mod_no_import, &mod_no_import.functions[0]);
-        let fp_with_import = function_fingerprint(&mod_with_import, &mod_with_import.functions[1]);
+        let fp_no_import = function_fingerprint(&mod_no_import.module, &mod_no_import.functions[0]);
+        let fp_with_import =
+            function_fingerprint(&mod_with_import.module, &mod_with_import.functions[1]);
 
         assert_eq!(fp_no_import.stable_id, fp_with_import.stable_id);
         assert_eq!(fp_no_import.stable_id, "func:export:add:type:i32,i32->i32");
@@ -284,8 +291,8 @@ mod tests {
     #[test]
     fn fingerprint_determinism_regression() {
         let bytes = make_simple_wasm(true);
-        let first = parse_module(&bytes).unwrap();
-        let second = parse_module(&bytes).unwrap();
+        let first = resolved(&bytes);
+        let second = resolved(&bytes);
 
         let fp_first = module_fingerprints(&first);
         let fp_second = module_fingerprints(&second);

@@ -1,11 +1,14 @@
 //! Module-, function-, and operator-level diff engine.
-//! Consumes matched function pairs and produces structured deltas.
+//! Consumes Normalized Diff IR and produces structured deltas.
+//!
+//! Phase 1: diff operators now compare using typed ParsedOperator
+//! (Opcode + Immediate) instead of string-based OperatorIr.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ir::{ExportIr, FunctionIr, ImportIr, ModuleIr, OperatorIr, TypeIr};
+use crate::ir::{ExportIr, FunctionIr, ImportIr, NormalizedModule, ParsedOperator, TypeIr};
 use crate::matcher::{
     match_functions, unmatched_new_function_ids, unmatched_old_function_ids, FunctionMatch,
 };
@@ -84,7 +87,12 @@ pub struct OperatorRecord {
     pub text: String,
 }
 
-pub fn diff_modules(old_name: &str, old: &ModuleIr, new_name: &str, new: &ModuleIr) -> DiffReport {
+pub fn diff_modules(
+    old_name: &str,
+    old: &NormalizedModule,
+    new_name: &str,
+    new: &NormalizedModule,
+) -> DiffReport {
     let function_matches = match_functions(old, new);
     let mut changes = Vec::new();
 
@@ -168,19 +176,20 @@ fn diff_function(old: &FunctionIr, new: &FunctionIr) -> Option<FunctionDelta> {
     })
 }
 
-fn diff_operators(old: &[OperatorIr], new: &[OperatorIr]) -> Vec<OperatorDelta> {
-    // Compare operators by kind+text, intentionally ignoring `offset` which
-    // differs between old and new binaries even for identical instructions.
-    let old_keys: Vec<(&str, &str)> = old
+fn diff_operators(old: &[ParsedOperator], new: &[ParsedOperator]) -> Vec<OperatorDelta> {
+    let old_keys: Vec<(&str, String)> = old
         .iter()
-        .map(|op| (op.kind.as_str(), op.text.as_str()))
+        .map(|op| (op.opcode.as_str(), op.display_text()))
         .collect();
-    let new_keys: Vec<(&str, &str)> = new
+    let new_keys: Vec<(&str, String)> = new
         .iter()
-        .map(|op| (op.kind.as_str(), op.text.as_str()))
+        .map(|op| (op.opcode.as_str(), op.display_text()))
         .collect();
 
-    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &old_keys, &new_keys);
+    let old_cmp: Vec<(&str, &str)> = old_keys.iter().map(|(k, t)| (*k, t.as_str())).collect();
+    let new_cmp: Vec<(&str, &str)> = new_keys.iter().map(|(k, t)| (*k, t.as_str())).collect();
+
+    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &old_cmp, &new_cmp);
 
     let mut deltas = Vec::new();
     for op in ops {
@@ -189,20 +198,20 @@ fn diff_operators(old: &[OperatorIr], new: &[OperatorIr]) -> Vec<OperatorDelta> 
             similar::DiffOp::Delete {
                 old_index, old_len, ..
             } => {
-                for i in old_index..old_index + old_len {
+                for (i, operator) in old.iter().enumerate().skip(old_index).take(old_len) {
                     deltas.push(OperatorDelta::Delete {
                         index: i,
-                        operator: operator_record(&old[i]),
+                        operator: operator_record(operator),
                     });
                 }
             }
             similar::DiffOp::Insert {
                 new_index, new_len, ..
             } => {
-                for i in new_index..new_index + new_len {
+                for (i, operator) in new.iter().enumerate().skip(new_index).take(new_len) {
                     deltas.push(OperatorDelta::Insert {
                         index: i,
-                        operator: operator_record(&new[i]),
+                        operator: operator_record(operator),
                     });
                 }
             }
@@ -238,11 +247,11 @@ fn diff_operators(old: &[OperatorIr], new: &[OperatorIr]) -> Vec<OperatorDelta> 
     deltas
 }
 
-fn operator_record(operator: &OperatorIr) -> OperatorRecord {
+fn operator_record(operator: &ParsedOperator) -> OperatorRecord {
     OperatorRecord {
         offset: operator.offset,
-        opcode: operator.kind.clone(),
-        text: operator.text.clone(),
+        opcode: operator.opcode.as_str().to_owned(),
+        text: operator.display_text(),
     }
 }
 
@@ -321,12 +330,19 @@ fn summarize(changes: &[DiffChange]) -> DiffSummary {
 #[cfg(test)]
 mod tests {
     use super::{diff_modules, DiffChange, OperatorDelta};
+    use crate::normalize::normalize_module;
     use crate::parse::parse_module;
+    use crate::resolve::resolve_module;
+
+    fn normalized_fixture(bytes: &[u8]) -> crate::ir::NormalizedModule {
+        let resolved = resolve_module(parse_module(bytes).unwrap());
+        normalize_module(&resolved)
+    }
 
     #[test]
     fn reports_canonical_fixture_as_single_operator_replacement() {
-        let old_module = parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap();
-        let new_module = parse_module(include_bytes!("../tests/fixtures/new.wasm")).unwrap();
+        let old_module = normalized_fixture(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = normalized_fixture(include_bytes!("../tests/fixtures/new.wasm"));
 
         let report = diff_modules("old.wasm", &old_module, "new.wasm", &new_module);
 
