@@ -382,7 +382,11 @@ fn direct_call_similarity(old: &FunctionIr, new: &FunctionIr) -> f32 {
     let old_histogram = item_histogram(&old.direct_calls);
     let new_histogram = item_histogram(&new.direct_calls);
 
-    histogram_similarity(&old_histogram, &new_histogram, old.direct_calls.len().max(new.direct_calls.len()))
+    histogram_similarity(
+        &old_histogram,
+        &new_histogram,
+        old.direct_calls.len().max(new.direct_calls.len()),
+    )
 }
 
 fn item_histogram<T: Clone + Ord>(items: &[T]) -> BTreeMap<T, usize> {
@@ -467,13 +471,12 @@ fn immediate_histogram(
 
 fn opcode_histogram_key(module: &NormalizedModule, operator: &ParsedOperator) -> String {
     match &operator.immediate {
-        Immediate::Call(index) | Immediate::RefFunc(index) => module
-            .functions
-            .get(*index as usize)
-            .map_or_else(
+        Immediate::Call(index) | Immediate::RefFunc(index) => {
+            module.functions.get(*index as usize).map_or_else(
                 || format!("{}:function_index:{index}", operator.opcode.as_str()),
                 |target| format!("{}:{}", operator.opcode.as_str(), target.id),
-            ),
+            )
+        }
         _ => operator.opcode.as_str().to_owned(),
     }
 }
@@ -482,13 +485,12 @@ fn immediate_histogram_key(module: &NormalizedModule, operator: &ParsedOperator)
     let opcode = operator.opcode.as_str();
     match &operator.immediate {
         Immediate::None => opcode.to_owned(),
-        Immediate::Call(index) | Immediate::RefFunc(index) => module
-            .functions
-            .get(*index as usize)
-            .map_or_else(
+        Immediate::Call(index) | Immediate::RefFunc(index) => {
+            module.functions.get(*index as usize).map_or_else(
                 || format!("{opcode}:function_index:{index}"),
                 |target| format!("{opcode}:{}", target.id),
-            ),
+            )
+        }
         immediate => format!("{opcode}:{}", immediate.as_hash_text()),
     }
 }
@@ -588,8 +590,8 @@ mod tests {
         bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
         bytes.extend_from_slice(&[
-            0x02, 0x11, 0x02, 0x03, b'e', b'n', b'v', 0x01, b'a', 0x00, 0x00, 0x03, b'e',
-            b'n', b'v', 0x01, b'b', 0x00, 0x00,
+            0x02, 0x11, 0x02, 0x03, b'e', b'n', b'v', 0x01, b'a', 0x00, 0x00, 0x03, b'e', b'n',
+            b'v', 0x01, b'b', 0x00, 0x00,
         ]);
         bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
         let target = if call_first_import { 0x00 } else { 0x01 };
@@ -670,7 +672,9 @@ mod tests {
         let matches = match_functions(&old_module, &new_module);
 
         assert_eq!(matches.len(), 2);
-        assert!(matches.iter().any(|m| m.reason == MatchReason::SimilarityFallback));
+        assert!(matches
+            .iter()
+            .any(|m| m.reason == MatchReason::SimilarityFallback));
         assert!(unmatched_new_function_ids(&new_module, &matches).is_empty());
     }
 
@@ -707,7 +711,9 @@ mod tests {
         let matches = match_functions(&old_module, &new_module);
 
         assert_eq!(matches.len(), 2);
-        assert!(matches.iter().all(|m| m.reason == MatchReason::SameStableId));
+        assert!(matches
+            .iter()
+            .all(|m| m.reason == MatchReason::SameStableId));
         assert_eq!(unmatched_new_function_ids(&new_module, &matches).len(), 1);
     }
 
