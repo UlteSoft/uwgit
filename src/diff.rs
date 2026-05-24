@@ -128,17 +128,17 @@ pub fn diff_modules(
     let old_functions = old
         .functions
         .iter()
-        .map(|function| (function.id.as_str(), function))
+        .map(|function| (function.source_index, function))
         .collect::<BTreeMap<_, _>>();
     let new_functions = new
         .functions
         .iter()
-        .map(|function| (function.id.as_str(), function))
+        .map(|function| (function.source_index, function))
         .collect::<BTreeMap<_, _>>();
 
     for function_match in &function_matches {
-        let old_function = old_functions[function_match.old_id.as_str()];
-        let new_function = new_functions[function_match.new_id.as_str()];
+        let old_function = old_functions[&function_match.old_source_index];
+        let new_function = new_functions[&function_match.new_source_index];
         if let Some(function_delta) = diff_function(old_function, new_function) {
             changes.push(DiffChange::FunctionChanged {
                 function: function_delta,
@@ -339,6 +339,16 @@ mod tests {
         normalize_module(&resolved)
     }
 
+    fn duplicate_empty_functions_wasm() -> Vec<u8> {
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: [] -> []
+            0x03, 0x04, 0x03, 0x00, 0x00, 0x00, // three defined funcs
+            0x0a, 0x0a, 0x03, // code section, three bodies
+            0x02, 0x00, 0x0b, 0x02, 0x00, 0x0b, 0x02, 0x00, 0x0b,
+        ]
+    }
+
     #[test]
     fn reports_canonical_fixture_as_single_operator_replacement() {
         let old_module = normalized_fixture(include_bytes!("../tests/fixtures/old.wasm"));
@@ -370,5 +380,20 @@ mod tests {
         assert_eq!(*index, 1);
         assert_eq!(old.text, "LocalGet { local_index: 1 }");
         assert_eq!(new.text, "I32Const { value: 1 }");
+    }
+
+    #[test]
+    fn reports_no_function_churn_for_identical_duplicate_functions() {
+        let wasm = duplicate_empty_functions_wasm();
+        let old_module = normalized_fixture(&wasm);
+        let new_module = normalized_fixture(&wasm);
+
+        let report = diff_modules("same.wasm", &old_module, "same.wasm", &new_module);
+
+        assert_eq!(report.summary.functions_added, 0);
+        assert_eq!(report.summary.functions_removed, 0);
+        assert_eq!(report.summary.functions_changed, 0);
+        assert_eq!(report.function_matches.len(), 3);
+        assert!(report.changes.is_empty());
     }
 }

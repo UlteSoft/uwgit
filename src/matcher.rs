@@ -79,6 +79,8 @@ pub fn match_functions(old: &NormalizedModule, new: &NormalizedModule) -> Vec<Fu
         left.old_id
             .cmp(&right.old_id)
             .then_with(|| left.new_id.cmp(&right.new_id))
+            .then_with(|| left.old_source_index.cmp(&right.old_source_index))
+            .then_with(|| left.new_source_index.cmp(&right.new_source_index))
     });
     matches
 }
@@ -89,12 +91,12 @@ pub fn unmatched_old_function_ids(
 ) -> Vec<String> {
     let matched = matches
         .iter()
-        .map(|function_match| function_match.old_id.as_str())
+        .map(|function_match| function_match.old_source_index)
         .collect::<BTreeSet<_>>();
 
     old.functions
         .iter()
-        .filter(|function| !matched.contains(function.id.as_str()))
+        .filter(|function| !matched.contains(&function.source_index))
         .map(|function| function.id.clone())
         .collect()
 }
@@ -105,12 +107,12 @@ pub fn unmatched_new_function_ids(
 ) -> Vec<String> {
     let matched = matches
         .iter()
-        .map(|function_match| function_match.new_id.as_str())
+        .map(|function_match| function_match.new_source_index)
         .collect::<BTreeSet<_>>();
 
     new.functions
         .iter()
-        .filter(|function| !matched.contains(function.id.as_str()))
+        .filter(|function| !matched.contains(&function.source_index))
         .map(|function| function.id.clone())
         .collect()
 }
@@ -126,40 +128,42 @@ fn match_by_key(
     matched_new: &mut BTreeSet<usize>,
     matches: &mut Vec<FunctionMatch>,
 ) {
-    let old_candidates = unique_candidates(old, &key, matched_old);
-    let new_candidates = unique_candidates(new, &key, matched_new);
+    let old_candidates = grouped_candidates(old, &key, matched_old);
+    let new_candidates = grouped_candidates(new, &key, matched_new);
 
-    for (candidate_key, old_index) in old_candidates {
-        let Some(new_index) = new_candidates.get(&candidate_key) else {
+    for (candidate_key, old_indices) in old_candidates {
+        let Some(new_indices) = new_candidates.get(&candidate_key) else {
             continue;
         };
-        if matched_old.contains(&old_index) || matched_new.contains(new_index) {
-            continue;
+        for (old_index, new_index) in old_indices.iter().zip(new_indices) {
+            if matched_old.contains(old_index) || matched_new.contains(new_index) {
+                continue;
+            }
+
+            let old_function = &old.functions[*old_index];
+            let new_function = &new.functions[*new_index];
+            let similarity = function_similarity(old_function, new_function);
+
+            matched_old.insert(*old_index);
+            matched_new.insert(*new_index);
+            matches.push(FunctionMatch {
+                old_id: old_function.id.clone(),
+                new_id: new_function.id.clone(),
+                old_source_index: old_function.source_index,
+                new_source_index: new_function.source_index,
+                confidence,
+                similarity,
+                reason,
+            });
         }
-
-        let old_function = &old.functions[old_index];
-        let new_function = &new.functions[*new_index];
-        let similarity = function_similarity(old_function, new_function);
-
-        matched_old.insert(old_index);
-        matched_new.insert(*new_index);
-        matches.push(FunctionMatch {
-            old_id: old_function.id.clone(),
-            new_id: new_function.id.clone(),
-            old_source_index: old_function.source_index,
-            new_source_index: new_function.source_index,
-            confidence,
-            similarity,
-            reason,
-        });
     }
 }
 
-fn unique_candidates(
+fn grouped_candidates(
     module: &NormalizedModule,
     key: &impl Fn(&FunctionIr) -> Option<String>,
     already_matched: &BTreeSet<usize>,
-) -> BTreeMap<String, usize> {
+) -> BTreeMap<String, Vec<usize>> {
     let mut candidates = BTreeMap::<String, Vec<usize>>::new();
     for (index, function) in module.functions.iter().enumerate() {
         if already_matched.contains(&index) {
@@ -171,15 +175,6 @@ fn unique_candidates(
     }
 
     candidates
-        .into_iter()
-        .filter_map(|(candidate_key, indices)| {
-            if indices.len() == 1 {
-                Some((candidate_key, indices[0]))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn function_similarity(old: &FunctionIr, new: &FunctionIr) -> f32 {
@@ -234,6 +229,16 @@ mod tests {
         bytes
     }
 
+    fn make_duplicate_empty_functions_wasm() -> Vec<u8> {
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: [] -> []
+            0x03, 0x04, 0x03, 0x00, 0x00, 0x00, // three defined funcs
+            0x0a, 0x0a, 0x03, // code section, three bodies
+            0x02, 0x00, 0x0b, 0x02, 0x00, 0x0b, 0x02, 0x00, 0x0b,
+        ]
+    }
+
     #[test]
     fn matches_canonical_fixture_by_stable_id_not_source_index() {
         let old_module = normalized(include_bytes!("../tests/fixtures/old.wasm"));
@@ -279,5 +284,23 @@ mod tests {
             unmatched_new[0].starts_with("import:"),
             "the unmatched function should be the import"
         );
+    }
+
+    #[test]
+    fn matches_duplicate_stable_ids_by_occurrence() {
+        let wasm = make_duplicate_empty_functions_wasm();
+        let old_module = normalized(&wasm);
+        let new_module = normalized(&wasm);
+
+        let matches = match_functions(&old_module, &new_module);
+
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].old_source_index, 0);
+        assert_eq!(matches[0].new_source_index, 0);
+        assert_eq!(matches[1].old_source_index, 1);
+        assert_eq!(matches[1].new_source_index, 1);
+        assert_eq!(matches[2].old_source_index, 2);
+        assert_eq!(matches[2].new_source_index, 2);
+        assert!(unmatched_new_function_ids(&new_module, &matches).is_empty());
     }
 }
