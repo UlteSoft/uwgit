@@ -128,6 +128,44 @@ fn cli_diff_json_shows_structured_output() {
 }
 
 #[test]
+fn cli_diff_short_shows_compact_summary() {
+    let output = Command::new(wasm_git_bin())
+        .args([
+            "diff",
+            &fixture_path("old.wasm"),
+            &fixture_path("new.wasm"),
+            "--short",
+        ])
+        .output()
+        .expect("failed to execute wasm-git diff --short");
+    assert!(output.status.success(), "diff --short should exit 0");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("1 matched, 1 changed"));
+    assert!(stdout.contains("changes: 1 total, 1 functions"));
+    assert!(!stdout.contains("Function matches:"));
+    assert!(!stdout.contains("~ op[1]:"));
+}
+
+#[test]
+fn cli_diff_short_overrides_json_format() {
+    let output = Command::new(wasm_git_bin())
+        .args([
+            "diff",
+            &fixture_path("old.wasm"),
+            &fixture_path("new.wasm"),
+            "--format",
+            "json",
+            "--short",
+        ])
+        .output()
+        .expect("failed to execute wasm-git diff --format json --short");
+    assert!(output.status.success(), "diff --short should exit 0");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Summary:"));
+    assert!(!stdout.contains(r#""function_matches""#));
+}
+
+#[test]
 fn cli_inspect_malformed_bytes_prints_error() {
     let dir = std::env::temp_dir();
     let bad_path = dir.join("wasm-git-test-bad.wasm");

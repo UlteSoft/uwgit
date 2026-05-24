@@ -24,6 +24,8 @@ struct DiffArgs {
     new_path: String,
     #[arg(long, value_enum, default_value_t = DiffFormat::Text)]
     format: DiffFormat,
+    #[arg(long)]
+    short: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -115,6 +117,11 @@ fn cmd_diff(args: &[String]) {
     let new_module = read_module(&parsed.new_path);
     let report = diff::diff_modules(&parsed.old_path, &old_module, &parsed.new_path, &new_module);
 
+    if parsed.short {
+        println!("{}", report::diff_short(&report));
+        return;
+    }
+
     match parsed.format {
         DiffFormat::Text => println!("{}", report::diff_text(&report)),
         DiffFormat::Json => println!("{}", report::diff_json(&report)),
@@ -126,7 +133,7 @@ fn print_usage_and_exit() -> ! {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  inspect <FILE> [--json]  Print a deterministic JSON module summary");
-    eprintln!("  diff    <OLD> <NEW> --format text|json  Compare two Wasm modules");
+    eprintln!("  diff    <OLD> <NEW> [--short] [--format text|json]  Compare two Wasm modules");
     std::process::exit(1);
 }
 

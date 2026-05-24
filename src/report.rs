@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::diff::{DiffChange, DiffReport, OperatorDelta};
 use crate::ir::ModuleIr;
+use crate::matcher::MatchReason;
 
 #[derive(Serialize)]
 struct InspectOutput<'a> {
@@ -62,6 +63,80 @@ pub fn diff_text(report: &DiffReport) -> String {
         report.old,
         report.new
     ));
+    push_summary_lines(report, &mut lines);
+
+    lines.push(format!("{}", "Function matches:".bold()));
+    if report.function_matches.is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        for function_match in &report.function_matches {
+            lines.push(format!(
+                "  {} {} -> {} confidence={:.2} similarity={:.2} reason={:?} old_index={} new_index={}",
+                "=".cyan(),
+                function_match.old_id,
+                function_match.new_id,
+                function_match.confidence,
+                function_match.similarity,
+                function_match.reason,
+                function_match.old_source_index,
+                function_match.new_source_index
+            ));
+        }
+    }
+
+    lines.push(format!("{}", "Changes:".bold()));
+    if report.changes.is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        for change in &report.changes {
+            push_change_text(change, &mut lines);
+        }
+    }
+
+    lines.join("\n")
+}
+
+pub fn diff_short(report: &DiffReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{}: {} -> {}",
+        "Diff".bold(),
+        report.old,
+        report.new
+    ));
+    push_summary_lines(report, &mut lines);
+
+    let fallback_matches = report
+        .function_matches
+        .iter()
+        .filter(|function_match| function_match.reason == MatchReason::SimilarityFallback)
+        .count();
+    if fallback_matches > 0 {
+        lines.push(format!(
+            "  fallback matches: {}",
+            fallback_matches.to_string().bright_black()
+        ));
+    }
+
+    if report.changes.is_empty() {
+        lines.push(format!("  {}", "changes: none".green()));
+    } else {
+        let changed_functions = report
+            .changes
+            .iter()
+            .filter(|change| matches!(change, DiffChange::FunctionChanged { .. }))
+            .count();
+        lines.push(format!(
+            "  changes: {} total, {} functions",
+            report.changes.len().to_string().yellow(),
+            changed_functions.to_string().yellow()
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn push_summary_lines(report: &DiffReport, lines: &mut Vec<String>) {
     lines.push(format!("{}", "Summary:".bold()));
     lines.push(format!(
         "  functions: {} {}, {} {}, {} {}, {} {}",
@@ -103,36 +178,6 @@ pub fn diff_text(report: &DiffReport) -> String {
     } else {
         lines.push(format!("  {}", "abi: unchanged".green()));
     }
-
-    lines.push(format!("{}", "Function matches:".bold()));
-    if report.function_matches.is_empty() {
-        lines.push("  none".to_owned());
-    } else {
-        for function_match in &report.function_matches {
-            lines.push(format!(
-                "  {} {} -> {} confidence={:.2} similarity={:.2} reason={:?} old_index={} new_index={}",
-                "=".cyan(),
-                function_match.old_id,
-                function_match.new_id,
-                function_match.confidence,
-                function_match.similarity,
-                function_match.reason,
-                function_match.old_source_index,
-                function_match.new_source_index
-            ));
-        }
-    }
-
-    lines.push(format!("{}", "Changes:".bold()));
-    if report.changes.is_empty() {
-        lines.push("  none".to_owned());
-    } else {
-        for change in &report.changes {
-            push_change_text(change, &mut lines);
-        }
-    }
-
-    lines.join("\n")
 }
 
 fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
@@ -206,7 +251,7 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_json, diff_text};
+    use super::{diff_json, diff_short, diff_text};
     use crate::diff::diff_modules;
     use crate::normalize::normalize_module;
     use crate::parse::parse_module;
@@ -234,5 +279,21 @@ mod tests {
         assert!(json.contains("\"kind\": \"replace\""));
         assert!(json.contains("LocalGet { local_index: 1 }"));
         assert!(json.contains("I32Const { value: 1 }"));
+    }
+
+    #[test]
+    fn renders_short_diff_without_match_or_operator_details() {
+        let old_module = normalized(include_bytes!("../tests/fixtures/old.wasm"));
+        let new_module = normalized(include_bytes!("../tests/fixtures/new.wasm"));
+        let report = diff_modules("old.wasm", &old_module, "new.wasm", &new_module);
+
+        colored::control::set_override(false);
+        let short = diff_short(&report);
+
+        assert!(short.contains("Summary:"));
+        assert!(short.contains("1 matched, 1 changed"));
+        assert!(short.contains("changes: 1 total, 1 functions"));
+        assert!(!short.contains("Function matches:"));
+        assert!(!short.contains("~ op[1]:"));
     }
 }

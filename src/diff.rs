@@ -349,6 +349,24 @@ mod tests {
         ]
     }
 
+    fn similar_functions_wasm(first_variant: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\0asm");
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        bytes.extend_from_slice(&[0x03, 0x03, 0x02, 0x00, 0x00]);
+        bytes.extend_from_slice(&[
+            0x0a, 0x11, 0x02, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6a, 0x0b, 0x07, 0x00, 0x20,
+            0x00,
+        ]);
+        if first_variant {
+            bytes.extend_from_slice(&[0x41, 0x02, 0x6a, 0x0b]);
+        } else {
+            bytes.extend_from_slice(&[0x41, 0x03, 0x6a, 0x0b]);
+        }
+        bytes
+    }
+
     #[test]
     fn reports_canonical_fixture_as_single_operator_replacement() {
         let old_module = normalized_fixture(include_bytes!("../tests/fixtures/old.wasm"));
@@ -395,5 +413,18 @@ mod tests {
         assert_eq!(report.summary.functions_changed, 0);
         assert_eq!(report.function_matches.len(), 3);
         assert!(report.changes.is_empty());
+    }
+
+    #[test]
+    fn reports_similar_functions_without_added_or_removed_churn() {
+        let old_module = normalized_fixture(&similar_functions_wasm(true));
+        let new_module = normalized_fixture(&similar_functions_wasm(false));
+
+        let report = diff_modules("old.wasm", &old_module, "new.wasm", &new_module);
+
+        assert_eq!(report.summary.functions_added, 0);
+        assert_eq!(report.summary.functions_removed, 0);
+        assert_eq!(report.summary.functions_changed, 1);
+        assert_eq!(report.function_matches.len(), 2);
     }
 }
