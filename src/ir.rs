@@ -651,6 +651,48 @@ impl Opcode {
         }
     }
 
+    pub fn is_structural_marker(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Block
+                | Opcode::Loop
+                | Opcode::Else
+                | Opcode::End
+                | Opcode::Catch
+                | Opcode::CatchAll
+        )
+    }
+
+    pub fn is_conditional_branch(&self) -> bool {
+        matches!(
+            self,
+            Opcode::If
+                | Opcode::BrIf
+                | Opcode::BrOnNull
+                | Opcode::BrOnNonNull
+                | Opcode::BrOnCast
+                | Opcode::BrOnCastFail
+        )
+    }
+
+    pub fn is_terminator(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Br
+                | Opcode::BrTable
+                | Opcode::Return
+                | Opcode::Unreachable
+                | Opcode::ReturnCall
+                | Opcode::ReturnCallIndirect
+                | Opcode::ReturnCallRef
+                | Opcode::Throw
+                | Opcode::ThrowRef
+                | Opcode::Rethrow
+                | Opcode::Delegate
+                | Opcode::TryTable
+        )
+    }
+
     fn variant_name(&self) -> &'static str {
         match self {
             // Control
@@ -1677,11 +1719,37 @@ impl Deref for NormalizedModule {
 pub struct AnalysisModule {
     #[serde(flatten)]
     pub module: ModuleIr,
+    pub cfgs: Vec<FunctionCfgIr>,
+    pub call_graph: CallGraphIr,
+    pub reachability: ReachabilityIr,
+    pub unsafe_paths: Vec<UnsafePathIr>,
 }
 
 impl AnalysisModule {
     pub fn from_module(module: ModuleIr) -> Self {
-        Self { module }
+        Self {
+            module,
+            cfgs: Vec::new(),
+            call_graph: CallGraphIr::default(),
+            reachability: ReachabilityIr::default(),
+            unsafe_paths: Vec::new(),
+        }
+    }
+
+    pub fn from_parts(
+        module: ModuleIr,
+        cfgs: Vec<FunctionCfgIr>,
+        call_graph: CallGraphIr,
+        reachability: ReachabilityIr,
+        unsafe_paths: Vec<UnsafePathIr>,
+    ) -> Self {
+        Self {
+            module,
+            cfgs,
+            call_graph,
+            reachability,
+            unsafe_paths,
+        }
     }
 }
 
@@ -1702,6 +1770,9 @@ pub struct ModuleIr {
     pub types: Vec<TypeIr>,
     pub imports: Vec<ImportIr>,
     pub exports: Vec<ExportIr>,
+    pub tables: Vec<TableIr>,
+    pub elements: Vec<ElementIr>,
+    pub start_function_index: Option<u32>,
     pub functions: Vec<FunctionIr>,
 }
 
@@ -1739,6 +1810,30 @@ pub struct ExportIr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableIr {
+    pub index: u32,
+    pub source_index: u32,
+    pub init_function_index: Option<u32>,
+    pub has_unknown_init: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ElementIr {
+    pub source_index: u32,
+    pub kind: ElementKindIr,
+    pub table_index: Option<u32>,
+    pub function_indices: Vec<u32>,
+    pub has_unknown_items: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ElementKindIr {
+    Active,
+    Passive,
+    Declared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionIr {
     pub id: String,
     pub source_index: u32,
@@ -1751,6 +1846,122 @@ pub struct FunctionIr {
     pub operators: Vec<ParsedOperator>,
     pub direct_calls: Vec<u32>,
     pub fingerprint: Option<FuncFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FunctionCfgIr {
+    pub function_id: String,
+    pub source_index: u32,
+    pub kind: FunctionKindIr,
+    pub entry_block: Option<usize>,
+    pub blocks: Vec<BasicBlockIr>,
+    pub call_sites: Vec<CallSiteIr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BasicBlockIr {
+    pub id: usize,
+    pub start_operator_index: usize,
+    pub end_operator_index: usize,
+    pub start_offset: Option<u64>,
+    pub end_offset: Option<u64>,
+    pub operator_indices: Vec<usize>,
+    pub operators: Vec<ParsedOperator>,
+    pub successors: Vec<CfgEdgeIr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CfgEdgeIr {
+    pub target_block: Option<usize>,
+    pub kind: CfgEdgeKindIr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CfgEdgeKindIr {
+    Fallthrough,
+    BranchTaken,
+    BranchNotTaken,
+    BranchTableTarget,
+    BranchTableDefault,
+    Return,
+    Trap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallSiteIr {
+    pub operator_index: usize,
+    pub block_id: usize,
+    pub offset: u64,
+    pub operator: ParsedOperator,
+    pub target_function_index: Option<u32>,
+    pub target_function_id: Option<String>,
+    pub opcode: String,
+    pub tail_call: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CallGraphIr {
+    pub roots: Vec<String>,
+    pub edges: Vec<CallGraphEdgeIr>,
+    pub reachable_functions: Vec<String>,
+    pub reachable_imports: Vec<String>,
+    pub unreachable_functions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallGraphEdgeIr {
+    pub caller_function_id: String,
+    pub callee_function_id: String,
+    pub call_site_index: usize,
+    pub call_site_offset: u64,
+    pub kind: CallGraphEdgeKindIr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CallGraphEdgeKindIr {
+    Direct,
+    TailDirect,
+    Indirect,
+    TailIndirect,
+    Ref,
+    TailRef,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReachabilityIr {
+    pub roots: Vec<String>,
+    pub reachable_functions: Vec<String>,
+    pub reachable_imports: Vec<String>,
+    pub unreachable_functions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnsafePathIr {
+    pub entry_function_id: String,
+    pub function_path: Vec<String>,
+    pub sink: UnsafeSinkIr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnsafeSinkIr {
+    pub function_id: String,
+    pub block_id: usize,
+    pub operator_index: usize,
+    pub offset: u64,
+    pub opcode: String,
+    pub kind: UnsafeSinkKindIr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum UnsafeSinkKindIr {
+    Unreachable,
+    MemoryAccess,
+    MemoryBulk,
+    TableAccess,
+    TableBulk,
+    IndirectCall,
+    Exception,
+    Trap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

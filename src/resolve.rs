@@ -28,6 +28,12 @@ fn attach_function_exports(module: &mut ModuleIr) {
     }
 }
 
+impl ParsedModule {
+    pub fn resolve(self) -> ResolvedModule {
+        resolve_module(self)
+    }
+}
+
 fn refresh_function_stable_ids(module: &mut ModuleIr) {
     let ids = module
         .functions

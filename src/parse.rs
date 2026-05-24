@@ -7,11 +7,14 @@
 
 use std::{error::Error, fmt};
 
-use wasmparser::{Encoding, ExternalKind, Operator, Parser, Payload, TypeRef};
+use wasmparser::{
+    ConstExpr, ElementItems, ElementKind, Encoding, ExternalKind, Operator, Parser, Payload,
+    TableInit, TypeRef,
+};
 
 use crate::ir::{
-    ExportIr, ExternalKindIr, FunctionIr, FunctionKindIr, Immediate, ImportIr, LocalIr, ModuleIr,
-    Opcode, ParsedModule, ParsedOperator, TypeIr, TypeRefIr,
+    ElementIr, ElementKindIr, ExportIr, ExternalKindIr, FunctionIr, FunctionKindIr, Immediate,
+    ImportIr, LocalIr, ModuleIr, Opcode, ParsedModule, ParsedOperator, TableIr, TypeIr, TypeRefIr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,45 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                     });
                 }
             }
+            Payload::TableSection(section) => {
+                let imported_table_count = imported_table_count(&module);
+                for (source_index, table) in section.into_iter().enumerate() {
+                    let table = table?;
+                    let source_index = checked_u32(source_index, "table index")?;
+                    let table_index =
+                        imported_table_count
+                            .checked_add(source_index)
+                            .ok_or_else(|| {
+                                ParseError::new("table index overflow while reading tables")
+                            })?;
+                    let (init_function_index, has_unknown_init) = convert_table_init(table.init)?;
+
+                    module.tables.push(TableIr {
+                        index: table_index,
+                        source_index,
+                        init_function_index,
+                        has_unknown_init,
+                    });
+                }
+            }
+            Payload::StartSection { func, .. } => {
+                module.start_function_index = Some(func);
+            }
+            Payload::ElementSection(section) => {
+                for (source_index, element) in section.into_iter().enumerate() {
+                    let element = element?;
+                    let (kind, table_index) = convert_element_kind(element.kind);
+                    let (function_indices, has_unknown_items) =
+                        convert_element_items(element.items)?;
+                    module.elements.push(ElementIr {
+                        source_index: checked_u32(source_index, "element index")?,
+                        kind,
+                        table_index,
+                        function_indices,
+                        has_unknown_items,
+                    });
+                }
+            }
             Payload::CodeSectionStart { count, .. } => {
                 if count as usize != defined_type_indices.len() {
                     return Err(ParseError::new(format!(
@@ -207,12 +249,9 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
             }
             Payload::End(_) => {}
             Payload::CustomSection(_)
-            | Payload::TableSection(_)
             | Payload::MemorySection(_)
             | Payload::TagSection(_)
             | Payload::GlobalSection(_)
-            | Payload::StartSection { .. }
-            | Payload::ElementSection(_)
             | Payload::DataCountSection { .. }
             | Payload::DataSection(_) => {}
             _ => {
@@ -1071,6 +1110,78 @@ fn convert_external_kind(kind: ExternalKind) -> Result<ExternalKindIr, ParseErro
     }
 }
 
+fn convert_table_init(init: TableInit<'_>) -> Result<(Option<u32>, bool), ParseError> {
+    match init {
+        TableInit::RefNull => Ok((None, false)),
+        TableInit::Expr(expr) => match const_expr_function_index(expr)? {
+            ConstExprFunctionRef::Function(index) => Ok((Some(index), false)),
+            ConstExprFunctionRef::Null => Ok((None, false)),
+            ConstExprFunctionRef::Unknown => Ok((None, true)),
+        },
+    }
+}
+
+fn convert_element_kind(kind: ElementKind<'_>) -> (ElementKindIr, Option<u32>) {
+    match kind {
+        ElementKind::Active { table_index, .. } => {
+            (ElementKindIr::Active, Some(table_index.unwrap_or(0)))
+        }
+        ElementKind::Passive => (ElementKindIr::Passive, None),
+        ElementKind::Declared => (ElementKindIr::Declared, None),
+    }
+}
+
+fn convert_element_items(items: ElementItems<'_>) -> Result<(Vec<u32>, bool), ParseError> {
+    let mut function_indices = Vec::new();
+    let mut has_unknown_items = false;
+
+    match items {
+        ElementItems::Functions(functions) => {
+            for function in functions {
+                function_indices.push(function?);
+            }
+        }
+        ElementItems::Expressions(_, expressions) => {
+            for expression in expressions {
+                match const_expr_function_index(expression?)? {
+                    ConstExprFunctionRef::Function(index) => function_indices.push(index),
+                    ConstExprFunctionRef::Null => {}
+                    ConstExprFunctionRef::Unknown => has_unknown_items = true,
+                }
+            }
+        }
+    }
+
+    Ok((function_indices, has_unknown_items))
+}
+
+enum ConstExprFunctionRef {
+    Function(u32),
+    Null,
+    Unknown,
+}
+
+fn const_expr_function_index(expr: ConstExpr<'_>) -> Result<ConstExprFunctionRef, ParseError> {
+    let mut saw_null = false;
+
+    for operator in expr.get_operators_reader() {
+        match operator? {
+            Operator::RefFunc { function_index } => {
+                return Ok(ConstExprFunctionRef::Function(function_index));
+            }
+            Operator::RefNull { .. } => saw_null = true,
+            Operator::End => {}
+            _ => return Ok(ConstExprFunctionRef::Unknown),
+        }
+    }
+
+    if saw_null {
+        Ok(ConstExprFunctionRef::Null)
+    } else {
+        Ok(ConstExprFunctionRef::Unknown)
+    }
+}
+
 fn type_id_for_index(types: &[TypeIr], type_index: u32) -> Result<&str, ParseError> {
     types
         .get(type_index as usize)
@@ -1104,6 +1215,14 @@ fn type_ref_id(type_ref: &TypeRefIr) -> &str {
 
 fn checked_u32(value: usize, label: &str) -> Result<u32, ParseError> {
     u32::try_from(value).map_err(|_| ParseError::new(format!("{label} exceeds u32 range")))
+}
+
+fn imported_table_count(module: &ModuleIr) -> u32 {
+    module
+        .imports
+        .iter()
+        .filter(|import| import.kind == ExternalKindIr::Table)
+        .count() as u32
 }
 
 #[cfg(test)]
@@ -1147,6 +1266,7 @@ mod tests {
         assert_eq!(module.exports[0].name, "add");
         assert_eq!(module.exports[0].kind, ExternalKindIr::Func);
         assert_eq!(module.functions.len(), 1);
+        assert_eq!(module.start_function_index, None);
 
         let function = &module.functions[0];
         assert_eq!(function.id, "type:type:i32,i32->i32:defined:0");
@@ -1187,6 +1307,24 @@ mod tests {
         assert_eq!(old_function.operators[0], new_function.operators[0]);
         assert_eq!(old_function.operators[2], new_function.operators[2]);
         assert_eq!(old_function.operators[3], new_function.operators[3]);
+    }
+
+    #[test]
+    fn parses_start_section_into_parsed_ir() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\0asm");
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        bytes.extend_from_slice(&[0x08, 0x01, 0x00]);
+        bytes.extend_from_slice(&[
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+        ]);
+
+        let module = parse_module(&bytes).expect("start module should parse");
+
+        assert_eq!(module.start_function_index, Some(0));
+        assert_eq!(module.functions.len(), 1);
     }
 
     #[test]

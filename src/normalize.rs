@@ -17,6 +17,12 @@ pub fn normalize_module(resolved: &ResolvedModule) -> NormalizedModule {
     NormalizedModule::from_module(module)
 }
 
+impl ResolvedModule {
+    pub fn normalize(&self) -> NormalizedModule {
+        normalize_module(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_module;

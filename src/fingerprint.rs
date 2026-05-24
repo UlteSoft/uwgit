@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use serde_json::json;
 
 use crate::ir::{FunctionIr, FunctionKindIr, Immediate, ModuleIr, ParsedOperator, ResolvedModule};
 
@@ -81,13 +82,14 @@ fn stable_function_id_for_hash(
 ) -> String {
     match function.kind {
         FunctionKindIr::Imported => function.id.clone(),
-        FunctionKindIr::Defined => match function.export_names.first() {
-            Some(export_name) => format!("func:export:{export_name}:{}", function.type_id),
-            None => format!(
+        FunctionKindIr::Defined => match function.export_names.as_slice() {
+            [export_name] => format!("func:export:{export_name}:{}", function.type_id),
+            [] => format!(
                 "func:type:{}:body:{}",
                 function.type_id,
                 canonical_body_hash.hex()
             ),
+            export_names => format!("func:exports:{}:{}", json!(export_names), function.type_id),
         },
     }
 }
@@ -216,6 +218,21 @@ mod tests {
         bytes
     }
 
+    fn make_multi_export_wasm() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\0asm");
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        bytes.extend_from_slice(&[
+            0x07, 0x09, 0x02, 0x01, 0x61, 0x00, 0x00, 0x01, 0x62, 0x00, 0x00,
+        ]);
+        bytes.extend_from_slice(&[
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+        ]);
+        bytes
+    }
+
     #[test]
     fn fingerprints_are_deterministic_for_canonical_fixtures() {
         let first = resolved(include_bytes!("../tests/fixtures/old.wasm"));
@@ -256,6 +273,17 @@ mod tests {
             "func:export:add:type:i32,i32->i32"
         );
         assert_eq!(old_module.functions[0].id, new_module.functions[0].id);
+    }
+
+    #[test]
+    fn exported_function_stable_id_uses_all_export_names() {
+        let module = resolved(&make_multi_export_wasm());
+
+        assert_eq!(module.functions[0].export_names, ["a", "b"]);
+        assert_eq!(
+            module.functions[0].id,
+            r#"func:exports:["a","b"]:type:i32,i32->i32"#
+        );
     }
 
     #[test]
