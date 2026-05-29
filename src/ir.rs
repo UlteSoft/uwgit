@@ -1299,7 +1299,7 @@ impl Opcode {
             Opcode::CatchAll => "CatchAll",
             Opcode::Delegate => "Delegate",
             // Unrecognized
-            Opcode::Unrecognized(_) => unreachable!(),
+            Opcode::Unrecognized(_) => "Unrecognized",
         }
     }
 }
@@ -2003,6 +2003,18 @@ impl ExternalKindIr {
             ExternalKindIr::Global => "global",
             ExternalKindIr::Tag => "tag",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrecognized_opcode_rendering_is_non_panicking() {
+        let op = Opcode::Unrecognized("0xff".to_string());
+        assert_eq!(op.variant_name(), "Unrecognized");
+        assert_eq!(op.as_str(), "0xff");
     }
 }
 

@@ -245,14 +245,18 @@ fn build_blocks(
                     exec_pos,
                 ));
             }
-        } else if leaders[exec_pos + 1] && current_start.is_some() {
-            blocks.push(build_block(
-                blocks.len(),
-                operators,
-                exec_positions,
-                current_start.take().unwrap(),
-                exec_pos,
-            ));
+        } else if leaders[exec_pos + 1] {
+            // None means no active block to finish; scanning continues
+            // until the next leader initialises a new block.
+            if let Some(start_exec_pos) = current_start.take() {
+                blocks.push(build_block(
+                    blocks.len(),
+                    operators,
+                    exec_positions,
+                    start_exec_pos,
+                    exec_pos,
+                ));
+            }
         }
 
         let _ = raw_index;
@@ -1359,6 +1363,75 @@ mod tests {
         assert!(analysis.unsafe_paths.iter().any(|path| path.function_path
             == vec!["func:entry".to_owned(), "func:unsafe".to_owned()]
             && path.sink.function_id == "func:unsafe"));
+    }
+
+    #[test]
+    fn cfg_handles_minimal_function_without_panic() {
+        let mut module = ModuleIr::new();
+        module.functions.push(FunctionIr {
+            id: "func:empty".to_owned(),
+            source_index: 0,
+            type_index: 0,
+            type_id: "type:void->void".to_owned(),
+            kind: FunctionKindIr::Defined,
+            export_names: vec![],
+            locals: vec![],
+            operators: vec![],
+            direct_calls: vec![],
+            fingerprint: None,
+        });
+
+        let resolved = ResolvedModule::from_module(module);
+        let analysis = analysis_module(&resolved);
+
+        assert_eq!(analysis.cfgs.len(), 1);
+        assert!(analysis.cfgs[0].blocks.is_empty());
+        assert_eq!(analysis.cfgs[0].entry_block, None);
+        assert_eq!(analysis.cfgs[0].call_sites.len(), 0);
+    }
+
+    #[test]
+    fn cfg_handles_branches_without_unwrap() {
+        let mut module = ModuleIr::new();
+        module.types.push(TypeIr {
+            id: "type:void->void".to_owned(),
+            source_index: 0,
+            params: vec![],
+            results: vec![],
+        });
+        module.functions.push(FunctionIr {
+            id: "func:branchy".to_owned(),
+            source_index: 0,
+            type_index: 0,
+            type_id: "type:void->void".to_owned(),
+            kind: FunctionKindIr::Defined,
+            export_names: vec!["branchy".to_owned()],
+            locals: vec![],
+            operators: vec![
+                sample_operator(0, Opcode::Nop, Immediate::None),
+                sample_operator(1, Opcode::Nop, Immediate::None),
+                sample_operator(2, Opcode::If, Immediate::BlockType("void".to_owned())),
+                sample_operator(3, Opcode::Nop, Immediate::None),
+                sample_operator(4, Opcode::Else, Immediate::None),
+                sample_operator(5, Opcode::Nop, Immediate::None),
+                sample_operator(6, Opcode::End, Immediate::None),
+                sample_operator(7, Opcode::Return, Immediate::None),
+            ],
+            direct_calls: vec![],
+            fingerprint: None,
+        });
+
+        let resolved = ResolvedModule::from_module(module);
+        let analysis = analysis_module(&resolved);
+
+        assert_eq!(analysis.cfgs.len(), 1);
+        let cfg = &analysis.cfgs[0];
+        assert_eq!(cfg.blocks.len(), 4, "expected 4 basic blocks");
+        assert_eq!(cfg.blocks[0].successors.len(), 2);
+        assert_eq!(cfg.blocks[1].successors.len(), 1);
+        assert_eq!(cfg.blocks[2].successors.len(), 1);
+        assert_eq!(cfg.blocks[3].successors.len(), 1);
+        assert_eq!(cfg.entry_block, Some(0));
     }
 
     #[test]

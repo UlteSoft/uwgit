@@ -235,7 +235,7 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                     .into_iter_with_offsets()
                     .map(|operator| {
                         let (operator, offset) = operator?;
-                        Ok(convert_operator(operator, offset))
+                        convert_operator(operator, offset)
                     })
                     .collect::<Result<Vec<_>, ParseError>>()?;
 
@@ -279,788 +279,794 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
 // ── Phase 1: typed operator conversion ─────────────────────────────────────
 
 /// Convert a wasmparser `Operator` into our typed `(Opcode, Immediate)`.
-fn convert_operator<'a>(operator: Operator<'a>, offset: usize) -> ParsedOperator {
-    let (opcode, immediate) = operator_to_opcode_immediate(operator);
-    ParsedOperator {
+fn convert_operator<'a>(
+    operator: Operator<'a>,
+    offset: usize,
+) -> Result<ParsedOperator, ParseError> {
+    let (opcode, immediate) = operator_to_opcode_immediate(operator)?;
+    Ok(ParsedOperator {
         offset: offset as u64,
         opcode,
         immediate,
-    }
+    })
 }
 
 /// Map wasmparser::Operator variants to (Opcode, Immediate).
 #[allow(clippy::too_many_lines)]
-fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> (Opcode, Immediate) {
+fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immediate), ParseError> {
     use Opcode as Oc;
     use Operator::*;
 
     match op {
         // ── MVP: Control flow ──
-        Unreachable => (Oc::Unreachable, Immediate::None),
-        Nop => (Oc::Nop, Immediate::None),
-        Block { blockty } => (
+        Unreachable => Ok((Oc::Unreachable, Immediate::None),),
+        Nop => Ok((Oc::Nop, Immediate::None),),
+        Block { blockty } => Ok((
             Oc::Block,
             Immediate::BlockType(format!("{blockty:?}")),
-        ),
-        Loop { blockty } => (
+        ),),
+        Loop { blockty } => Ok((
             Oc::Loop,
             Immediate::BlockType(format!("{blockty:?}")),
-        ),
-        If { blockty } => (
+        ),),
+        If { blockty } => Ok((
             Oc::If,
             Immediate::BlockType(format!("{blockty:?}")),
-        ),
-        Else => (Oc::Else, Immediate::None),
-        End => (Oc::End, Immediate::None),
-        Br { relative_depth } => (Oc::Br, Immediate::Branch(relative_depth)),
-        BrIf { relative_depth } => (Oc::BrIf, Immediate::Branch(relative_depth)),
-        BrOnNull { relative_depth } => (Oc::BrOnNull, Immediate::Branch(relative_depth)),
-        BrOnNonNull { relative_depth } => (Oc::BrOnNonNull, Immediate::Branch(relative_depth)),
-        BrTable { targets } => (
-            Oc::BrTable,
-            Immediate::BrTable {
-                targets: targets
-                    .targets()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap_or_default(),
-                default_target: targets.default(),
-            },
-        ),
-        Return => (Oc::Return, Immediate::None),
+        ),),
+        Else => Ok((Oc::Else, Immediate::None),),
+        End => Ok((Oc::End, Immediate::None),),
+        Br { relative_depth } => Ok((Oc::Br, Immediate::Branch(relative_depth)),),
+        BrIf { relative_depth } => Ok((Oc::BrIf, Immediate::Branch(relative_depth)),),
+        BrOnNull { relative_depth } => Ok((Oc::BrOnNull, Immediate::Branch(relative_depth)),),
+        BrOnNonNull { relative_depth } => Ok((Oc::BrOnNonNull, Immediate::Branch(relative_depth)),),
+        BrTable { targets } => {
+            let default_target = targets.default();
+            let target_labels = targets
+                .targets()
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                Oc::BrTable,
+                Immediate::BrTable {
+                    targets: target_labels,
+                    default_target,
+                },
+            ))
+        },
+        Return => Ok((Oc::Return, Immediate::None),),
 
         // ── MVP: Calls ──
-        Call { function_index } => (Oc::Call, Immediate::Call(function_index)),
+        Call { function_index } => Ok((Oc::Call, Immediate::Call(function_index)),),
         CallIndirect {
             type_index,
             table_index,
-        } => (
+        } => Ok((
             Oc::CallIndirect,
             Immediate::CallIndirect {
                 type_index,
                 table_index,
             },
-        ),
+        ),),
 
         // ── MVP: Parametric ──
-        Drop => (Oc::Drop, Immediate::None),
-        Select => (Oc::Select, Immediate::None),
+        Drop => Ok((Oc::Drop, Immediate::None),),
+        Select => Ok((Oc::Select, Immediate::None),),
 
         // ── MVP: Variable ──
-        LocalGet { local_index } => (Oc::LocalGet, Immediate::Local(local_index)),
-        LocalSet { local_index } => (Oc::LocalSet, Immediate::Local(local_index)),
-        LocalTee { local_index } => (Oc::LocalTee, Immediate::Local(local_index)),
-        GlobalGet { global_index } => (Oc::GlobalGet, Immediate::Global(global_index)),
-        GlobalSet { global_index } => (Oc::GlobalSet, Immediate::Global(global_index)),
+        LocalGet { local_index } => Ok((Oc::LocalGet, Immediate::Local(local_index)),),
+        LocalSet { local_index } => Ok((Oc::LocalSet, Immediate::Local(local_index)),),
+        LocalTee { local_index } => Ok((Oc::LocalTee, Immediate::Local(local_index)),),
+        GlobalGet { global_index } => Ok((Oc::GlobalGet, Immediate::Global(global_index)),),
+        GlobalSet { global_index } => Ok((Oc::GlobalSet, Immediate::Global(global_index)),),
 
         // ── MVP: Memory loads ──
-        I32Load { memarg } => (
+        I32Load { memarg } => Ok((
             Oc::I32Load,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load { memarg } => (
+        ),),
+        I64Load { memarg } => Ok((
             Oc::I64Load,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        F32Load { memarg } => (
+        ),),
+        F32Load { memarg } => Ok((
             Oc::F32Load,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        F64Load { memarg } => (
+        ),),
+        F64Load { memarg } => Ok((
             Oc::F64Load,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Load8S { memarg } => (
+        ),),
+        I32Load8S { memarg } => Ok((
             Oc::I32Load8S,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Load8U { memarg } => (
+        ),),
+        I32Load8U { memarg } => Ok((
             Oc::I32Load8U,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Load16S { memarg } => (
+        ),),
+        I32Load16S { memarg } => Ok((
             Oc::I32Load16S,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Load16U { memarg } => (
+        ),),
+        I32Load16U { memarg } => Ok((
             Oc::I32Load16U,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load8S { memarg } => (
+        ),),
+        I64Load8S { memarg } => Ok((
             Oc::I64Load8S,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load8U { memarg } => (
+        ),),
+        I64Load8U { memarg } => Ok((
             Oc::I64Load8U,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load16S { memarg } => (
+        ),),
+        I64Load16S { memarg } => Ok((
             Oc::I64Load16S,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load16U { memarg } => (
+        ),),
+        I64Load16U { memarg } => Ok((
             Oc::I64Load16U,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load32S { memarg } => (
+        ),),
+        I64Load32S { memarg } => Ok((
             Oc::I64Load32S,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Load32U { memarg } => (
+        ),),
+        I64Load32U { memarg } => Ok((
             Oc::I64Load32U,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
+        ),),
 
         // ── MVP: Memory stores ──
-        I32Store { memarg } => (
+        I32Store { memarg } => Ok((
             Oc::I32Store,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Store { memarg } => (
+        ),),
+        I64Store { memarg } => Ok((
             Oc::I64Store,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        F32Store { memarg } => (
+        ),),
+        F32Store { memarg } => Ok((
             Oc::F32Store,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        F64Store { memarg } => (
+        ),),
+        F64Store { memarg } => Ok((
             Oc::F64Store,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Store8 { memarg } => (
+        ),),
+        I32Store8 { memarg } => Ok((
             Oc::I32Store8,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I32Store16 { memarg } => (
+        ),),
+        I32Store16 { memarg } => Ok((
             Oc::I32Store16,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Store8 { memarg } => (
+        ),),
+        I64Store8 { memarg } => Ok((
             Oc::I64Store8,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Store16 { memarg } => (
+        ),),
+        I64Store16 { memarg } => Ok((
             Oc::I64Store16,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
-        I64Store32 { memarg } => (
+        ),),
+        I64Store32 { memarg } => Ok((
             Oc::I64Store32,
             Immediate::MemArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
             },
-        ),
+        ),),
 
         // ── MVP: Memory misc ──
-        MemorySize { mem } => (Oc::MemorySize, Immediate::MemoryIndex(mem)),
-        MemoryGrow { mem } => (Oc::MemoryGrow, Immediate::MemoryIndex(mem)),
+        MemorySize { mem } => Ok((Oc::MemorySize, Immediate::MemoryIndex(mem)),),
+        MemoryGrow { mem } => Ok((Oc::MemoryGrow, Immediate::MemoryIndex(mem)),),
 
         // ── MVP: Constants ──
-        I32Const { value } => (Oc::I32Const, Immediate::I32Const(value)),
-        I64Const { value } => (Oc::I64Const, Immediate::I64Const(value)),
-        F32Const { value } => (
+        I32Const { value } => Ok((Oc::I32Const, Immediate::I32Const(value)),),
+        I64Const { value } => Ok((Oc::I64Const, Immediate::I64Const(value)),),
+        F32Const { value } => Ok((
             Oc::F32Const,
             Immediate::F32Const(value.bits()),
-        ),
-        F64Const { value } => (
+        ),),
+        F64Const { value } => Ok((
             Oc::F64Const,
             Immediate::F64Const(value.bits()),
-        ),
+        ),),
 
         // ── MVP: i32 test ──
-        I32Eqz => (Oc::I32Eqz, Immediate::None),
-        I32Eq => (Oc::I32Eq, Immediate::None),
-        I32Ne => (Oc::I32Ne, Immediate::None),
-        I32LtS => (Oc::I32LtS, Immediate::None),
-        I32LtU => (Oc::I32LtU, Immediate::None),
-        I32GtS => (Oc::I32GtS, Immediate::None),
-        I32GtU => (Oc::I32GtU, Immediate::None),
-        I32LeS => (Oc::I32LeS, Immediate::None),
-        I32LeU => (Oc::I32LeU, Immediate::None),
-        I32GeS => (Oc::I32GeS, Immediate::None),
-        I32GeU => (Oc::I32GeU, Immediate::None),
+        I32Eqz => Ok((Oc::I32Eqz, Immediate::None),),
+        I32Eq => Ok((Oc::I32Eq, Immediate::None),),
+        I32Ne => Ok((Oc::I32Ne, Immediate::None),),
+        I32LtS => Ok((Oc::I32LtS, Immediate::None),),
+        I32LtU => Ok((Oc::I32LtU, Immediate::None),),
+        I32GtS => Ok((Oc::I32GtS, Immediate::None),),
+        I32GtU => Ok((Oc::I32GtU, Immediate::None),),
+        I32LeS => Ok((Oc::I32LeS, Immediate::None),),
+        I32LeU => Ok((Oc::I32LeU, Immediate::None),),
+        I32GeS => Ok((Oc::I32GeS, Immediate::None),),
+        I32GeU => Ok((Oc::I32GeU, Immediate::None),),
 
         // ── MVP: i64 test ──
-        I64Eqz => (Oc::I64Eqz, Immediate::None),
-        I64Eq => (Oc::I64Eq, Immediate::None),
-        I64Ne => (Oc::I64Ne, Immediate::None),
-        I64LtS => (Oc::I64LtS, Immediate::None),
-        I64LtU => (Oc::I64LtU, Immediate::None),
-        I64GtS => (Oc::I64GtS, Immediate::None),
-        I64GtU => (Oc::I64GtU, Immediate::None),
-        I64LeS => (Oc::I64LeS, Immediate::None),
-        I64LeU => (Oc::I64LeU, Immediate::None),
-        I64GeS => (Oc::I64GeS, Immediate::None),
-        I64GeU => (Oc::I64GeU, Immediate::None),
+        I64Eqz => Ok((Oc::I64Eqz, Immediate::None),),
+        I64Eq => Ok((Oc::I64Eq, Immediate::None),),
+        I64Ne => Ok((Oc::I64Ne, Immediate::None),),
+        I64LtS => Ok((Oc::I64LtS, Immediate::None),),
+        I64LtU => Ok((Oc::I64LtU, Immediate::None),),
+        I64GtS => Ok((Oc::I64GtS, Immediate::None),),
+        I64GtU => Ok((Oc::I64GtU, Immediate::None),),
+        I64LeS => Ok((Oc::I64LeS, Immediate::None),),
+        I64LeU => Ok((Oc::I64LeU, Immediate::None),),
+        I64GeS => Ok((Oc::I64GeS, Immediate::None),),
+        I64GeU => Ok((Oc::I64GeU, Immediate::None),),
 
         // ── MVP: f32 test ──
-        F32Eq => (Oc::F32Eq, Immediate::None),
-        F32Ne => (Oc::F32Ne, Immediate::None),
-        F32Lt => (Oc::F32Lt, Immediate::None),
-        F32Gt => (Oc::F32Gt, Immediate::None),
-        F32Le => (Oc::F32Le, Immediate::None),
-        F32Ge => (Oc::F32Ge, Immediate::None),
+        F32Eq => Ok((Oc::F32Eq, Immediate::None),),
+        F32Ne => Ok((Oc::F32Ne, Immediate::None),),
+        F32Lt => Ok((Oc::F32Lt, Immediate::None),),
+        F32Gt => Ok((Oc::F32Gt, Immediate::None),),
+        F32Le => Ok((Oc::F32Le, Immediate::None),),
+        F32Ge => Ok((Oc::F32Ge, Immediate::None),),
 
         // ── MVP: f64 test ──
-        F64Eq => (Oc::F64Eq, Immediate::None),
-        F64Ne => (Oc::F64Ne, Immediate::None),
-        F64Lt => (Oc::F64Lt, Immediate::None),
-        F64Gt => (Oc::F64Gt, Immediate::None),
-        F64Le => (Oc::F64Le, Immediate::None),
-        F64Ge => (Oc::F64Ge, Immediate::None),
+        F64Eq => Ok((Oc::F64Eq, Immediate::None),),
+        F64Ne => Ok((Oc::F64Ne, Immediate::None),),
+        F64Lt => Ok((Oc::F64Lt, Immediate::None),),
+        F64Gt => Ok((Oc::F64Gt, Immediate::None),),
+        F64Le => Ok((Oc::F64Le, Immediate::None),),
+        F64Ge => Ok((Oc::F64Ge, Immediate::None),),
 
         // ── MVP: i32 unary ──
-        I32Clz => (Oc::I32Clz, Immediate::None),
-        I32Ctz => (Oc::I32Ctz, Immediate::None),
-        I32Popcnt => (Oc::I32Popcnt, Immediate::None),
+        I32Clz => Ok((Oc::I32Clz, Immediate::None),),
+        I32Ctz => Ok((Oc::I32Ctz, Immediate::None),),
+        I32Popcnt => Ok((Oc::I32Popcnt, Immediate::None),),
 
         // ── MVP: i64 unary ──
-        I64Clz => (Oc::I64Clz, Immediate::None),
-        I64Ctz => (Oc::I64Ctz, Immediate::None),
-        I64Popcnt => (Oc::I64Popcnt, Immediate::None),
+        I64Clz => Ok((Oc::I64Clz, Immediate::None),),
+        I64Ctz => Ok((Oc::I64Ctz, Immediate::None),),
+        I64Popcnt => Ok((Oc::I64Popcnt, Immediate::None),),
 
         // ── MVP: f32 unary ──
-        F32Abs => (Oc::F32Abs, Immediate::None),
-        F32Neg => (Oc::F32Neg, Immediate::None),
-        F32Ceil => (Oc::F32Ceil, Immediate::None),
-        F32Floor => (Oc::F32Floor, Immediate::None),
-        F32Trunc => (Oc::F32Trunc, Immediate::None),
-        F32Nearest => (Oc::F32Nearest, Immediate::None),
-        F32Sqrt => (Oc::F32Sqrt, Immediate::None),
+        F32Abs => Ok((Oc::F32Abs, Immediate::None),),
+        F32Neg => Ok((Oc::F32Neg, Immediate::None),),
+        F32Ceil => Ok((Oc::F32Ceil, Immediate::None),),
+        F32Floor => Ok((Oc::F32Floor, Immediate::None),),
+        F32Trunc => Ok((Oc::F32Trunc, Immediate::None),),
+        F32Nearest => Ok((Oc::F32Nearest, Immediate::None),),
+        F32Sqrt => Ok((Oc::F32Sqrt, Immediate::None),),
 
         // ── MVP: f64 unary ──
-        F64Abs => (Oc::F64Abs, Immediate::None),
-        F64Neg => (Oc::F64Neg, Immediate::None),
-        F64Ceil => (Oc::F64Ceil, Immediate::None),
-        F64Floor => (Oc::F64Floor, Immediate::None),
-        F64Trunc => (Oc::F64Trunc, Immediate::None),
-        F64Nearest => (Oc::F64Nearest, Immediate::None),
-        F64Sqrt => (Oc::F64Sqrt, Immediate::None),
+        F64Abs => Ok((Oc::F64Abs, Immediate::None),),
+        F64Neg => Ok((Oc::F64Neg, Immediate::None),),
+        F64Ceil => Ok((Oc::F64Ceil, Immediate::None),),
+        F64Floor => Ok((Oc::F64Floor, Immediate::None),),
+        F64Trunc => Ok((Oc::F64Trunc, Immediate::None),),
+        F64Nearest => Ok((Oc::F64Nearest, Immediate::None),),
+        F64Sqrt => Ok((Oc::F64Sqrt, Immediate::None),),
 
         // ── MVP: i32 binary ──
-        I32Add => (Oc::I32Add, Immediate::None),
-        I32Sub => (Oc::I32Sub, Immediate::None),
-        I32Mul => (Oc::I32Mul, Immediate::None),
-        I32DivS => (Oc::I32DivS, Immediate::None),
-        I32DivU => (Oc::I32DivU, Immediate::None),
-        I32RemS => (Oc::I32RemS, Immediate::None),
-        I32RemU => (Oc::I32RemU, Immediate::None),
-        I32And => (Oc::I32And, Immediate::None),
-        I32Or => (Oc::I32Or, Immediate::None),
-        I32Xor => (Oc::I32Xor, Immediate::None),
-        I32Shl => (Oc::I32Shl, Immediate::None),
-        I32ShrS => (Oc::I32ShrS, Immediate::None),
-        I32ShrU => (Oc::I32ShrU, Immediate::None),
-        I32Rotl => (Oc::I32Rotl, Immediate::None),
-        I32Rotr => (Oc::I32Rotr, Immediate::None),
+        I32Add => Ok((Oc::I32Add, Immediate::None),),
+        I32Sub => Ok((Oc::I32Sub, Immediate::None),),
+        I32Mul => Ok((Oc::I32Mul, Immediate::None),),
+        I32DivS => Ok((Oc::I32DivS, Immediate::None),),
+        I32DivU => Ok((Oc::I32DivU, Immediate::None),),
+        I32RemS => Ok((Oc::I32RemS, Immediate::None),),
+        I32RemU => Ok((Oc::I32RemU, Immediate::None),),
+        I32And => Ok((Oc::I32And, Immediate::None),),
+        I32Or => Ok((Oc::I32Or, Immediate::None),),
+        I32Xor => Ok((Oc::I32Xor, Immediate::None),),
+        I32Shl => Ok((Oc::I32Shl, Immediate::None),),
+        I32ShrS => Ok((Oc::I32ShrS, Immediate::None),),
+        I32ShrU => Ok((Oc::I32ShrU, Immediate::None),),
+        I32Rotl => Ok((Oc::I32Rotl, Immediate::None),),
+        I32Rotr => Ok((Oc::I32Rotr, Immediate::None),),
 
         // ── MVP: i64 binary ──
-        I64Add => (Oc::I64Add, Immediate::None),
-        I64Sub => (Oc::I64Sub, Immediate::None),
-        I64Mul => (Oc::I64Mul, Immediate::None),
-        I64DivS => (Oc::I64DivS, Immediate::None),
-        I64DivU => (Oc::I64DivU, Immediate::None),
-        I64RemS => (Oc::I64RemS, Immediate::None),
-        I64RemU => (Oc::I64RemU, Immediate::None),
-        I64And => (Oc::I64And, Immediate::None),
-        I64Or => (Oc::I64Or, Immediate::None),
-        I64Xor => (Oc::I64Xor, Immediate::None),
-        I64Shl => (Oc::I64Shl, Immediate::None),
-        I64ShrS => (Oc::I64ShrS, Immediate::None),
-        I64ShrU => (Oc::I64ShrU, Immediate::None),
-        I64Rotl => (Oc::I64Rotl, Immediate::None),
-        I64Rotr => (Oc::I64Rotr, Immediate::None),
+        I64Add => Ok((Oc::I64Add, Immediate::None),),
+        I64Sub => Ok((Oc::I64Sub, Immediate::None),),
+        I64Mul => Ok((Oc::I64Mul, Immediate::None),),
+        I64DivS => Ok((Oc::I64DivS, Immediate::None),),
+        I64DivU => Ok((Oc::I64DivU, Immediate::None),),
+        I64RemS => Ok((Oc::I64RemS, Immediate::None),),
+        I64RemU => Ok((Oc::I64RemU, Immediate::None),),
+        I64And => Ok((Oc::I64And, Immediate::None),),
+        I64Or => Ok((Oc::I64Or, Immediate::None),),
+        I64Xor => Ok((Oc::I64Xor, Immediate::None),),
+        I64Shl => Ok((Oc::I64Shl, Immediate::None),),
+        I64ShrS => Ok((Oc::I64ShrS, Immediate::None),),
+        I64ShrU => Ok((Oc::I64ShrU, Immediate::None),),
+        I64Rotl => Ok((Oc::I64Rotl, Immediate::None),),
+        I64Rotr => Ok((Oc::I64Rotr, Immediate::None),),
 
         // ── MVP: f32 binary ──
-        F32Add => (Oc::F32Add, Immediate::None),
-        F32Sub => (Oc::F32Sub, Immediate::None),
-        F32Mul => (Oc::F32Mul, Immediate::None),
-        F32Div => (Oc::F32Div, Immediate::None),
-        F32Min => (Oc::F32Min, Immediate::None),
-        F32Max => (Oc::F32Max, Immediate::None),
-        F32Copysign => (Oc::F32Copysign, Immediate::None),
+        F32Add => Ok((Oc::F32Add, Immediate::None),),
+        F32Sub => Ok((Oc::F32Sub, Immediate::None),),
+        F32Mul => Ok((Oc::F32Mul, Immediate::None),),
+        F32Div => Ok((Oc::F32Div, Immediate::None),),
+        F32Min => Ok((Oc::F32Min, Immediate::None),),
+        F32Max => Ok((Oc::F32Max, Immediate::None),),
+        F32Copysign => Ok((Oc::F32Copysign, Immediate::None),),
 
         // ── MVP: f64 binary ──
-        F64Add => (Oc::F64Add, Immediate::None),
-        F64Sub => (Oc::F64Sub, Immediate::None),
-        F64Mul => (Oc::F64Mul, Immediate::None),
-        F64Div => (Oc::F64Div, Immediate::None),
-        F64Min => (Oc::F64Min, Immediate::None),
-        F64Max => (Oc::F64Max, Immediate::None),
-        F64Copysign => (Oc::F64Copysign, Immediate::None),
+        F64Add => Ok((Oc::F64Add, Immediate::None),),
+        F64Sub => Ok((Oc::F64Sub, Immediate::None),),
+        F64Mul => Ok((Oc::F64Mul, Immediate::None),),
+        F64Div => Ok((Oc::F64Div, Immediate::None),),
+        F64Min => Ok((Oc::F64Min, Immediate::None),),
+        F64Max => Ok((Oc::F64Max, Immediate::None),),
+        F64Copysign => Ok((Oc::F64Copysign, Immediate::None),),
 
         // ── MVP: Conversions ──
-        I32WrapI64 => (Oc::I32WrapI64, Immediate::None),
-        I32TruncF32S => (Oc::I32TruncF32S, Immediate::None),
-        I32TruncF32U => (Oc::I32TruncF32U, Immediate::None),
-        I32TruncF64S => (Oc::I32TruncF64S, Immediate::None),
-        I32TruncF64U => (Oc::I32TruncF64U, Immediate::None),
-        I64ExtendI32S => (Oc::I64ExtendI32S, Immediate::None),
-        I64ExtendI32U => (Oc::I64ExtendI32U, Immediate::None),
-        I64TruncF32S => (Oc::I64TruncF32S, Immediate::None),
-        I64TruncF32U => (Oc::I64TruncF32U, Immediate::None),
-        I64TruncF64S => (Oc::I64TruncF64S, Immediate::None),
-        I64TruncF64U => (Oc::I64TruncF64U, Immediate::None),
-        F32ConvertI32S => (Oc::F32ConvertI32S, Immediate::None),
-        F32ConvertI32U => (Oc::F32ConvertI32U, Immediate::None),
-        F32ConvertI64S => (Oc::F32ConvertI64S, Immediate::None),
-        F32ConvertI64U => (Oc::F32ConvertI64U, Immediate::None),
-        F32DemoteF64 => (Oc::F32DemoteF64, Immediate::None),
-        F64ConvertI32S => (Oc::F64ConvertI32S, Immediate::None),
-        F64ConvertI32U => (Oc::F64ConvertI32U, Immediate::None),
-        F64ConvertI64S => (Oc::F64ConvertI64S, Immediate::None),
-        F64ConvertI64U => (Oc::F64ConvertI64U, Immediate::None),
-        F64PromoteF32 => (Oc::F64PromoteF32, Immediate::None),
-        I32ReinterpretF32 => (Oc::I32ReinterpretF32, Immediate::None),
-        I64ReinterpretF64 => (Oc::I64ReinterpretF64, Immediate::None),
-        F32ReinterpretI32 => (Oc::F32ReinterpretI32, Immediate::None),
-        F64ReinterpretI64 => (Oc::F64ReinterpretI64, Immediate::None),
+        I32WrapI64 => Ok((Oc::I32WrapI64, Immediate::None),),
+        I32TruncF32S => Ok((Oc::I32TruncF32S, Immediate::None),),
+        I32TruncF32U => Ok((Oc::I32TruncF32U, Immediate::None),),
+        I32TruncF64S => Ok((Oc::I32TruncF64S, Immediate::None),),
+        I32TruncF64U => Ok((Oc::I32TruncF64U, Immediate::None),),
+        I64ExtendI32S => Ok((Oc::I64ExtendI32S, Immediate::None),),
+        I64ExtendI32U => Ok((Oc::I64ExtendI32U, Immediate::None),),
+        I64TruncF32S => Ok((Oc::I64TruncF32S, Immediate::None),),
+        I64TruncF32U => Ok((Oc::I64TruncF32U, Immediate::None),),
+        I64TruncF64S => Ok((Oc::I64TruncF64S, Immediate::None),),
+        I64TruncF64U => Ok((Oc::I64TruncF64U, Immediate::None),),
+        F32ConvertI32S => Ok((Oc::F32ConvertI32S, Immediate::None),),
+        F32ConvertI32U => Ok((Oc::F32ConvertI32U, Immediate::None),),
+        F32ConvertI64S => Ok((Oc::F32ConvertI64S, Immediate::None),),
+        F32ConvertI64U => Ok((Oc::F32ConvertI64U, Immediate::None),),
+        F32DemoteF64 => Ok((Oc::F32DemoteF64, Immediate::None),),
+        F64ConvertI32S => Ok((Oc::F64ConvertI32S, Immediate::None),),
+        F64ConvertI32U => Ok((Oc::F64ConvertI32U, Immediate::None),),
+        F64ConvertI64S => Ok((Oc::F64ConvertI64S, Immediate::None),),
+        F64ConvertI64U => Ok((Oc::F64ConvertI64U, Immediate::None),),
+        F64PromoteF32 => Ok((Oc::F64PromoteF32, Immediate::None),),
+        I32ReinterpretF32 => Ok((Oc::I32ReinterpretF32, Immediate::None),),
+        I64ReinterpretF64 => Ok((Oc::I64ReinterpretF64, Immediate::None),),
+        F32ReinterpretI32 => Ok((Oc::F32ReinterpretI32, Immediate::None),),
+        F64ReinterpretI64 => Ok((Oc::F64ReinterpretI64, Immediate::None),),
 
         // ── Sign extension ──
-        I32Extend8S => (Oc::I32Extend8S, Immediate::None),
-        I32Extend16S => (Oc::I32Extend16S, Immediate::None),
-        I64Extend8S => (Oc::I64Extend8S, Immediate::None),
-        I64Extend16S => (Oc::I64Extend16S, Immediate::None),
-        I64Extend32S => (Oc::I64Extend32S, Immediate::None),
+        I32Extend8S => Ok((Oc::I32Extend8S, Immediate::None),),
+        I32Extend16S => Ok((Oc::I32Extend16S, Immediate::None),),
+        I64Extend8S => Ok((Oc::I64Extend8S, Immediate::None),),
+        I64Extend16S => Ok((Oc::I64Extend16S, Immediate::None),),
+        I64Extend32S => Ok((Oc::I64Extend32S, Immediate::None),),
 
         // ── Saturating float-to-int ──
-        I32TruncSatF32S => (Oc::I32TruncSatF32S, Immediate::None),
-        I32TruncSatF32U => (Oc::I32TruncSatF32U, Immediate::None),
-        I32TruncSatF64S => (Oc::I32TruncSatF64S, Immediate::None),
-        I32TruncSatF64U => (Oc::I32TruncSatF64U, Immediate::None),
-        I64TruncSatF32S => (Oc::I64TruncSatF32S, Immediate::None),
-        I64TruncSatF32U => (Oc::I64TruncSatF32U, Immediate::None),
-        I64TruncSatF64S => (Oc::I64TruncSatF64S, Immediate::None),
-        I64TruncSatF64U => (Oc::I64TruncSatF64U, Immediate::None),
+        I32TruncSatF32S => Ok((Oc::I32TruncSatF32S, Immediate::None),),
+        I32TruncSatF32U => Ok((Oc::I32TruncSatF32U, Immediate::None),),
+        I32TruncSatF64S => Ok((Oc::I32TruncSatF64S, Immediate::None),),
+        I32TruncSatF64U => Ok((Oc::I32TruncSatF64U, Immediate::None),),
+        I64TruncSatF32S => Ok((Oc::I64TruncSatF32S, Immediate::None),),
+        I64TruncSatF32U => Ok((Oc::I64TruncSatF32U, Immediate::None),),
+        I64TruncSatF64S => Ok((Oc::I64TruncSatF64S, Immediate::None),),
+        I64TruncSatF64U => Ok((Oc::I64TruncSatF64U, Immediate::None),),
 
         // ── Bulk memory ──
-        MemoryInit { data_index, mem: _mem } => (
+        MemoryInit { data_index, mem: _mem } => Ok((
             Oc::MemoryInit,
             Immediate::DataIndex(data_index),
-        ),
-        DataDrop { data_index } => (
+        ),),
+        DataDrop { data_index } => Ok((
             Oc::DataDrop,
             Immediate::DataIndex(data_index),
-        ),
+        ),),
         MemoryCopy {
             dst_mem,
             src_mem,
-        } => (
+        } => Ok((
             Oc::MemoryCopy,
             Immediate::MemoryCopy {
                 dst_index: dst_mem,
                 src_index: src_mem,
             },
-        ),
-        MemoryFill { mem } => (Oc::MemoryFill, Immediate::MemoryIndex(mem)),
+        ),),
+        MemoryFill { mem } => Ok((Oc::MemoryFill, Immediate::MemoryIndex(mem)),),
         TableInit {
             elem_index,
             table: _table,
-        } => (Oc::TableInit, Immediate::ElemIndex(elem_index)),
-        ElemDrop { elem_index } => (Oc::ElemDrop, Immediate::ElemIndex(elem_index)),
+        } => Ok((Oc::TableInit, Immediate::ElemIndex(elem_index)),),
+        ElemDrop { elem_index } => Ok((Oc::ElemDrop, Immediate::ElemIndex(elem_index)),),
         TableCopy {
             dst_table,
             src_table,
-        } => (
+        } => Ok((
             Oc::TableCopy,
             Immediate::TableCopy {
                 dst_table,
                 src_table,
             },
-        ),
+        ),),
 
         // ── Reference types ──
-        RefNull { hty } => (Oc::RefNull, Immediate::RefNull(format!("{hty:?}"))),
-        RefIsNull => (Oc::RefIsNull, Immediate::None),
-        RefFunc { function_index } => (Oc::RefFunc, Immediate::RefFunc(function_index)),
-        TypedSelect { .. } => (Oc::Select, Immediate::SelectTypes(vec![])),
-        TableFill { table } => (Oc::TableFill, Immediate::TableIndex(table)),
-        TableGet { table } => (Oc::TableGet, Immediate::TableIndex(table)),
-        TableSet { table } => (Oc::TableSet, Immediate::TableIndex(table)),
-        TableGrow { table } => (Oc::TableGrow, Immediate::TableIndex(table)),
-        TableSize { table } => (Oc::TableSize, Immediate::TableIndex(table)),
+        RefNull { hty } => Ok((Oc::RefNull, Immediate::RefNull(format!("{hty:?}"))),),
+        RefIsNull => Ok((Oc::RefIsNull, Immediate::None),),
+        RefFunc { function_index } => Ok((Oc::RefFunc, Immediate::RefFunc(function_index)),),
+        TypedSelect { .. } => Ok((Oc::Select, Immediate::SelectTypes(vec![])),),
+        TableFill { table } => Ok((Oc::TableFill, Immediate::TableIndex(table)),),
+        TableGet { table } => Ok((Oc::TableGet, Immediate::TableIndex(table)),),
+        TableSet { table } => Ok((Oc::TableSet, Immediate::TableIndex(table)),),
+        TableGrow { table } => Ok((Oc::TableGrow, Immediate::TableIndex(table)),),
+        TableSize { table } => Ok((Oc::TableSize, Immediate::TableIndex(table)),),
 
         // ── Tail call ──
-        ReturnCall { function_index } => (Oc::ReturnCall, Immediate::Call(function_index)),
+        ReturnCall { function_index } => Ok((Oc::ReturnCall, Immediate::Call(function_index)),),
         ReturnCallIndirect {
             type_index,
             table_index,
-        } => (
+        } => Ok((
             Oc::ReturnCallIndirect,
             Immediate::CallIndirect {
                 type_index,
                 table_index,
             },
-        ),
+        ),),
 
         // ── GC ──
-        RefEq => (Oc::RefEq, Immediate::None),
+        RefEq => Ok((Oc::RefEq, Immediate::None),),
         StructNew {
             struct_type_index,
-        } => (Oc::StructNew, Immediate::StructType(struct_type_index)),
+        } => Ok((Oc::StructNew, Immediate::StructType(struct_type_index)),),
         StructNewDefault {
             struct_type_index,
-        } => (
+        } => Ok((
             Oc::StructNewDefault,
             Immediate::StructType(struct_type_index),
-        ),
+        ),),
         StructGet {
             struct_type_index,
             field_index,
-        } => (
+        } => Ok((
             Oc::StructGet,
             Immediate::StructField {
                 type_index: struct_type_index,
                 field_index,
             },
-        ),
+        ),),
         StructGetS {
             struct_type_index,
             field_index,
-        } => (
+        } => Ok((
             Oc::StructGetS,
             Immediate::StructField {
                 type_index: struct_type_index,
                 field_index,
             },
-        ),
+        ),),
         StructGetU {
             struct_type_index,
             field_index,
-        } => (
+        } => Ok((
             Oc::StructGetU,
             Immediate::StructField {
                 type_index: struct_type_index,
                 field_index,
             },
-        ),
+        ),),
         StructSet {
             struct_type_index,
             field_index,
-        } => (
+        } => Ok((
             Oc::StructSet,
             Immediate::StructField {
                 type_index: struct_type_index,
                 field_index,
             },
-        ),
+        ),),
         ArrayNew {
             array_type_index,
-        } => (Oc::ArrayNew, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayNew, Immediate::ArrayType(array_type_index)),),
         ArrayNewDefault {
             array_type_index,
-        } => (Oc::ArrayNewDefault, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayNewDefault, Immediate::ArrayType(array_type_index)),),
         ArrayNewFixed {
             array_type_index,
             array_size,
-        } => (
+        } => Ok((
             Oc::ArrayNewFixed,
             Immediate::ArrayNewFixed {
                 type_index: array_type_index,
                 size: array_size,
             },
-        ),
+        ),),
         ArrayNewData {
             array_type_index,
             array_data_index,
-        } => (
+        } => Ok((
             Oc::ArrayNewData,
             Immediate::ArrayNewData {
                 type_index: array_type_index,
                 data_index: array_data_index,
             },
-        ),
+        ),),
         ArrayNewElem {
             array_type_index,
             array_elem_index,
-        } => (
+        } => Ok((
             Oc::ArrayNewElem,
             Immediate::ArrayNewElem {
                 type_index: array_type_index,
                 elem_index: array_elem_index,
             },
-        ),
+        ),),
         ArrayGet {
             array_type_index,
-        } => (Oc::ArrayGet, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayGet, Immediate::ArrayType(array_type_index)),),
         ArrayGetS {
             array_type_index,
-        } => (Oc::ArrayGetS, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayGetS, Immediate::ArrayType(array_type_index)),),
         ArrayGetU {
             array_type_index,
-        } => (Oc::ArrayGetU, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayGetU, Immediate::ArrayType(array_type_index)),),
         ArraySet {
             array_type_index,
-        } => (Oc::ArraySet, Immediate::ArrayType(array_type_index)),
-        ArrayLen => (Oc::ArrayLen, Immediate::None),
+        } => Ok((Oc::ArraySet, Immediate::ArrayType(array_type_index)),),
+        ArrayLen => Ok((Oc::ArrayLen, Immediate::None),),
         ArrayFill {
             array_type_index,
-        } => (Oc::ArrayFill, Immediate::ArrayType(array_type_index)),
+        } => Ok((Oc::ArrayFill, Immediate::ArrayType(array_type_index)),),
         ArrayCopy {
             array_type_index_dst,
             array_type_index_src,
-        } => (
+        } => Ok((
             Oc::ArrayCopy,
             Immediate::Unrecognized(format!(
                 "ArrayCopy {{ array_type_index_dst: {array_type_index_dst}, array_type_index_src: {array_type_index_src} }}"
             )),
-        ),
+        ),),
         ArrayInitData {
             array_type_index,
             array_data_index,
-        } => (
+        } => Ok((
             Oc::ArrayInitData,
             Immediate::ArrayNewData {
                 type_index: array_type_index,
                 data_index: array_data_index,
             },
-        ),
+        ),),
         ArrayInitElem {
             array_type_index,
             array_elem_index,
-        } => (
+        } => Ok((
             Oc::ArrayInitElem,
             Immediate::ArrayNewElem {
                 type_index: array_type_index,
                 elem_index: array_elem_index,
             },
-        ),
-        RefTestNonNull { hty } => (
+        ),),
+        RefTestNonNull { hty } => Ok((
             Oc::RefTestRef,
             Immediate::Unrecognized(format!("RefTestNonNull {{ hty: {hty:?} }}")),
-        ),
-        RefTestNullable { hty } => (
+        ),),
+        RefTestNullable { hty } => Ok((
             Oc::Unrecognized(format!("RefTestNullable {{ hty: {hty:?} }}")),
             Immediate::Unrecognized(format!("RefTestNullable {{ hty: {hty:?} }}")),
-        ),
-        RefCastNonNull { hty } => (
+        ),),
+        RefCastNonNull { hty } => Ok((
             Oc::RefCastRef,
             Immediate::Unrecognized(format!("RefCastNonNull {{ hty: {hty:?} }}")),
-        ),
-        RefCastNullable { hty } => (
+        ),),
+        RefCastNullable { hty } => Ok((
             Oc::Unrecognized(format!("RefCastNullable {{ hty: {hty:?} }}")),
             Immediate::Unrecognized(format!("RefCastNullable {{ hty: {hty:?} }}")),
-        ),
+        ),),
         BrOnCast {
             relative_depth,
             from_ref_type,
             to_ref_type,
-        } => (
+        } => Ok((
             Oc::BrOnCast,
             Immediate::BrOnCast {
                 src_type: format!("{from_ref_type:?}"),
                 dst_type: format!("{to_ref_type:?}"),
                 label: relative_depth,
             },
-        ),
+        ),),
         BrOnCastFail {
             relative_depth,
             from_ref_type,
             to_ref_type,
-        } => (
+        } => Ok((
             Oc::BrOnCastFail,
             Immediate::BrOnCast {
                 src_type: format!("{from_ref_type:?}"),
                 dst_type: format!("{to_ref_type:?}"),
                 label: relative_depth,
             },
-        ),
-        AnyConvertExtern => (Oc::AnyConvertExtern, Immediate::None),
-        ExternConvertAny => (Oc::ExternConvertAny, Immediate::None),
-        RefI31 => (Oc::RefI31, Immediate::None),
-        I31GetS => (Oc::I31GetS, Immediate::None),
-        I31GetU => (Oc::I31GetU, Immediate::None),
+        ),),
+        AnyConvertExtern => Ok((Oc::AnyConvertExtern, Immediate::None),),
+        ExternConvertAny => Ok((Oc::ExternConvertAny, Immediate::None),),
+        RefI31 => Ok((Oc::RefI31, Immediate::None),),
+        I31GetS => Ok((Oc::I31GetS, Immediate::None),),
+        I31GetU => Ok((Oc::I31GetU, Immediate::None),),
 
         // ── Exceptions ──
-        TryTable { try_table } => (
+        TryTable { try_table } => Ok((
             Oc::TryTable,
             Immediate::Unrecognized(format!("TryTable {{ try_table: {try_table:?} }}")),
-        ),
-        Throw { tag_index } => (Oc::Throw, Immediate::TagIndex(tag_index)),
-        ThrowRef => (Oc::ThrowRef, Immediate::None),
+        ),),
+        Throw { tag_index } => Ok((Oc::Throw, Immediate::TagIndex(tag_index)),),
+        ThrowRef => Ok((Oc::ThrowRef, Immediate::None),),
 
         // ── Legacy exceptions ──
-        Try { blockty } => (
+        Try { blockty } => Ok((
             Oc::Unrecognized(format!("Try {{ blockty: {blockty:?} }}")),
             Immediate::BlockType(format!("{blockty:?}")),
-        ),
-        Catch { tag_index } => (Oc::Catch, Immediate::TagIndex(tag_index)),
-        Rethrow { relative_depth } => (Oc::Rethrow, Immediate::Branch(relative_depth)),
-        Delegate { relative_depth } => (Oc::Delegate, Immediate::Branch(relative_depth)),
-        CatchAll => (Oc::CatchAll, Immediate::None),
+        ),),
+        Catch { tag_index } => Ok((Oc::Catch, Immediate::TagIndex(tag_index)),),
+        Rethrow { relative_depth } => Ok((Oc::Rethrow, Immediate::Branch(relative_depth)),),
+        Delegate { relative_depth } => Ok((Oc::Delegate, Immediate::Branch(relative_depth)),),
+        CatchAll => Ok((Oc::CatchAll, Immediate::None),),
 
         // ── Reference types: TypedSelectMulti ──
-        TypedSelectMulti { tys } => (
+        TypedSelectMulti { tys } => Ok((
             Oc::Select,
             Immediate::SelectTypes(tys.iter().map(|t| format!("{t:?}")).collect()),
-        ),
+        ),),
 
         // ── SIMD lane loads/stores ──
-        V128Load8Lane { memarg, lane } => (
+        V128Load8Lane { memarg, lane } => Ok((
             Oc::V128Load8Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Load16Lane { memarg, lane } => (
+        ),),
+        V128Load16Lane { memarg, lane } => Ok((
             Oc::V128Load16Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Load32Lane { memarg, lane } => (
+        ),),
+        V128Load32Lane { memarg, lane } => Ok((
             Oc::V128Load32Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Load64Lane { memarg, lane } => (
+        ),),
+        V128Load64Lane { memarg, lane } => Ok((
             Oc::V128Load64Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Store8Lane { memarg, lane } => (
+        ),),
+        V128Store8Lane { memarg, lane } => Ok((
             Oc::V128Store8Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Store16Lane { memarg, lane } => (
+        ),),
+        V128Store16Lane { memarg, lane } => Ok((
             Oc::V128Store16Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Store32Lane { memarg, lane } => (
+        ),),
+        V128Store32Lane { memarg, lane } => Ok((
             Oc::V128Store32Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
-        V128Store64Lane { memarg, lane } => (
+        ),),
+        V128Store64Lane { memarg, lane } => Ok((
             Oc::V128Store64Lane,
             Immediate::SimdMemLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
                 lane,
             },
-        ),
+        ),),
 
         // ── SIMD division / pmin / pmax ──
-        F32x4Div => (Oc::F32x4Div, Immediate::None),
-        F32x4PMin => (Oc::F32x4PMin, Immediate::None),
-        F32x4PMax => (Oc::F32x4PMax, Immediate::None),
-        F64x2Div => (Oc::F64x2Div, Immediate::None),
-        F64x2PMin => (Oc::F64x2PMin, Immediate::None),
-        F64x2PMax => (Oc::F64x2PMax, Immediate::None),
+        F32x4Div => Ok((Oc::F32x4Div, Immediate::None),),
+        F32x4PMin => Ok((Oc::F32x4PMin, Immediate::None),),
+        F32x4PMax => Ok((Oc::F32x4PMax, Immediate::None),),
+        F64x2Div => Ok((Oc::F64x2Div, Immediate::None),),
+        F64x2PMin => Ok((Oc::F64x2PMin, Immediate::None),),
+        F64x2PMax => Ok((Oc::F64x2PMax, Immediate::None),),
 
         // ── Relaxed SIMD ──
-        I8x16RelaxedSwizzle => (Oc::I8x16RelaxedSwizzle, Immediate::None),
-        I32x4RelaxedTruncF32x4S => (Oc::I32x4RelaxedTruncF32x4S, Immediate::None),
-        I32x4RelaxedTruncF32x4U => (Oc::I32x4RelaxedTruncF32x4U, Immediate::None),
-        I32x4RelaxedTruncF64x2SZero => (Oc::I32x4RelaxedTruncF64x2SZero, Immediate::None),
-        I32x4RelaxedTruncF64x2UZero => (Oc::I32x4RelaxedTruncF64x2UZero, Immediate::None),
-        F32x4RelaxedMadd => (Oc::F32x4RelaxedMadd, Immediate::None),
-        F32x4RelaxedNmadd => (Oc::F32x4RelaxedNmadd, Immediate::None),
-        F64x2RelaxedMadd => (Oc::F64x2RelaxedMadd, Immediate::None),
-        F64x2RelaxedNmadd => (Oc::F64x2RelaxedNmadd, Immediate::None),
-        I8x16RelaxedLaneselect => (Oc::I8x16RelaxedLaneselect, Immediate::None),
-        I16x8RelaxedLaneselect => (Oc::I16x8RelaxedLaneselect, Immediate::None),
-        I32x4RelaxedLaneselect => (Oc::I32x4RelaxedLaneselect, Immediate::None),
-        I64x2RelaxedLaneselect => (Oc::I64x2RelaxedLaneselect, Immediate::None),
-        F32x4RelaxedMin => (Oc::F32x4RelaxedMin, Immediate::None),
-        F32x4RelaxedMax => (Oc::F32x4RelaxedMax, Immediate::None),
-        F64x2RelaxedMin => (Oc::F64x2RelaxedMin, Immediate::None),
-        F64x2RelaxedMax => (Oc::F64x2RelaxedMax, Immediate::None),
-        I16x8RelaxedQ15mulrS => (Oc::I16x8RelaxedQ15mulrS, Immediate::None),
-        I16x8RelaxedDotI8x16I7x16S => (Oc::I16x8RelaxedDotI8x16I7x16S, Immediate::None),
-        I32x4RelaxedDotI8x16I7x16AddS => (Oc::I32x4RelaxedDotI8x16I7x16AddS, Immediate::None),
+        I8x16RelaxedSwizzle => Ok((Oc::I8x16RelaxedSwizzle, Immediate::None),),
+        I32x4RelaxedTruncF32x4S => Ok((Oc::I32x4RelaxedTruncF32x4S, Immediate::None),),
+        I32x4RelaxedTruncF32x4U => Ok((Oc::I32x4RelaxedTruncF32x4U, Immediate::None),),
+        I32x4RelaxedTruncF64x2SZero => Ok((Oc::I32x4RelaxedTruncF64x2SZero, Immediate::None),),
+        I32x4RelaxedTruncF64x2UZero => Ok((Oc::I32x4RelaxedTruncF64x2UZero, Immediate::None),),
+        F32x4RelaxedMadd => Ok((Oc::F32x4RelaxedMadd, Immediate::None),),
+        F32x4RelaxedNmadd => Ok((Oc::F32x4RelaxedNmadd, Immediate::None),),
+        F64x2RelaxedMadd => Ok((Oc::F64x2RelaxedMadd, Immediate::None),),
+        F64x2RelaxedNmadd => Ok((Oc::F64x2RelaxedNmadd, Immediate::None),),
+        I8x16RelaxedLaneselect => Ok((Oc::I8x16RelaxedLaneselect, Immediate::None),),
+        I16x8RelaxedLaneselect => Ok((Oc::I16x8RelaxedLaneselect, Immediate::None),),
+        I32x4RelaxedLaneselect => Ok((Oc::I32x4RelaxedLaneselect, Immediate::None),),
+        I64x2RelaxedLaneselect => Ok((Oc::I64x2RelaxedLaneselect, Immediate::None),),
+        F32x4RelaxedMin => Ok((Oc::F32x4RelaxedMin, Immediate::None),),
+        F32x4RelaxedMax => Ok((Oc::F32x4RelaxedMax, Immediate::None),),
+        F64x2RelaxedMin => Ok((Oc::F64x2RelaxedMin, Immediate::None),),
+        F64x2RelaxedMax => Ok((Oc::F64x2RelaxedMax, Immediate::None),),
+        I16x8RelaxedQ15mulrS => Ok((Oc::I16x8RelaxedQ15mulrS, Immediate::None),),
+        I16x8RelaxedDotI8x16I7x16S => Ok((Oc::I16x8RelaxedDotI8x16I7x16S, Immediate::None),),
+        I32x4RelaxedDotI8x16I7x16AddS => Ok((Oc::I32x4RelaxedDotI8x16I7x16AddS, Immediate::None),),
 
         // ── Catch-all for unrecognized opcodes ──
         unknown => {
             let name = extract_operator_name(&unknown);
-            (Opcode::Unrecognized(name.clone()), Immediate::Unrecognized(name))
+            Ok((Opcode::Unrecognized(name.clone()), Immediate::Unrecognized(name)))
         }
     }
 }
@@ -1371,6 +1377,59 @@ mod tests {
         assert_eq!(
             first, second,
             "parsing same bytes must produce identical ParsedModule"
+        );
+    }
+
+    #[test]
+    fn parse_br_table_preserves_targets() {
+        // Minimal wasm module with a single br_table instruction:
+        //   br_table 2(targets=0,1) default=2
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\0asm");
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        // Type section: (func () -> ())
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        // Function section: 1 function uses type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        // Code section: 1 body, br_table count=2, targets=[0,1], default=2, end
+        bytes.extend_from_slice(&[
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x0e, 0x02, 0x00, 0x01, 0x02, 0x0b,
+        ]);
+
+        let module = parse_module(&bytes).expect("valid br_table module should parse");
+        assert_eq!(module.functions.len(), 1);
+        let func = &module.functions[0];
+        assert_eq!(func.operators.len(), 2); // br_table + end
+        assert_eq!(func.operators[0].opcode, Opcode::BrTable);
+        match &func.operators[0].immediate {
+            crate::ir::Immediate::BrTable {
+                targets,
+                default_target,
+            } => {
+                assert_eq!(targets, &vec![0_u32, 1_u32]);
+                assert_eq!(*default_target, 2_u32);
+            }
+            other => panic!("expected BrTable immediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_malformed_br_table_fails() {
+        // Truncated br_table: count says 2 targets but body ends after 1 target byte.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\0asm");
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        // Type section: (func () -> ())
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        // Function section: 1 function uses type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        // Code section: truncated br_table (count=2, only 1 target byte provided)
+        bytes.extend_from_slice(&[0x0a, 0x06, 0x01, 0x04, 0x00, 0x0e, 0x02, 0x00]);
+
+        let error = parse_module(&bytes).expect_err("malformed br_table should fail");
+        assert!(
+            error.to_string().starts_with("wasm parse error:"),
+            "error should be a ParseError: {error}"
         );
     }
 }
