@@ -264,7 +264,15 @@ fn ids_by_import(items: &[ImportIr]) -> Vec<String> {
 }
 
 fn ids_by_export(items: &[ExportIr]) -> Vec<String> {
-    items.iter().map(|item| item.id.clone()).collect()
+    items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:target:{}:exact:{}",
+                item.id, item.item_index, item.exact
+            )
+        })
+        .collect()
 }
 
 fn push_collection_changes(
@@ -277,11 +285,23 @@ fn push_collection_changes(
     old_ids.sort();
     new_ids.sort();
 
-    for id in old_ids.iter().filter(|id| !new_ids.contains(id)) {
-        changes.push(removed(id.clone()));
-    }
-    for id in new_ids.iter().filter(|id| !old_ids.contains(id)) {
-        changes.push(added(id.clone()));
+    let (mut old_index, mut new_index) = (0, 0);
+    while old_index < old_ids.len() || new_index < new_ids.len() {
+        match (old_ids.get(old_index), new_ids.get(new_index)) {
+            (Some(old), Some(new)) if old == new => {
+                old_index += 1;
+                new_index += 1;
+            }
+            (Some(old), new) if new.is_none_or(|new| old < new) => {
+                changes.push(removed(old.clone()));
+                old_index += 1;
+            }
+            (_, Some(new)) => {
+                changes.push(added(new.clone()));
+                new_index += 1;
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -333,6 +353,34 @@ mod tests {
     use crate::normalize::normalize_module;
     use crate::parse::parse_module;
     use crate::resolve::resolve_module;
+
+    #[test]
+    fn collection_deltas_preserve_duplicate_multiplicity() {
+        let mut changes = Vec::new();
+        super::push_collection_changes(
+            vec!["same".into(), "same".into()],
+            vec!["same".into()],
+            |id| DiffChange::ImportRemoved { id },
+            |id| DiffChange::ImportAdded { id },
+            &mut changes,
+        );
+        assert_eq!(
+            changes,
+            vec![DiffChange::ImportRemoved { id: "same".into() }]
+        );
+    }
+
+    #[test]
+    fn export_target_changes_are_reported() {
+        let old = normalized_fixture(include_bytes!("../tests/fixtures/old.wasm"));
+        let mut new = old.clone();
+        new.module.exports[0].item_index += 1;
+        let report = diff_modules("old", &old, "new", &new);
+        assert_eq!(
+            (report.summary.exports_added, report.summary.exports_removed),
+            (1, 1)
+        );
+    }
 
     fn normalized_fixture(bytes: &[u8]) -> crate::ir::NormalizedModule {
         let resolved = resolve_module(parse_module(bytes).unwrap());

@@ -133,10 +133,12 @@ fn canonical_body_hash(module: &ModuleIr, function: &FunctionIr) -> FingerprintH
 /// raw call target indices with stable function IDs.
 fn canonical_operator_text(module: &ModuleIr, operator: &ParsedOperator) -> String {
     match &operator.immediate {
-        Immediate::Call(index) => module.functions.get(*index as usize).map_or_else(
-            || format!("function_index:{index}"),
-            |target| format!("Call {{ function: {} }}", target.id),
-        ),
+        Immediate::Call(index) | Immediate::RefFunc(index) => {
+            module.functions.get(*index as usize).map_or_else(
+                || format!("function_index:{index}"),
+                |target| format!("{} {{ function: {} }}", operator.opcode.as_str(), target.id),
+            )
+        }
         immediate => immediate.as_hash_text(),
     }
 }
@@ -329,5 +331,59 @@ mod tests {
             fp_first, fp_second,
             "fingerprints must be deterministic under repeated parses"
         );
+    }
+
+    fn exported_reference_module(with_import: bool, reference: bool) -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        let mut section = |id: u8, payload: &[u8]| {
+            bytes.push(id);
+            bytes.push(u8::try_from(payload.len()).unwrap());
+            bytes.extend_from_slice(payload);
+        };
+        section(1, &[1, 0x60, 0, 0]);
+        if with_import {
+            section(2, b"\x01\x03env\x06unused\x00\x00");
+        }
+        section(3, &[2, 0, 0]);
+        let callee = u8::from(with_import);
+        let mut exports = b"\x01\x06target\x00".to_vec();
+        exports.push(callee);
+        section(7, &exports);
+        let mut code = vec![2, 3, 0, 1, 0x0b];
+        if reference {
+            code.extend_from_slice(&[5, 0, 0xd2, callee, 0x1a, 0x0b]);
+        } else {
+            code.extend_from_slice(&[4, 0, 0x10, callee, 0x0b]);
+        }
+        section(10, &code);
+        bytes
+    }
+
+    #[test]
+    fn exported_call_and_reference_targets_survive_import_index_drift() {
+        for reference in [false, true] {
+            let original = resolved(&exported_reference_module(false, reference));
+            let shifted = resolved(&exported_reference_module(true, reference));
+            let first = function_fingerprint(&original.module, &original.functions[1]);
+            let second = function_fingerprint(&shifted.module, &shifted.functions[2]);
+            assert_eq!(first.canonical_body_hash, second.canonical_body_hash);
+            assert_eq!(first.stable_id, second.stable_id);
+            assert_ne!(first.exact_body_hash, second.exact_body_hash);
+        }
+    }
+
+    #[test]
+    fn fingerprints_detect_nan_payload_only_edits() {
+        use crate::ir::{Immediate, Opcode};
+        let module = resolved(include_bytes!("../tests/fixtures/old.wasm"));
+        let mut first = module.functions[0].clone();
+        first.operators[0].opcode = Opcode::F32Const;
+        first.operators[0].immediate = Immediate::F32Const(0x7fc0_0001);
+        let mut second = first.clone();
+        second.operators[0].immediate = Immediate::F32Const(0x7fc0_0002);
+        let first = function_fingerprint(&module.module, &first);
+        let second = function_fingerprint(&module.module, &second);
+        assert_ne!(first.exact_body_hash, second.exact_body_hash);
+        assert_ne!(first.canonical_body_hash, second.canonical_body_hash);
     }
 }

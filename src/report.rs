@@ -60,8 +60,8 @@ pub fn diff_text(report: &DiffReport) -> String {
     lines.push(format!(
         "{}: {} -> {}",
         "Diff".bold(),
-        report.old,
-        report.new
+        safe_text(&report.old),
+        safe_text(&report.new)
     ));
     push_summary_lines(report, &mut lines);
 
@@ -71,20 +71,24 @@ pub fn diff_text(report: &DiffReport) -> String {
     } else {
         for function_match in &report.function_matches {
             lines.push(format!(
-                "  {} {} -> {} confidence={:.2} similarity={:.2} reason={:?} old_index={} new_index={}",
+                "  {} {} -> {} confidence={:.2} similarity={:.2} reason={:?} old_index={} new_index={} ambiguous={}",
                 "=".cyan(),
-                function_match.old_id,
-                function_match.new_id,
+                safe_text(&function_match.old_id),
+                safe_text(&function_match.new_id),
                 function_match.confidence,
                 function_match.similarity,
                 function_match.reason,
                 function_match.old_source_index,
                 function_match.new_source_index
+                ,function_match.ambiguous
             ));
         }
     }
 
-    lines.push(format!("{}", "Changes:".bold()));
+    lines.push(format!(
+        "{}",
+        "Function/interface projection changes:".bold()
+    ));
     if report.changes.is_empty() {
         lines.push("  none".to_owned());
     } else {
@@ -101,8 +105,8 @@ pub fn diff_short(report: &DiffReport) -> String {
     lines.push(format!(
         "{}: {} -> {}",
         "Diff".bold(),
-        report.old,
-        report.new
+        safe_text(&report.old),
+        safe_text(&report.new)
     ));
     push_summary_lines(report, &mut lines);
 
@@ -117,9 +121,19 @@ pub fn diff_short(report: &DiffReport) -> String {
             fallback_matches.to_string().bright_black()
         ));
     }
+    let ambiguous = report
+        .function_matches
+        .iter()
+        .filter(|m| m.ambiguous)
+        .count();
+    if ambiguous > 0 {
+        lines.push(format!(
+            "  ambiguous function pairings: {ambiguous} (identity unproven)"
+        ));
+    }
 
     if report.changes.is_empty() {
-        lines.push(format!("  {}", "changes: none".green()));
+        lines.push(format!("  {}", "function/interface changes: none".green()));
     } else {
         let changed_functions = report
             .changes
@@ -127,7 +141,7 @@ pub fn diff_short(report: &DiffReport) -> String {
             .filter(|change| matches!(change, DiffChange::FunctionChanged { .. }))
             .count();
         lines.push(format!(
-            "  changes: {} total, {} functions",
+            "  function/interface changes: {} total, {} functions",
             report.changes.len().to_string().yellow(),
             changed_functions.to_string().yellow()
         ));
@@ -176,38 +190,50 @@ fn push_summary_lines(report: &DiffReport, lines: &mut Vec<String>) {
             format!("-{}", report.summary.exports_removed).red(),
         ));
     } else {
-        lines.push(format!("  {}", "abi: unchanged".green()));
+        lines.push(format!(
+            "  {}",
+            "abi: unchanged in the listed type/import/export projection; see complete binary audit"
+                .green()
+        ));
     }
 }
 
 fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
     match change {
-        DiffChange::TypeAdded { id } => lines.push(format!("  {}", format!("+ type {id}").green())),
-        DiffChange::TypeRemoved { id } => lines.push(format!("  {}", format!("- type {id}").red())),
-        DiffChange::ImportAdded { id } => {
-            lines.push(format!("  {}", format!("+ import {id}").green()))
+        DiffChange::TypeAdded { id } => {
+            lines.push(format!("  {}", format!("+ type {}", safe_text(id)).green()))
         }
+        DiffChange::TypeRemoved { id } => {
+            lines.push(format!("  {}", format!("- type {}", safe_text(id)).red()))
+        }
+        DiffChange::ImportAdded { id } => lines.push(format!(
+            "  {}",
+            format!("+ import {}", safe_text(id)).green()
+        )),
         DiffChange::ImportRemoved { id } => {
-            lines.push(format!("  {}", format!("- import {id}").red()))
+            lines.push(format!("  {}", format!("- import {}", safe_text(id)).red()))
         }
-        DiffChange::ExportAdded { id } => {
-            lines.push(format!("  {}", format!("+ export {id}").green()))
-        }
+        DiffChange::ExportAdded { id } => lines.push(format!(
+            "  {}",
+            format!("+ export {}", safe_text(id)).green()
+        )),
         DiffChange::ExportRemoved { id } => {
-            lines.push(format!("  {}", format!("- export {id}").red()))
+            lines.push(format!("  {}", format!("- export {}", safe_text(id)).red()))
         }
-        DiffChange::FunctionAdded { id } => {
-            lines.push(format!("  {}", format!("+ function {id}").green()))
-        }
-        DiffChange::FunctionRemoved { id } => {
-            lines.push(format!("  {}", format!("- function {id}").red()))
-        }
+        DiffChange::FunctionAdded { id } => lines.push(format!(
+            "  {}",
+            format!("+ function {}", safe_text(id)).green()
+        )),
+        DiffChange::FunctionRemoved { id } => lines.push(format!(
+            "  {}",
+            format!("- function {}", safe_text(id)).red()
+        )),
         DiffChange::FunctionChanged { function } => {
             lines.push(format!(
                 "  {} {} -> {}",
                 "~".yellow(),
-                function.old_id,
-                function.new_id
+                safe_text(&function.old_id),
+                safe_text(&function.new_id)
             ));
             if function.type_changed {
                 lines.push(format!("    {} type signature changed", "~".yellow()));
@@ -249,6 +275,22 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
     }
 }
 
+// Names in Wasm are arbitrary UTF-8. Preserve them without allowing embedded
+// terminal controls to forge report lines or color escapes.
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control()
+                || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ch.escape_default().to_string()
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{diff_json, diff_short, diff_text};
@@ -260,6 +302,12 @@ mod tests {
     fn normalized(bytes: &[u8]) -> crate::ir::NormalizedModule {
         let resolved = resolve_module(parse_module(bytes).unwrap());
         normalize_module(&resolved)
+    }
+
+    #[test]
+    fn textual_names_cannot_inject_report_lines() {
+        assert_eq!(super::safe_text("name\n\u{1b}[31m"), r"name\n\u{1b}[31m");
+        assert_eq!(super::safe_text("name\u{202e}"), r"name\u{202e}");
     }
 
     #[test]

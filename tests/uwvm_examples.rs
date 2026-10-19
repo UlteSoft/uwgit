@@ -1,0 +1,694 @@
+//! Opt-in verification of the external, read-only uwvm2-ros examples corpus.
+//! This exercises original Core Wasm bytes and producer output, never runtime
+//! behavior or ROS delivery. Every generated artifact must be below /tmp.
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::{Component, Path, PathBuf};
+use wasm_git::{audit, patch};
+use wasmparser::{ExternalKind, Parser, Payload, TypeRef, Validator, WasmFeatures};
+
+const HEADER: &[u8; 8] = b"\0asm\x01\0\0\0";
+
+#[derive(Debug, Serialize)]
+struct Failure {
+    path: String,
+    stage: String,
+    message: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct Summary {
+    discovered_wasm: usize,
+    discovered_wat: usize,
+    ignored_regular_files: usize,
+    encoded_wat: usize,
+    valid_core_modules: usize,
+    identity_replays: usize,
+    mutation_replays: usize,
+    serialized_identity_patch_replays: usize,
+    serialized_mutation_patch_replays: usize,
+    paired_binaries: usize,
+    paired_binary_replays: usize,
+    paired_binaries_changed: usize,
+    failures: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FileEvidence {
+    relative_path: String,
+    kind: String,
+    source_sha256: Option<String>,
+    source_len: Option<usize>,
+    binary_sha256: Option<String>,
+    binary_len: Option<usize>,
+    generated_path: Option<String>,
+    audit_validation: Option<String>,
+    audit_decoding_complete: bool,
+    audit_diagnostics: Vec<audit::Diagnostic>,
+    custom_types: Vec<Value>,
+    independent_inventory: Option<Value>,
+    identity_replay: bool,
+    serialized_identity_patch_replay: bool,
+    mutation_replay: bool,
+    serialized_mutation_patch_replay: bool,
+    mutation: Option<Value>,
+    paired_binary: Option<Value>,
+}
+
+impl FileEvidence {
+    fn new(relative: &Path, kind: &str) -> Self {
+        Self {
+            relative_path: relative.to_string_lossy().into_owned(),
+            kind: kind.into(),
+            source_sha256: None,
+            source_len: None,
+            binary_sha256: None,
+            binary_len: None,
+            generated_path: None,
+            audit_validation: None,
+            audit_decoding_complete: false,
+            audit_diagnostics: Vec::new(),
+            custom_types: Vec::new(),
+            independent_inventory: None,
+            identity_replay: false,
+            serialized_identity_patch_replay: false,
+            mutation_replay: false,
+            serialized_mutation_patch_replay: false,
+            mutation: None,
+            paired_binary: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CorpusReport {
+    schema_version: u32,
+    source_root: String,
+    examples_root: String,
+    build_root: String,
+    validator_profile: String,
+    interpretation: String,
+    complete: bool,
+    summary: Summary,
+    files: Vec<FileEvidence>,
+    failures: Vec<Failure>,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn failure(report: &mut CorpusReport, relative: &Path, stage: &str, message: impl ToString) {
+    report.failures.push(Failure {
+        path: relative.to_string_lossy().into_owned(),
+        stage: stage.into(),
+        message: message.to_string(),
+    });
+}
+
+fn discover(root: &Path, directory: &Path, report: &mut CorpusReport, files: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            failure(
+                report,
+                directory.strip_prefix(root).unwrap_or(directory),
+                "traversal",
+                error,
+            );
+            return;
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) => failure(
+                report,
+                directory.strip_prefix(root).unwrap_or(directory),
+                "traversal",
+                error,
+            ),
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let relative = path.strip_prefix(root).unwrap();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                failure(report, relative, "metadata", error);
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            failure(
+                report,
+                relative,
+                "symlink",
+                "symlinks are rejected, never followed or silently skipped",
+            );
+        } else if metadata.is_dir() {
+            discover(root, &path, report, files);
+        } else if metadata.is_file() {
+            match path.extension().and_then(|value| value.to_str()) {
+                Some("wasm") => {
+                    report.summary.discovered_wasm += 1;
+                    files.push(path);
+                }
+                Some("wat") => {
+                    report.summary.discovered_wat += 1;
+                    files.push(path);
+                }
+                _ => report.summary.ignored_regular_files += 1,
+            }
+        } else {
+            failure(
+                report,
+                relative,
+                "file_type",
+                "non-regular input is outside the frozen corpus",
+            );
+        }
+    }
+}
+
+/// Inventory comes directly from wasmparser, independently of audit's regions.
+/// Export signatures resolve their real kind-specific index spaces, including
+/// imported functions and GC recursion-group type indices.
+fn inventory(bytes: &[u8]) -> Result<Value, String> {
+    let mut types = Vec::<String>::new();
+    let mut imports = Vec::<Value>::new();
+    let mut functions = Vec::<u32>::new();
+    let mut tables = Vec::<String>::new();
+    let mut memories = Vec::<String>::new();
+    let mut globals = Vec::<String>::new();
+    let mut tags = Vec::<u32>::new();
+    let mut exports = Vec::new();
+    let mut custom = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|error| error.to_string())? {
+            Payload::TypeSection(reader) => {
+                for group in reader {
+                    for ty in group.map_err(|error| error.to_string())?.into_types() {
+                        types.push(format!("{ty:?}"));
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for group in reader {
+                    for import in group.map_err(|error| error.to_string())? {
+                        let (_, import) = import.map_err(|error| error.to_string())?;
+                        let (kind, type_index) = match import.ty {
+                            TypeRef::Func(index) => {
+                                functions.push(index);
+                                ("function", Some(index))
+                            }
+                            TypeRef::FuncExact(index) => {
+                                functions.push(index);
+                                ("function_exact", Some(index))
+                            }
+                            TypeRef::Table(ty) => {
+                                tables.push(format!("{ty:?}"));
+                                ("table", None)
+                            }
+                            TypeRef::Memory(ty) => {
+                                memories.push(format!("{ty:?}"));
+                                ("memory", None)
+                            }
+                            TypeRef::Global(ty) => {
+                                globals.push(format!("{ty:?}"));
+                                ("global", None)
+                            }
+                            TypeRef::Tag(ty) => {
+                                tags.push(ty.func_type_idx);
+                                ("tag", Some(ty.func_type_idx))
+                            }
+                        };
+                        imports.push(json!({
+                            "module":import.module,"name":import.name,"kind":kind,
+                            "type":format!("{:?}",import.ty),"type_index":type_index
+                        }));
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for ty in reader {
+                    functions.push(ty.map_err(|error| error.to_string())?);
+                }
+            }
+            Payload::TableSection(reader) => {
+                for table in reader {
+                    tables.push(format!(
+                        "{:?}",
+                        table.map_err(|error| error.to_string())?.ty
+                    ));
+                }
+            }
+            Payload::MemorySection(reader) => {
+                for memory in reader {
+                    memories.push(format!("{:?}", memory.map_err(|error| error.to_string())?));
+                }
+            }
+            Payload::GlobalSection(reader) => {
+                for global in reader {
+                    globals.push(format!(
+                        "{:?}",
+                        global.map_err(|error| error.to_string())?.ty
+                    ));
+                }
+            }
+            Payload::TagSection(reader) => {
+                for tag in reader {
+                    tags.push(tag.map_err(|error| error.to_string())?.func_type_idx);
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    exports.push(export.map_err(|error| error.to_string())?);
+                }
+            }
+            Payload::CustomSection(section) => custom.push(json!({
+                "name":section.name(),"data_offset":section.data_offset(),
+                "data_len":section.data().len(),"data_sha256":sha256(section.data()),
+                "range":{"start":section.range().start,"end":section.range().end}
+            })),
+            _ => {}
+        }
+    }
+    for import in &mut imports {
+        if let Some(index) = import["type_index"].as_u64() {
+            import["resolved_type"] = json!(types
+                .get(index as usize)
+                .ok_or_else(|| format!("import type index {index} is outside the type section"))?);
+        }
+    }
+    let exports = exports
+        .into_iter()
+        .map(|export| {
+            let index = export.index as usize;
+            let (kind, ty) = match export.kind {
+                ExternalKind::Func | ExternalKind::FuncExact => {
+                    let ty_index = *functions
+                        .get(index)
+                        .ok_or("export function index is out of range")?;
+                    let ty = types
+                        .get(ty_index as usize)
+                        .ok_or("export function type index is out of range")?;
+                    (
+                        if export.kind == ExternalKind::FuncExact {
+                            "function_exact"
+                        } else {
+                            "function"
+                        },
+                        json!({"type_index":ty_index,"signature":ty}),
+                    )
+                }
+                ExternalKind::Table => (
+                    "table",
+                    json!(tables
+                        .get(index)
+                        .ok_or("export table index is out of range")?),
+                ),
+                ExternalKind::Memory => (
+                    "memory",
+                    json!(memories
+                        .get(index)
+                        .ok_or("export memory index is out of range")?),
+                ),
+                ExternalKind::Global => (
+                    "global",
+                    json!(globals
+                        .get(index)
+                        .ok_or("export global index is out of range")?),
+                ),
+                ExternalKind::Tag => {
+                    let ty_index = *tags.get(index).ok_or("export tag index is out of range")?;
+                    let ty = types
+                        .get(ty_index as usize)
+                        .ok_or("export tag type index is out of range")?;
+                    ("tag", json!({"type_index":ty_index,"signature":ty}))
+                }
+            };
+            Ok(json!({"name":export.name,"kind":kind,"index":export.index,"type":ty}))
+        })
+        .collect::<Result<Vec<Value>, String>>()?;
+    Ok(json!({"types":types,"imports":imports,"exports":exports,"custom_sections":custom}))
+}
+
+fn replay(old: &[u8], new: &[u8], diff: &audit::AuditDiff) -> Result<(), String> {
+    let mut output = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for edit in &diff.edits {
+        let a = edit.old_span;
+        let b = edit.new_span;
+        if a.start < old_cursor
+            || b.start < new_cursor
+            || a.start > a.end
+            || b.start > b.end
+            || a.end > old.len()
+            || b.end > new.len()
+        {
+            return Err("diff returned invalid, overlapping or unsorted physical spans".into());
+        }
+        if old[old_cursor..a.start] != new[new_cursor..b.start] {
+            return Err("diff unchanged gap does not bind equal original bytes".into());
+        }
+        if edit.old_hex != hex(&old[a.start..a.end]) || edit.new_hex != hex(&new[b.start..b.end]) {
+            return Err("diff edit hex does not bind the reported original spans".into());
+        }
+        output.extend_from_slice(&old[old_cursor..a.start]);
+        output.extend_from_slice(&new[b.start..b.end]);
+        old_cursor = a.end;
+        new_cursor = b.end;
+    }
+    if old[old_cursor..] != new[new_cursor..] {
+        return Err("diff final gap differs".into());
+    }
+    output.extend_from_slice(&old[old_cursor..]);
+    if output != new {
+        return Err("diff replay did not reconstruct the entire target".into());
+    }
+    if diff.changed != (old != new) {
+        return Err("diff changed flag disagrees with original bytes".into());
+    }
+    Ok(())
+}
+
+fn serialized_patch(old: &[u8], new: &[u8]) -> Result<Value, String> {
+    let created = patch::create(old, new)?;
+    let encoded = created.to_bytes()?;
+    let decoded = patch::BytePatch::from_bytes(&encoded)?;
+    if created != decoded || decoded.apply(old)? != new {
+        return Err("serialized patch replay differs".into());
+    }
+    if decoded.old_sha256 != sha256(old)
+        || decoded.new_sha256 != sha256(new)
+        || decoded.old_len != old.len() as u64
+        || decoded.new_len != new.len() as u64
+    {
+        return Err("patch metadata does not bind raw input and target hashes/lengths".into());
+    }
+    Ok(
+        json!({"format":decoded.format,"sha256":sha256(&encoded),"len":encoded.len(),"edit_count":decoded.edits.len(),"replay":true}),
+    )
+}
+
+fn mutation(bytes: &[u8]) -> (Vec<u8>, usize, &'static str) {
+    let mut changed = bytes.to_vec();
+    if bytes.len() == HEADER.len() {
+        changed.push(0);
+        return (
+            changed,
+            HEADER.len(),
+            "append_one_payload_byte_to_header_only_module",
+        );
+    }
+    let hash = Sha256::digest(bytes);
+    let selector = u64::from_le_bytes(hash[..8].try_into().unwrap());
+    let offset = HEADER.len() + (selector % (bytes.len() - HEADER.len()) as u64) as usize;
+    changed[offset] ^= 1;
+    (changed, offset, "xor_one_payload_byte_with_01")
+}
+
+fn diff_evidence(diff: &audit::AuditDiff) -> Value {
+    json!({
+        "changed":diff.changed,"exact_minimal":diff.exact_minimal,"alignment":diff.alignment,
+        "edit_count":diff.edits.len(),"edits":diff.edits,
+        "old_validation":diff.old.validation,"new_validation":diff.new.validation,
+        "old_diagnostics":diff.old.diagnostics,"new_diagnostics":diff.new.diagnostics,
+        "replay":true
+    })
+}
+
+fn verify_binary(record: &mut FileEvidence, bytes: &[u8], report: &mut CorpusReport) {
+    let path = Path::new(&record.relative_path);
+    record.binary_sha256 = Some(sha256(bytes));
+    record.binary_len = Some(bytes.len());
+    if !bytes.starts_with(HEADER) {
+        failure(report,path,"core_header","expected original Core Wasm version-1 header; Component Model is not an accepted corpus module");
+        return;
+    }
+    match audit::inspect(bytes) {
+        Ok(module) => {
+            record.audit_validation = Some(module.validation.clone());
+            record.audit_decoding_complete = !module.diagnostics.iter().any(|issue| {
+                matches!(
+                    issue.code.as_str(),
+                    "core_decode"
+                        | "unknown_operator"
+                        | "operator_decode"
+                        | "locals_decode"
+                        | "unknown_section"
+                )
+            });
+            if !record.audit_decoding_complete {
+                failure(report,path,"audit_known_decoding","original Core module contains an unknown/malformed standard-section or instruction decoding diagnostic; inspect audit_diagnostics");
+            }
+            record.audit_diagnostics = module.diagnostics;
+            record.custom_types=module.sections.iter().filter(|section|section.id==0)
+                .map(|section|json!({"path":section.path,"kind":section.kind,"status":section.status,"span":section.span})).collect();
+            if module.validation != "valid_with_all_known_features" {
+                failure(
+                    report,
+                    path,
+                    "audit_validation",
+                    format!(
+                        "unexpected invalid/unsupported original module: {}",
+                        module.validation
+                    ),
+                );
+            }
+        }
+        Err(error) => failure(report, path, "audit_inspect", error),
+    }
+    match Validator::new_with_features(WasmFeatures::all()).validate_all(bytes) {
+        Ok(_) => report.summary.valid_core_modules += 1,
+        Err(error) => failure(report, path, "validator_all_known", error),
+    }
+    match inventory(bytes) {
+        Ok(inventory) => record.independent_inventory = Some(inventory),
+        Err(error) => failure(report, path, "independent_inventory", error),
+    }
+    match audit::compare(bytes, bytes).and_then(|diff| {
+        replay(bytes, bytes, &diff)?;
+        if diff.changed || !diff.edits.is_empty() {
+            return Err("identity comparison contains edits".into());
+        }
+        Ok(())
+    }) {
+        Ok(()) => {
+            record.identity_replay = true;
+            report.summary.identity_replays += 1;
+        }
+        Err(error) => failure(report, path, "identity_diff", error),
+    }
+    match serialized_patch(bytes, bytes) {
+        Ok(_) => {
+            record.serialized_identity_patch_replay = true;
+            report.summary.serialized_identity_patch_replays += 1;
+        }
+        Err(error) => failure(report, path, "identity_serialized_patch", error),
+    }
+    let (changed, offset, kind) = mutation(bytes);
+    let mut evidence = json!({"kind":kind,"offset":offset,"sha256":sha256(&changed),"len":changed.len(),"header_preserved":changed.starts_with(HEADER)});
+    match audit::compare(bytes, &changed).and_then(|diff| {
+        replay(bytes, &changed, &diff)?;
+        Ok(diff)
+    }) {
+        Ok(diff) => {
+            record.mutation_replay = true;
+            report.summary.mutation_replays += 1;
+            evidence["diff"] = diff_evidence(&diff);
+        }
+        Err(error) => failure(report, path, "mutation_diff", error),
+    }
+    match serialized_patch(bytes, &changed) {
+        Ok(patch) => {
+            record.serialized_mutation_patch_replay = true;
+            report.summary.serialized_mutation_patch_replays += 1;
+            evidence["serialized_patch"] = patch;
+        }
+        Err(error) => failure(report, path, "mutation_serialized_patch", error),
+    }
+    record.mutation = Some(evidence);
+}
+
+fn verify_file(root: &Path, build: &Path, path: &Path, report: &mut CorpusReport) {
+    let relative = path.strip_prefix(root).unwrap();
+    let is_wat = path.extension().is_some_and(|extension| extension == "wat");
+    let mut record = FileEvidence::new(relative, if is_wat { "wat" } else { "wasm" });
+    let source = match std::fs::read(path) {
+        Ok(source) => source,
+        Err(error) => {
+            failure(report, relative, "read_source", error);
+            report.files.push(record);
+            return;
+        }
+    };
+    record.source_sha256 = Some(sha256(&source));
+    record.source_len = Some(source.len());
+    let bytes = if is_wat {
+        match wat::parse_bytes(&source) {
+            Ok(bytes) => {
+                report.summary.encoded_wat += 1;
+                bytes.into_owned()
+            }
+            Err(error) => {
+                failure(report, relative, "wat_encode", error);
+                report.files.push(record);
+                return;
+            }
+        }
+    } else {
+        source
+    };
+    if is_wat {
+        // Retain the source extension: foo.wat -> foo.wat.wasm. This cannot
+        // collide with the paired original foo.wasm or another source path.
+        let mut generated = build.join(relative);
+        generated.set_extension("wat.wasm");
+        let written = std::fs::create_dir_all(generated.parent().unwrap())
+            .and_then(|()| std::fs::write(&generated, &bytes));
+        match written {
+            Ok(()) => record.generated_path = Some(generated.to_string_lossy().into_owned()),
+            Err(error) => failure(report, relative, "write_generated_wasm", error),
+        }
+    }
+    verify_binary(&mut record, &bytes, report);
+    if is_wat {
+        let paired = path.with_extension("wasm");
+        match std::fs::symlink_metadata(&paired) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                report.summary.paired_binaries += 1;
+                let result = std::fs::read(&paired)
+                    .map_err(|error| error.to_string())
+                    .and_then(|original| {
+                        let diff = audit::compare(&original, &bytes)?;
+                        replay(&original, &bytes, &diff)?;
+                        let patch = serialized_patch(&original, &bytes)?;
+                        Ok((original, diff, patch))
+                    });
+                match result {
+                    Ok((original, diff, patch)) => {
+                        report.summary.paired_binary_replays += 1;
+                        report.summary.paired_binaries_changed += usize::from(diff.changed);
+                        record.paired_binary = Some(json!({
+                            "relative_path":paired.strip_prefix(root).unwrap().to_string_lossy(),
+                            "source_sha256":sha256(&original),"source_len":original.len(),
+                            "encoded_sha256":sha256(&bytes),"diff":diff_evidence(&diff),
+                            "serialized_patch":patch,"replay":true
+                        }));
+                    }
+                    Err(error) => failure(report, relative, "paired_binary_diff", error),
+                }
+            }
+            Ok(_) => failure(
+                report,
+                relative,
+                "paired_binary_type",
+                "paired binary exists but is not a regular non-symlink file",
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failure(report, relative, "paired_binary_metadata", error),
+        }
+    }
+    report.files.push(record);
+}
+
+fn external_path(name: &str, temporary: bool) -> PathBuf {
+    let path = PathBuf::from(std::env::var_os(name).unwrap_or_else(|| {
+        panic!("{name} is required for the explicitly ignored external corpus test")
+    }));
+    assert!(path.is_absolute(), "{name} must be absolute");
+    assert!(
+        !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir)),
+        "{name} must not contain parent traversal"
+    );
+    if temporary {
+        assert!(path.starts_with("/tmp"), "{name} must stay below /tmp");
+    }
+    path
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied read-only uwvm2-ros examples corpus and /tmp output paths"]
+fn uwvm_examples_external_corpus() {
+    let root = external_path("UWGIT_UWVM_EXAMPLES_ROOT", false);
+    let report_path = external_path("UWGIT_UWVM_CORPUS_REPORT", true);
+    let build = external_path("UWGIT_UWVM_BUILD_ROOT", true);
+    let examples = root.join("examples");
+    let canonical_root = root
+        .canonicalize()
+        .expect("external source root must exist");
+    std::fs::create_dir_all(&build).expect("create /tmp Wasm producer-output directory");
+    let canonical_build = build.canonicalize().unwrap();
+    assert!(
+        !canonical_build.starts_with(&canonical_root),
+        "generated output must not modify the reference corpus"
+    );
+    assert!(
+        !report_path.starts_with(&root),
+        "report must not modify the reference corpus"
+    );
+    let mut report=CorpusReport {
+        schema_version:1,source_root:root.to_string_lossy().into_owned(),
+        examples_root:examples.to_string_lossy().into_owned(),build_root:build.to_string_lossy().into_owned(),
+        validator_profile:"wasmparser 0.249.0 WasmFeatures::all(); original Core inputs must validate".into(),
+        interpretation:"Read-only external corpus verification, not Wasm execution, ROS delivery or host-plugin registration conformance. Mutations may become malformed or unsupported but must remain exactly auditable/replayable. Paired WAT/binary producer differences are reported without demanding byte equality.".into(),
+        complete:false,summary:Summary::default(),files:Vec::new(),failures:Vec::new(),
+    };
+    let mut files = Vec::new();
+    match std::fs::symlink_metadata(&examples) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            discover(&examples, &examples, &mut report, &mut files)
+        }
+        Ok(_) => failure(
+            &mut report,
+            Path::new("examples"),
+            "examples_root",
+            "examples must be a real directory, not a symlink",
+        ),
+        Err(error) => failure(&mut report, Path::new("examples"), "examples_root", error),
+    }
+    files.sort();
+    if files.is_empty() {
+        failure(
+            &mut report,
+            Path::new("examples"),
+            "discovery",
+            "no regular .wasm or .wat sources were discovered",
+        );
+    }
+    for path in files {
+        verify_file(&examples, &build, &path, &mut report);
+    }
+    report.summary.failures = report.failures.len();
+    report.complete = report.failures.is_empty();
+    std::fs::create_dir_all(report_path.parent().unwrap())
+        .expect("create report parent below /tmp");
+    let encoded = serde_json::to_vec_pretty(&report).unwrap();
+    std::fs::write(&report_path, encoded)
+        .expect("write full corpus evidence before asserting outcomes");
+    eprintln!("uwvm examples: wasm={} wat={} valid={} identity={} mutation={} serialized_patch={} paired={} changed_pairs={} failures={} report={}",
+        report.summary.discovered_wasm,report.summary.discovered_wat,report.summary.valid_core_modules,
+        report.summary.identity_replays,report.summary.mutation_replays,
+        report.summary.serialized_mutation_patch_replays,report.summary.paired_binaries,
+        report.summary.paired_binaries_changed,report.summary.failures,report_path.display());
+    assert!(
+        report.complete,
+        "external uwvm examples corpus has {} failures; full evidence: {}; first failures: {:?}",
+        report.failures.len(),
+        report_path.display(),
+        report.failures.iter().take(5).collect::<Vec<_>>()
+    );
+}

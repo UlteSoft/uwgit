@@ -35,6 +35,19 @@ impl ParsedModule {
 }
 
 fn refresh_function_stable_ids(module: &mut ModuleIr) {
+    // Export identities do not depend on body hashes. Publish them before
+    // hashing callers, so a shifted callee index does not leak into a caller's
+    // canonical fingerprint through the parser's temporary ID.
+    let exported_ids = module
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, function)| !function.export_names.is_empty())
+        .map(|(index, function)| (index, stable_function_id(module, function)))
+        .collect::<Vec<_>>();
+    for (index, id) in exported_ids {
+        module.functions[index].id = id;
+    }
     let ids = module
         .functions
         .iter()

@@ -16,6 +16,9 @@ pub struct FunctionMatch {
     pub confidence: f32,
     pub similarity: f32,
     pub reason: MatchReason,
+    /// Multiple candidates support this pairing; ordering is deterministic but
+    /// must not be interpreted as a proven historical identity.
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,7 +39,10 @@ pub fn match_functions(old: &NormalizedModule, new: &NormalizedModule) -> Vec<Fu
     match_by_key(
         old,
         new,
-        |function| Some(function.id.clone()),
+        |function| {
+            (function.kind == FunctionKindIr::Imported || !function.export_names.is_empty())
+                .then(|| function.id.clone())
+        },
         MatchReason::SameStableId,
         1.0,
         &mut matched_old,
@@ -51,7 +57,21 @@ pub fn match_functions(old: &NormalizedModule, new: &NormalizedModule) -> Vec<Fu
                 return None;
             }
             function.fingerprint.as_ref().map(|fingerprint| {
-                format!("{}:{}", function.type_id, fingerprint.exact_body_hash.hex())
+                // A hash is an accelerator, not proof. Include the actual
+                // decoded operands so a hash collision cannot make an exact
+                // body pairing appear certain.
+                let operators: Vec<_> = function
+                    .operators
+                    .iter()
+                    .map(|op| (op.opcode.as_str(), &op.immediate))
+                    .collect();
+                serde_json::to_string(&(
+                    &function.type_id,
+                    fingerprint.exact_body_hash.hex(),
+                    &function.locals,
+                    operators,
+                ))
+                .expect("function keys are serializable")
             })
         },
         MatchReason::SameExactBodyHash,
@@ -150,6 +170,7 @@ fn match_by_key(
         let Some(new_indices) = new_candidates.get(&candidate_key) else {
             continue;
         };
+        let ambiguous = old_indices.len() != 1 || new_indices.len() != 1;
         for (old_index, new_index) in old_indices.iter().zip(new_indices) {
             if matched_old.contains(old_index) || matched_new.contains(new_index) {
                 continue;
@@ -166,9 +187,17 @@ fn match_by_key(
                 new_id: new_function.id.clone(),
                 old_source_index: old_function.source_index,
                 new_source_index: new_function.source_index,
-                confidence,
+                confidence: if ambiguous {
+                    0.5
+                } else if reason != MatchReason::SameStableId && old_function.id != new_function.id
+                {
+                    confidence.min(0.9)
+                } else {
+                    confidence
+                },
                 similarity,
                 reason,
+                ambiguous,
             });
         }
     }
@@ -264,7 +293,7 @@ fn match_by_similarity(
             .then_with(|| left.new_index.cmp(&right.new_index))
     });
 
-    for candidate in candidates {
+    for candidate in &candidates {
         if matched_old.contains(&candidate.old_index) || matched_new.contains(&candidate.new_index)
         {
             continue;
@@ -272,6 +301,16 @@ fn match_by_similarity(
 
         let old_function = &old.functions[candidate.old_index];
         let new_function = &new.functions[candidate.new_index];
+        let ambiguous = candidates.iter().any(|other| {
+            (other.old_index != candidate.old_index || other.new_index != candidate.new_index)
+                && (other.old_index == candidate.old_index
+                    || other.new_index == candidate.new_index)
+                && !matched_old.contains(&other.old_index)
+                && !matched_new.contains(&other.new_index)
+                && other.score.combined == candidate.score.combined
+                && other.locals_equal == candidate.locals_equal
+                && other.direct_call_similarity == candidate.direct_call_similarity
+        });
 
         matched_old.insert(candidate.old_index);
         matched_new.insert(candidate.new_index);
@@ -280,9 +319,14 @@ fn match_by_similarity(
             new_id: new_function.id.clone(),
             old_source_index: old_function.source_index,
             new_source_index: new_function.source_index,
-            confidence: similarity_confidence(old_function, new_function, &candidate),
+            confidence: if ambiguous {
+                0.5
+            } else {
+                similarity_confidence(old_function, new_function, candidate)
+            },
             similarity: candidate.score.combined,
             reason: MatchReason::SimilarityFallback,
+            ambiguous,
         });
     }
 }
@@ -655,6 +699,7 @@ mod tests {
         let matches = match_functions(&old_module, &new_module);
 
         assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|m| m.ambiguous && m.confidence < 1.0));
         assert_eq!(matches[0].old_source_index, 0);
         assert_eq!(matches[0].new_source_index, 0);
         assert_eq!(matches[1].old_source_index, 1);

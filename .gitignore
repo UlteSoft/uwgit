@@ -1,0 +1,23 @@
+# Build products and local test output.
+/target/
+/build/
+/tmp/
+/artifacts/
+/evidence/
+/evidence-*/
+/reports/
+/corpus/
+/corpus-*/
+/uwvm-examples-*/
+
+# Local wasm-git repositories and generated exchange files.
+.uwgit/
+/*.uwgb
+/*.uwgp
+
+# Python caches, logs, and macOS metadata.
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+._*

@@ -373,6 +373,7 @@ fn compile_c_to_wasm(compiler: &str, src: &str, dst: &std::path::Path) -> Result
 
 #[test]
 fn c_to_wasm_diff_detects_c_change() {
+    let compiler_required = std::env::var_os("WASM_GIT_CC").is_some();
     let compiler = std::env::var("WASM_GIT_CC").unwrap_or_else(|_| "clang".to_string());
 
     let dir = temp_artifact_dir("c-to-wasm-diff");
@@ -382,10 +383,18 @@ fn c_to_wasm_diff_detects_c_change() {
     let v2_c = fixture_path("c/add_v2.c");
 
     if let Err(reason) = compile_c_to_wasm(&compiler, &v1_c, &v1_wasm) {
+        assert!(
+            !compiler_required,
+            "explicit WASM_GIT_CC must work: {reason}"
+        );
         println!("{}", format_c_to_wasm_skip(&reason));
         return;
     }
     if let Err(reason) = compile_c_to_wasm(&compiler, &v2_c, &v2_wasm) {
+        assert!(
+            !compiler_required,
+            "explicit WASM_GIT_CC must work: {reason}"
+        );
         println!("{}", format_c_to_wasm_skip(&reason));
         return;
     }

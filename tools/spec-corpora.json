@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "upstream": "https://github.com/WebAssembly/spec",
+  "corpora": [
+    {
+      "version": 1,
+      "tag": "wg-1.0",
+      "commit": "977f97014c962f7bd1291fcc6d28b41a924882bf",
+      "archive_sha256": "492f9a90dda9536d687746185f329c96a35226e5386ff82b331098d9070179a2",
+      "wast_files": 73
+    },
+    {
+      "version": 2,
+      "tag": "wg-2.0",
+      "commit": "fffc6e12fa454e475455a7b58d3b5dc343980c10",
+      "archive_sha256": "597e3ea796ac08bb5f041513afa9f538b1e7f7619d865225ac482983a7af35cf",
+      "wast_files": 148
+    },
+    {
+      "version": 3,
+      "tag": "wg-3.0",
+      "commit": "9d36019973201a19f9c9ebb0f10828b2fe2374aa",
+      "archive_sha256": "84c1c529561c0cfc3b2bdc96eca8d98f6b275e6d9d82e90641313750338beb8a",
+      "wast_files": 258
+    }
+  ]
+}

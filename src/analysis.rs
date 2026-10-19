@@ -6,10 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::ir::{
-    AnalysisModule, BasicBlockIr, CallGraphEdgeIr, CallGraphEdgeKindIr, CallGraphIr, CallSiteIr,
-    CfgEdgeIr, CfgEdgeKindIr, ElementKindIr, ExternalKindIr, FunctionCfgIr, FunctionIr,
-    FunctionKindIr, Immediate, ModuleIr, Opcode, ParsedOperator, ReachabilityIr, ResolvedModule,
-    UnsafePathIr, UnsafeSinkIr, UnsafeSinkKindIr,
+    AnalysisCompletenessIr, AnalysisModule, AnalysisStatusIr, AnalysisWarningIr, BasicBlockIr,
+    CallGraphEdgeIr, CallGraphEdgeKindIr, CallGraphIr, CallSiteIr, CfgEdgeIr, CfgEdgeKindIr,
+    CompositeTypeIr, ElementKindIr, ExternalKindIr, FunctionCfgIr, FunctionIr, FunctionKindIr,
+    Immediate, ModuleIr, Opcode, ParsedOperator, ReachabilityIr, ResolvedModule, UnsafePathIr,
+    UnsafeSinkIr, UnsafeSinkKindIr,
 };
 
 pub fn analysis_module(resolved: &ResolvedModule) -> AnalysisModule {
@@ -24,7 +25,229 @@ pub fn analysis_module(resolved: &ResolvedModule) -> AnalysisModule {
     let reachability = build_reachability(&module, &call_graph);
     let unsafe_paths = build_unsafe_paths(&module, &cfgs, &call_graph);
 
-    AnalysisModule::from_parts(module, cfgs, call_graph, reachability, unsafe_paths)
+    let completeness = analysis_completeness(&module);
+    let mut analysis =
+        AnalysisModule::from_parts(module, cfgs, call_graph, reachability, unsafe_paths);
+    analysis.completeness = completeness;
+    analysis
+}
+
+/// Report model limitations without making unsupported reachability claims.
+/// Parsed/resolved IR is intentionally not an operand-stack validator, and the
+/// current CFG does not implement exceptional edges or nominal subtyping.
+fn analysis_completeness(module: &ModuleIr) -> AnalysisCompletenessIr {
+    let mut completeness = AnalysisCompletenessIr {
+        cfg: AnalysisStatusIr::Approximate,
+        call_graph: AnalysisStatusIr::Approximate,
+        reachability: AnalysisStatusIr::Approximate,
+        unsafe_paths: AnalysisStatusIr::Approximate,
+        model_validated: false,
+        warnings: vec![AnalysisWarningIr {
+            code: "unvalidated_analysis_ir".to_owned(),
+            message: "Static analysis has not validated operand typing or runtime behavior; reachability and unsafe paths are approximate and cannot prove a function unreachable or safe.".to_owned(),
+            function_index: None,
+            operator_offset: None,
+        }],
+    };
+    let mut emitted = BTreeSet::new();
+    let mut warn = |code: &str, message: String, function_index, operator_offset| {
+        if emitted.insert((code.to_owned(), function_index)) {
+            completeness.cfg = AnalysisStatusIr::Incomplete;
+            completeness.call_graph = AnalysisStatusIr::Incomplete;
+            completeness.reachability = AnalysisStatusIr::Incomplete;
+            completeness.unsafe_paths = AnalysisStatusIr::Incomplete;
+            completeness.warnings.push(AnalysisWarningIr {
+                code: code.to_owned(),
+                message,
+                function_index,
+                operator_offset,
+            });
+        }
+    };
+    let mut identities = BTreeMap::<&str, Vec<u32>>::new();
+    for function in &module.functions {
+        identities
+            .entry(&function.id)
+            .or_default()
+            .push(function.source_index);
+    }
+    for (id, indices) in identities {
+        if indices.len() > 1 {
+            warn("duplicate_function_identity", format!("Functions {indices:?} share content identity {id:?}; graph nodes keyed by that identity cannot distinguish their occurrences."), None, None);
+        }
+    }
+    if module
+        .type_definitions
+        .iter()
+        .any(|ty| !ty.is_final || ty.supertype.is_some())
+    {
+        warn("gc_subtyping_unmodeled", "Nominal GC/function subtyping is present; indirect-call and call_ref target selection currently compares exact type identities.".to_owned(), None, None);
+    }
+    if module
+        .type_definitions
+        .iter()
+        .any(|ty| matches!(ty.composite, CompositeTypeIr::Continuation { .. }))
+    {
+        warn(
+            "continuation_types_unmodeled",
+            "Continuation types require a control-flow model that is not implemented.".to_owned(),
+            None,
+            None,
+        );
+    }
+    for (index, function) in module.functions.iter().enumerate() {
+        let function_index = Some(function.source_index);
+        if function.source_index as usize != index
+            || module
+                .types
+                .get(function.type_index as usize)
+                .map(|ty| &ty.id)
+                != Some(&function.type_id)
+            || module
+                .type_definitions
+                .get(function.type_index as usize)
+                .is_some_and(|ty| !matches!(ty.composite, CompositeTypeIr::Function { .. }))
+        {
+            warn("malformed_analysis_model", "Function indices or function type references are inconsistent with the module model.".to_owned(), function_index, None);
+        }
+        if function.kind == FunctionKindIr::Imported {
+            continue;
+        }
+        // Do not label valid legacy EH or future structured instructions
+        // malformed using the smaller MVP frame grammar below.
+        let structural_checks_supported = !function.operators.iter().any(|operator| {
+            matches!(
+                operator.opcode,
+                Opcode::TryTable
+                    | Opcode::Throw
+                    | Opcode::ThrowRef
+                    | Opcode::Rethrow
+                    | Opcode::Catch
+                    | Opcode::CatchAll
+                    | Opcode::Delegate
+                    | Opcode::Unrecognized(_)
+            )
+        });
+        // The root function expression contributes one label frame. This check
+        // detects malformed structure; it deliberately does not validate types.
+        let mut frames = vec![(false, false)]; // (is_if, saw_else)
+        for operator in &function.operators {
+            let offset = Some(operator.offset);
+            let name = operator.opcode.as_str();
+            if matches!(
+                operator.opcode,
+                Opcode::TryTable
+                    | Opcode::Throw
+                    | Opcode::ThrowRef
+                    | Opcode::Rethrow
+                    | Opcode::Catch
+                    | Opcode::CatchAll
+                    | Opcode::Delegate
+            ) || name == "Try"
+            {
+                warn("exception_control_flow_unmodeled", "Exception handlers and exceptional edges are not modeled; the generated CFG and reachability must not be used as complete control-flow evidence.".to_owned(), function_index, offset);
+            }
+            if matches!(operator.opcode, Opcode::Unrecognized(_))
+                || matches!(operator.immediate, Immediate::Unrecognized(_))
+            {
+                warn(
+                    "unmodeled_instruction",
+                    format!("Instruction {name} has no complete typed analysis model."),
+                    function_index,
+                    offset,
+                );
+            }
+            if structural_checks_supported && frames.is_empty() {
+                warn(
+                    "malformed_analysis_model",
+                    "Instructions follow the final function End.".to_owned(),
+                    function_index,
+                    offset,
+                );
+            }
+            if structural_checks_supported {
+                match operator.opcode {
+                    Opcode::Block | Opcode::Loop | Opcode::If | Opcode::TryTable => {
+                        frames.push((operator.opcode == Opcode::If, false))
+                    }
+                    Opcode::Else => match frames.last_mut() {
+                        Some((true, saw_else)) if !*saw_else => *saw_else = true,
+                        _ => warn(
+                            "malformed_analysis_model",
+                            "Else has no unmatched If frame.".to_owned(),
+                            function_index,
+                            offset,
+                        ),
+                    },
+                    Opcode::End => {
+                        if frames.pop().is_none() {
+                            warn(
+                                "malformed_analysis_model",
+                                "End has no enclosing frame.".to_owned(),
+                                function_index,
+                                offset,
+                            );
+                        }
+                    }
+                    _ if name == "Try" => frames.push((false, false)),
+                    _ => {}
+                }
+            }
+            let mut check_depth = |depth: u32| {
+                if structural_checks_supported && depth as usize >= frames.len() {
+                    warn(
+                        "malformed_analysis_model",
+                        format!("Branch depth {depth} exceeds the modeled label stack."),
+                        function_index,
+                        offset,
+                    );
+                }
+            };
+            match &operator.immediate {
+                Immediate::Call(target) | Immediate::RefFunc(target)
+                    if *target as usize >= module.functions.len() =>
+                {
+                    warn(
+                        "malformed_analysis_model",
+                        format!("Function target {target} is out of bounds."),
+                        function_index,
+                        offset,
+                    )
+                }
+                Immediate::CallIndirect { type_index, .. } | Immediate::CallRef(type_index)
+                    if *type_index as usize >= module.types.len() =>
+                {
+                    warn(
+                        "malformed_analysis_model",
+                        format!("Call type {type_index} is out of bounds."),
+                        function_index,
+                        offset,
+                    )
+                }
+                Immediate::Branch(depth) => check_depth(*depth),
+                Immediate::BrOnCast { label, .. } => check_depth(*label),
+                Immediate::BrTable {
+                    targets,
+                    default_target,
+                } => {
+                    for depth in targets {
+                        check_depth(*depth);
+                    }
+                    check_depth(*default_target);
+                }
+                _ => {}
+            }
+        }
+        if structural_checks_supported && !frames.is_empty() {
+            warn(
+                "malformed_analysis_model",
+                "Function expression has unclosed control frames or no final End.".to_owned(),
+                function_index,
+                None,
+            );
+        }
+    }
+    completeness
 }
 
 impl ResolvedModule {
@@ -1158,6 +1381,114 @@ mod tests {
             opcode,
             immediate,
         }
+    }
+
+    fn analyze_valid_wat(source: &str) -> crate::ir::AnalysisModule {
+        let bytes = wat::parse_str(source).unwrap();
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("analysis regression fixture must be valid core Wasm");
+        analysis_module(&resolve_module(parse_module(&bytes).unwrap()))
+    }
+
+    fn assert_incomplete(analysis: &crate::ir::AnalysisModule, code: &str) {
+        use crate::ir::AnalysisStatusIr;
+        assert_eq!(analysis.completeness.cfg, AnalysisStatusIr::Incomplete);
+        assert_eq!(
+            analysis.completeness.reachability,
+            AnalysisStatusIr::Incomplete
+        );
+        assert!(analysis
+            .completeness
+            .warnings
+            .iter()
+            .any(|warning| warning.code == code));
+        assert!(!analysis.completeness.model_validated);
+    }
+
+    #[test]
+    fn analysis_constructors_do_not_claim_graphs_were_derived() {
+        let analysis = crate::ir::AnalysisModule::from_module(ModuleIr::new());
+        assert_eq!(
+            analysis.completeness.cfg,
+            crate::ir::AnalysisStatusIr::NotDerived
+        );
+        assert_eq!(
+            analysis.completeness.reachability,
+            crate::ir::AnalysisStatusIr::NotDerived
+        );
+    }
+
+    #[test]
+    fn mvp_static_analysis_is_explicitly_approximate() {
+        let analysis = analyze_valid_wat("(module (func (export \"run\") nop))");
+        assert_eq!(
+            analysis.completeness.cfg,
+            crate::ir::AnalysisStatusIr::Approximate
+        );
+        assert_eq!(
+            analysis.completeness.warnings[0].code,
+            "unvalidated_analysis_ir"
+        );
+        assert!(!analysis.completeness.model_validated);
+    }
+
+    #[test]
+    fn exception_cfg_and_reachability_are_explicitly_incomplete() {
+        let analysis = analyze_valid_wat(
+            r#"(module
+            (tag $signal (param i32))
+            (func (export "run") (result i32)
+                (block $caught (result i32)
+                    (try_table (catch $signal $caught) i32.const 1 throw $signal)
+                    i32.const 0)))"#,
+        );
+        assert_incomplete(&analysis, "exception_control_flow_unmodeled");
+        let json = serde_json::to_value(analysis).unwrap();
+        assert_eq!(json["completeness"]["reachability"], "incomplete");
+    }
+
+    #[test]
+    fn duplicate_content_ids_do_not_imply_distinct_reachability_is_proved() {
+        let analysis = analyze_valid_wat(
+            r#"(module
+            (func $first nop)
+            (func $second nop)
+            (func (export "run") call $first))"#,
+        );
+        assert_eq!(analysis.functions[0].id, analysis.functions[1].id);
+        assert_incomplete(&analysis, "duplicate_function_identity");
+    }
+
+    #[test]
+    fn subtype_call_ref_targets_are_explicitly_unmodeled() {
+        let analysis = analyze_valid_wat(
+            r#"(module
+            (type $base (sub (func)))
+            (type $derived (sub $base (func)))
+            (func $target (type $derived))
+            (elem declare func $target)
+            (func (export "run") ref.func $target call_ref $base))"#,
+        );
+        assert_incomplete(&analysis, "gc_subtyping_unmodeled");
+    }
+
+    #[test]
+    fn unknown_or_malformed_ir_is_marked_incomplete() {
+        let mut resolved =
+            resolve_module(parse_module(include_bytes!("../tests/fixtures/old.wasm")).unwrap());
+        resolved.module.functions[0].operators.insert(
+            0,
+            sample_operator(
+                0,
+                Opcode::Unrecognized("FutureBranch".to_owned()),
+                Immediate::Unrecognized("target=0".to_owned()),
+            ),
+        );
+        assert_incomplete(&analysis_module(&resolved), "unmodeled_instruction");
+        resolved.module.functions[0].operators.remove(0);
+        resolved.module.functions[0].operators.pop();
+        assert_incomplete(&analysis_module(&resolved), "malformed_analysis_model");
     }
 
     #[test]

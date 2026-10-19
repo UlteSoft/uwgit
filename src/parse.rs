@@ -8,13 +8,14 @@
 use std::{error::Error, fmt};
 
 use wasmparser::{
-    ConstExpr, ElementItems, ElementKind, Encoding, ExternalKind, Operator, Parser, Payload,
-    TableInit, TypeRef,
+    CompositeInnerType, ConstExpr, ElementItems, ElementKind, Encoding, ExternalKind, Operator,
+    Parser, Payload, TableInit, TypeRef,
 };
 
 use crate::ir::{
-    ElementIr, ElementKindIr, ExportIr, ExternalKindIr, FunctionIr, FunctionKindIr, Immediate,
-    ImportIr, LocalIr, ModuleIr, Opcode, ParsedModule, ParsedOperator, TableIr, TypeIr, TypeRefIr,
+    CatchIr, CompositeTypeIr, ElementIr, ElementKindIr, ExportIr, ExternalKindIr, FieldTypeIr,
+    FunctionIr, FunctionKindIr, Immediate, ImportIr, LocalIr, ModuleIr, Opcode, ParsedModule,
+    ParsedOperator, RecursionGroupIr, TableIr, TypeDefinitionIr, TypeIr, TypeRefIr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,25 +61,98 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                 saw_module = true;
             }
             Payload::TypeSection(section) => {
-                for (source_index, ty) in section.into_iter_err_on_gc_types().enumerate() {
-                    let ty = ty?;
-                    let params = ty
-                        .params()
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>();
-                    let results = ty
-                        .results()
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>();
-                    let id = type_id(&params, &results);
-                    module.types.push(TypeIr {
-                        id,
-                        source_index: checked_u32(source_index, "type index")?,
-                        params,
-                        results,
+                for group in section.into_iter_with_offsets() {
+                    let (offset, group) = group?;
+                    let group_index =
+                        checked_u32(module.recursion_groups.len(), "recursion group")?;
+                    module.recursion_groups.push(RecursionGroupIr {
+                        source_index: group_index,
+                        offset: offset as u64,
+                        first_type_index: checked_u32(module.types.len(), "type index")?,
+                        type_count: checked_u32(group.types().len(), "recursion group type count")?,
+                        explicit: group.is_explicit_rec_group(),
                     });
+                    for (offset, ty) in group.into_types_and_offsets() {
+                        let source_index = checked_u32(module.types.len(), "type index")?;
+                        let (params, results, composite) = match &ty.composite_type.inner {
+                            CompositeInnerType::Func(function) => {
+                                let params = function
+                                    .params()
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>();
+                                let results = function
+                                    .results()
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>();
+                                let composite = CompositeTypeIr::Function {
+                                    params: params.clone(),
+                                    results: results.clone(),
+                                };
+                                (params, results, composite)
+                            }
+                            CompositeInnerType::Struct(structure) => (
+                                Vec::new(),
+                                Vec::new(),
+                                CompositeTypeIr::Struct {
+                                    fields: structure
+                                        .fields
+                                        .iter()
+                                        .map(convert_field_type)
+                                        .collect(),
+                                },
+                            ),
+                            CompositeInnerType::Array(array) => (
+                                Vec::new(),
+                                Vec::new(),
+                                CompositeTypeIr::Array {
+                                    field: convert_field_type(&array.0),
+                                },
+                            ),
+                            CompositeInnerType::Cont(continuation) => (
+                                Vec::new(),
+                                Vec::new(),
+                                CompositeTypeIr::Continuation {
+                                    type_index: continuation.0.to_string(),
+                                },
+                            ),
+                        };
+                        let id = if matches!(&ty.composite_type.inner, CompositeInnerType::Func(_))
+                            && ty.is_final
+                            && ty.supertype_idx.is_none()
+                            && !ty.composite_type.shared
+                            && ty.composite_type.descriptor_idx.is_none()
+                            && ty.composite_type.describes_idx.is_none()
+                        {
+                            type_id(&params, &results)
+                        } else {
+                            format!("type:{ty:?}")
+                        };
+                        module.types.push(TypeIr {
+                            id,
+                            source_index,
+                            params,
+                            results,
+                        });
+                        module.type_definitions.push(TypeDefinitionIr {
+                            source_index,
+                            offset: offset as u64,
+                            recursion_group_index: group_index,
+                            is_final: ty.is_final,
+                            supertype: ty.supertype_idx.map(|index| index.to_string()),
+                            shared: ty.composite_type.shared,
+                            descriptor: ty
+                                .composite_type
+                                .descriptor_idx
+                                .map(|index| index.to_string()),
+                            describes: ty
+                                .composite_type
+                                .describes_idx
+                                .map(|index| index.to_string()),
+                            composite,
+                        });
+                    }
                 }
             }
             Payload::ImportSection(section) => {
@@ -92,13 +166,11 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                     if let TypeRefIr::Func {
                         type_index,
                         type_id,
+                        ..
                     } = &type_ref
                     {
                         module.functions.push(FunctionIr {
-                            id: format!(
-                                "import:{}:{}:func:{}",
-                                import.module, import.name, type_id
-                            ),
+                            id: id.clone(),
                             source_index: next_function_index,
                             type_index: *type_index,
                             type_id: type_id.clone(),
@@ -157,6 +229,7 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                         name: export.name.to_owned(),
                         kind,
                         item_index: export.index,
+                        exact: export.kind == ExternalKind::FuncExact,
                     });
                 }
             }
@@ -248,6 +321,11 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
                 next_defined_function += 1;
             }
             Payload::End(_) => {}
+            Payload::UnknownSection { id, .. } => {
+                return Err(ParseError::new(format!(
+                    "unknown Core section id {id} is unavailable to function analysis; see the lossless binary audit"
+                )));
+            }
             Payload::CustomSection(_)
             | Payload::MemorySection(_)
             | Payload::TagSection(_)
@@ -274,6 +352,13 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
     }
 
     Ok(ParsedModule { module })
+}
+
+fn convert_field_type(field: &wasmparser::FieldType) -> FieldTypeIr {
+    FieldTypeIr {
+        storage_type: field.element_type.to_string(),
+        mutable: field.mutable,
+    }
 }
 
 // ── Phase 1: typed operator conversion ─────────────────────────────────────
@@ -361,165 +446,188 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         // ── MVP: Memory loads ──
         I32Load { memarg } => Ok((
             Oc::I32Load,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load { memarg } => Ok((
             Oc::I64Load,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         F32Load { memarg } => Ok((
             Oc::F32Load,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         F64Load { memarg } => Ok((
             Oc::F64Load,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Load8S { memarg } => Ok((
             Oc::I32Load8S,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Load8U { memarg } => Ok((
             Oc::I32Load8U,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Load16S { memarg } => Ok((
             Oc::I32Load16S,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Load16U { memarg } => Ok((
             Oc::I32Load16U,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load8S { memarg } => Ok((
             Oc::I64Load8S,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load8U { memarg } => Ok((
             Oc::I64Load8U,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load16S { memarg } => Ok((
             Oc::I64Load16S,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load16U { memarg } => Ok((
             Oc::I64Load16U,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load32S { memarg } => Ok((
             Oc::I64Load32S,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Load32U { memarg } => Ok((
             Oc::I64Load32U,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
 
         // ── MVP: Memory stores ──
         I32Store { memarg } => Ok((
             Oc::I32Store,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Store { memarg } => Ok((
             Oc::I64Store,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         F32Store { memarg } => Ok((
             Oc::F32Store,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         F64Store { memarg } => Ok((
             Oc::F64Store,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Store8 { memarg } => Ok((
             Oc::I32Store8,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I32Store16 { memarg } => Ok((
             Oc::I32Store16,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Store8 { memarg } => Ok((
             Oc::I64Store8,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Store16 { memarg } => Ok((
             Oc::I64Store16,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
         I64Store32 { memarg } => Ok((
             Oc::I64Store32,
-            Immediate::MemArg {
+            Immediate::MemoryArg {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
             },
         ),),
 
@@ -706,9 +814,9 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         I64TruncSatF64U => Ok((Oc::I64TruncSatF64U, Immediate::None),),
 
         // ── Bulk memory ──
-        MemoryInit { data_index, mem: _mem } => Ok((
+        MemoryInit { data_index, mem } => Ok((
             Oc::MemoryInit,
-            Immediate::DataIndex(data_index),
+            Immediate::MemoryInit { data_index, memory_index: mem },
         ),),
         DataDrop { data_index } => Ok((
             Oc::DataDrop,
@@ -727,8 +835,8 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         MemoryFill { mem } => Ok((Oc::MemoryFill, Immediate::MemoryIndex(mem)),),
         TableInit {
             elem_index,
-            table: _table,
-        } => Ok((Oc::TableInit, Immediate::ElemIndex(elem_index)),),
+            table,
+        } => Ok((Oc::TableInit, Immediate::TableInit { elem_index, table_index: table }),),
         ElemDrop { elem_index } => Ok((Oc::ElemDrop, Immediate::ElemIndex(elem_index)),),
         TableCopy {
             dst_table,
@@ -745,7 +853,7 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         RefNull { hty } => Ok((Oc::RefNull, Immediate::RefNull(format!("{hty:?}"))),),
         RefIsNull => Ok((Oc::RefIsNull, Immediate::None),),
         RefFunc { function_index } => Ok((Oc::RefFunc, Immediate::RefFunc(function_index)),),
-        TypedSelect { .. } => Ok((Oc::Select, Immediate::SelectTypes(vec![])),),
+        TypedSelect { ty } => Ok((Oc::Select, Immediate::SelectTypes(vec![ty.to_string()])),),
         TableFill { table } => Ok((Oc::TableFill, Immediate::TableIndex(table)),),
         TableGet { table } => Ok((Oc::TableGet, Immediate::TableIndex(table)),),
         TableSet { table } => Ok((Oc::TableSet, Immediate::TableIndex(table)),),
@@ -764,6 +872,9 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
                 table_index,
             },
         ),),
+        CallRef { type_index } => Ok((Oc::CallRef, Immediate::CallRef(type_index))),
+        ReturnCallRef { type_index } => Ok((Oc::ReturnCallRef, Immediate::CallRef(type_index))),
+        RefAsNonNull => Ok((Oc::RefAsNonNull, Immediate::None)),
 
         // ── GC ──
         RefEq => Ok((Oc::RefEq, Immediate::None),),
@@ -902,7 +1013,7 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
             Immediate::Unrecognized(format!("RefTestNonNull {{ hty: {hty:?} }}")),
         ),),
         RefTestNullable { hty } => Ok((
-            Oc::Unrecognized(format!("RefTestNullable {{ hty: {hty:?} }}")),
+            Oc::Unrecognized("RefTestNullable".to_owned()),
             Immediate::Unrecognized(format!("RefTestNullable {{ hty: {hty:?} }}")),
         ),),
         RefCastNonNull { hty } => Ok((
@@ -910,7 +1021,7 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
             Immediate::Unrecognized(format!("RefCastNonNull {{ hty: {hty:?} }}")),
         ),),
         RefCastNullable { hty } => Ok((
-            Oc::Unrecognized(format!("RefCastNullable {{ hty: {hty:?} }}")),
+            Oc::Unrecognized("RefCastNullable".to_owned()),
             Immediate::Unrecognized(format!("RefCastNullable {{ hty: {hty:?} }}")),
         ),),
         BrOnCast {
@@ -946,14 +1057,22 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         // ── Exceptions ──
         TryTable { try_table } => Ok((
             Oc::TryTable,
-            Immediate::Unrecognized(format!("TryTable {{ try_table: {try_table:?} }}")),
+            Immediate::TryTableFull {
+                block_type: format!("{:?}", try_table.ty),
+                catches: try_table.catches.into_iter().map(|catch| match catch {
+                    wasmparser::Catch::One { tag, label } => CatchIr::One { tag, label },
+                    wasmparser::Catch::OneRef { tag, label } => CatchIr::OneRef { tag, label },
+                    wasmparser::Catch::All { label } => CatchIr::All { label },
+                    wasmparser::Catch::AllRef { label } => CatchIr::AllRef { label },
+                }).collect(),
+            },
         ),),
         Throw { tag_index } => Ok((Oc::Throw, Immediate::TagIndex(tag_index)),),
         ThrowRef => Ok((Oc::ThrowRef, Immediate::None),),
 
         // ── Legacy exceptions ──
         Try { blockty } => Ok((
-            Oc::Unrecognized(format!("Try {{ blockty: {blockty:?} }}")),
+            Oc::Unrecognized("Try".to_owned()),
             Immediate::BlockType(format!("{blockty:?}")),
         ),),
         Catch { tag_index } => Ok((Oc::Catch, Immediate::TagIndex(tag_index)),),
@@ -970,65 +1089,73 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         // ── SIMD lane loads/stores ──
         V128Load8Lane { memarg, lane } => Ok((
             Oc::V128Load8Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Load16Lane { memarg, lane } => Ok((
             Oc::V128Load16Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Load32Lane { memarg, lane } => Ok((
             Oc::V128Load32Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Load64Lane { memarg, lane } => Ok((
             Oc::V128Load64Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Store8Lane { memarg, lane } => Ok((
             Oc::V128Store8Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Store16Lane { memarg, lane } => Ok((
             Oc::V128Store16Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Store32Lane { memarg, lane } => Ok((
             Oc::V128Store32Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
         V128Store64Lane { memarg, lane } => Ok((
             Oc::V128Store64Lane,
-            Immediate::SimdMemLane {
+            Immediate::SimdMemoryLane {
                 align: memarg.align as u32,
                 offset: memarg.offset,
+                memory: memarg.memory,
                 lane,
             },
         ),),
@@ -1066,7 +1193,8 @@ fn operator_to_opcode_immediate<'a>(op: Operator<'a>) -> Result<(Opcode, Immedia
         // ── Catch-all for unrecognized opcodes ──
         unknown => {
             let name = extract_operator_name(&unknown);
-            Ok((Opcode::Unrecognized(name.clone()), Immediate::Unrecognized(name)))
+            let operands = format!("{unknown:?}");
+            Ok((Opcode::Unrecognized(name), Immediate::Unrecognized(operands)))
         }
     }
 }
@@ -1085,9 +1213,15 @@ fn extract_operator_name(op: &Operator<'_>) -> String {
 
 fn convert_type_ref(type_ref: TypeRef, types: &[TypeIr]) -> Result<TypeRefIr, ParseError> {
     Ok(match type_ref {
-        TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => TypeRefIr::Func {
+        TypeRef::Func(type_index) => TypeRefIr::Func {
             type_index,
             type_id: type_id_for_index(types, type_index)?.to_owned(),
+            exact: false,
+        },
+        TypeRef::FuncExact(type_index) => TypeRefIr::Func {
+            type_index,
+            type_id: type_id_for_index(types, type_index)?.to_owned(),
+            exact: true,
         },
         TypeRef::Table(table) => TypeRefIr::Table(format!("{table:?}")),
         TypeRef::Memory(memory) => TypeRefIr::Memory(format!("{memory:?}")),
@@ -1200,12 +1334,24 @@ fn type_id(params: &[String], results: &[String]) -> String {
 }
 
 fn import_id(module: &str, name: &str, kind: ExternalKindIr, type_ref: &TypeRefIr) -> String {
+    // Module and field names are arbitrary UTF-8, including ':'. Encode the
+    // complete tuple so different host bindings cannot collide at delimiters.
     format!(
-        "import:{}:{}:{}:{}",
-        module,
-        name,
-        kind.as_str(),
-        type_ref_id(type_ref)
+        "import:{}",
+        serde_json::to_string(&(
+            module,
+            name,
+            kind.as_str(),
+            match type_ref {
+                TypeRefIr::Func {
+                    type_id,
+                    exact: true,
+                    ..
+                } => format!("exact:{type_id}"),
+                _ => type_ref_id(type_ref).to_owned(),
+            }
+        ))
+        .expect("import identity is serializable")
     )
 }
 
@@ -1233,8 +1379,8 @@ fn imported_table_count(module: &ModuleIr) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_module;
-    use crate::ir::{ExternalKindIr, FunctionKindIr, Opcode};
+    use super::{operator_to_opcode_immediate, parse_module};
+    use crate::ir::{CatchIr, CompositeTypeIr, ExternalKindIr, FunctionKindIr, Immediate, Opcode};
     use crate::resolve::resolve_module;
 
     fn make_simple_wasm(with_import: bool) -> Vec<u8> {
@@ -1290,6 +1436,14 @@ mod tests {
         assert_eq!(function.operators[2].opcode, Opcode::I32Add);
         assert_eq!(function.operators[3].opcode, Opcode::End);
         assert!(function.direct_calls.is_empty());
+    }
+
+    #[test]
+    fn unknown_core_sections_are_not_reported_as_components() {
+        let bytes = [b"\0asm\x01\0\0\0".as_slice(), &[99, 1, 0]].concat();
+        let error = parse_module(&bytes).unwrap_err().to_string();
+        assert!(error.contains("unknown Core section id 99"));
+        assert!(!error.contains("components"));
     }
 
     #[test]
@@ -1430,6 +1584,142 @@ mod tests {
         assert!(
             error.to_string().starts_with("wasm parse error:"),
             "error should be a ParseError: {error}"
+        );
+    }
+
+    #[test]
+    fn gc_recursion_groups_preserve_type_indices_and_fields() {
+        let bytes = b"\0asm\x01\0\0\0\x01\x0d\x02\x4e\x02\x5f\x01\x7f\x01\x5e\x7e\x00\x60\x00\x00\x03\x02\x01\x02\x0a\x04\x01\x02\x00\x0b";
+        let module = parse_module(bytes).expect("GC types should parse");
+        assert_eq!(module.types.len(), 3);
+        assert_eq!(module.type_definitions.len(), 3);
+        assert_eq!(module.functions[0].type_index, 2);
+        assert_eq!(module.functions[0].type_id, "type:->");
+        assert_eq!(module.recursion_groups.len(), 2);
+        assert!(module.recursion_groups[0].explicit);
+        assert_eq!(module.recursion_groups[0].first_type_index, 0);
+        assert_eq!(module.recursion_groups[0].type_count, 2);
+        assert!(!module.recursion_groups[1].explicit);
+        assert_eq!(module.recursion_groups[1].first_type_index, 2);
+        match &module.type_definitions[0].composite {
+            CompositeTypeIr::Struct { fields } => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].storage_type, "i32");
+                assert!(fields[0].mutable);
+            }
+            other => panic!("expected struct type, got {other:?}"),
+        }
+        match &module.type_definitions[1].composite {
+            CompositeTypeIr::Array { field } => {
+                assert_eq!(field.storage_type, "i64");
+                assert!(!field.mutable);
+            }
+            other => panic!("expected array type, got {other:?}"),
+        }
+        assert!(module.type_definitions[0].offset < module.type_definitions[1].offset);
+        assert_eq!(module.type_definitions[1].recursion_group_index, 0);
+        assert_eq!(module.type_definitions[2].recursion_group_index, 1);
+    }
+
+    #[test]
+    fn gc_subtype_finality_and_parent_survive_parsing() {
+        let bytes = b"\0asm\x01\0\0\0\x01\x0c\x01\x4e\x02\x50\x00\x5f\x00\x4f\x01\x00\x5f\x00";
+        let module = parse_module(bytes).expect("GC subtypes should parse");
+        assert!(!module.type_definitions[0].is_final);
+        assert_eq!(module.type_definitions[0].supertype, None);
+        assert!(module.type_definitions[1].is_final);
+        assert!(module.type_definitions[1].supertype.is_some());
+        assert_ne!(module.types[0].id, module.types[1].id);
+    }
+
+    #[test]
+    fn fallback_operators_keep_every_immediate() {
+        let (_, first) =
+            operator_to_opcode_immediate(wasmparser::Operator::I8x16ExtractLaneS { lane: 3 })
+                .unwrap();
+        let (_, second) =
+            operator_to_opcode_immediate(wasmparser::Operator::I8x16ExtractLaneS { lane: 4 })
+                .unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_hash_text().contains("lane: 3"));
+        assert!(second.as_hash_text().contains("lane: 4"));
+    }
+
+    #[test]
+    fn multi_memory_and_bulk_initialization_keep_all_indices() {
+        let (_, immediate) = operator_to_opcode_immediate(wasmparser::Operator::I32Load {
+            memarg: wasmparser::MemArg {
+                align: 2,
+                max_align: 2,
+                offset: u64::MAX,
+                memory: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            immediate,
+            Immediate::MemoryArg {
+                align: 2,
+                offset: u64::MAX,
+                memory: 7
+            }
+        );
+        let (_, immediate) = operator_to_opcode_immediate(wasmparser::Operator::MemoryInit {
+            data_index: 3,
+            mem: 4,
+        })
+        .unwrap();
+        assert_eq!(
+            immediate,
+            Immediate::MemoryInit {
+                data_index: 3,
+                memory_index: 4
+            }
+        );
+        let (_, immediate) = operator_to_opcode_immediate(wasmparser::Operator::TableInit {
+            elem_index: 5,
+            table: 6,
+        })
+        .unwrap();
+        assert_eq!(
+            immediate,
+            Immediate::TableInit {
+                elem_index: 5,
+                table_index: 6
+            }
+        );
+        let (_, immediate) = operator_to_opcode_immediate(wasmparser::Operator::TypedSelect {
+            ty: wasmparser::ValType::F64,
+        })
+        .unwrap();
+        assert_eq!(immediate, Immediate::SelectTypes(vec!["f64".to_owned()]));
+    }
+
+    #[test]
+    fn exception_catch_kind_tag_and_label_are_preserved() {
+        let (_, immediate) = operator_to_opcode_immediate(wasmparser::Operator::TryTable {
+            try_table: wasmparser::TryTable {
+                ty: wasmparser::BlockType::FuncType(9),
+                catches: vec![
+                    wasmparser::Catch::One { tag: 1, label: 2 },
+                    wasmparser::Catch::OneRef { tag: 3, label: 4 },
+                    wasmparser::Catch::All { label: 5 },
+                    wasmparser::Catch::AllRef { label: 6 },
+                ],
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            immediate,
+            Immediate::TryTableFull {
+                block_type: "FuncType(9)".to_owned(),
+                catches: vec![
+                    CatchIr::One { tag: 1, label: 2 },
+                    CatchIr::OneRef { tag: 3, label: 4 },
+                    CatchIr::All { label: 5 },
+                    CatchIr::AllRef { label: 6 }
+                ],
+            }
         );
     }
 }

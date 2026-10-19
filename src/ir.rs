@@ -1329,7 +1329,10 @@ pub enum Immediate {
     /// call / return_call: function index
     Call(u32),
     /// call_indirect / return_call_indirect: type index + table index
-    CallIndirect { type_index: u32, table_index: u32 },
+    CallIndirect {
+        type_index: u32,
+        table_index: u32,
+    },
     /// call_ref / return_call_ref: type index
     CallRef(u32),
     /// local.get / local.set / local.tee
@@ -1339,17 +1342,40 @@ pub enum Immediate {
     /// br / br_if: relative label depth
     Branch(u32),
     /// memory load/store: alignment + offset
-    MemArg { align: u32, offset: u64 },
+    MemArg {
+        align: u32,
+        offset: u64,
+    },
+    /// Complete memory immediate, including the multi-memory index.
+    MemoryArg {
+        align: u32,
+        offset: u64,
+        memory: u32,
+    },
     /// memory.size / memory.grow: memory index
     MemoryIndex(u32),
     /// memory.copy: destination + source memory indices
-    MemoryCopy { dst_index: u32, src_index: u32 },
+    MemoryCopy {
+        dst_index: u32,
+        src_index: u32,
+    },
     /// memory.init / data.drop: data segment index
     DataIndex(u32),
+    MemoryInit {
+        data_index: u32,
+        memory_index: u32,
+    },
     /// table.init / elem.drop: element segment index
     ElemIndex(u32),
+    TableInit {
+        elem_index: u32,
+        table_index: u32,
+    },
     /// table.copy: destination + source table indices
-    TableCopy { dst_table: u32, src_table: u32 },
+    TableCopy {
+        dst_table: u32,
+        src_table: u32,
+    },
     /// table.get / table.set / table.size / table.grow / table.fill
     TableIndex(u32),
     /// i32.const
@@ -1367,7 +1393,17 @@ pub enum Immediate {
     /// SIMD lane index
     Lane(u8),
     /// SIMD memory lane: memarg + lane index (for v128.loadN_lane / v128.storeN_lane)
-    SimdMemLane { align: u32, offset: u64, lane: u8 },
+    SimdMemLane {
+        align: u32,
+        offset: u64,
+        lane: u8,
+    },
+    SimdMemoryLane {
+        align: u32,
+        offset: u64,
+        memory: u32,
+        lane: u8,
+    },
     /// i8x16.shuffle: 16-byte lane permutation
     Shuffle([u8; 16]),
     /// v128.const: raw bytes
@@ -1377,17 +1413,32 @@ pub enum Immediate {
     /// struct.new / struct.new_default: type index
     StructType(u32),
     /// struct.get / struct.set: type index + field index
-    StructField { type_index: u32, field_index: u32 },
+    StructField {
+        type_index: u32,
+        field_index: u32,
+    },
     /// array.new / array.new_default / array.get / array.set etc.: type index
     ArrayType(u32),
     /// array.new_fixed: type index + size
-    ArrayNewFixed { type_index: u32, size: u32 },
+    ArrayNewFixed {
+        type_index: u32,
+        size: u32,
+    },
     /// array.new_data / array.init_data: type index + data index
-    ArrayNewData { type_index: u32, data_index: u32 },
+    ArrayNewData {
+        type_index: u32,
+        data_index: u32,
+    },
     /// array.new_elem / array.init_elem: type index + elem index
-    ArrayNewElem { type_index: u32, elem_index: u32 },
+    ArrayNewElem {
+        type_index: u32,
+        elem_index: u32,
+    },
     /// ref.test / ref.cast / br_on_cast etc.: src type + dst type
-    RefCast { src_type: String, dst_type: String },
+    RefCast {
+        src_type: String,
+        dst_type: String,
+    },
     /// br_on_cast / br_on_cast_fail: src type + dst type + label depth
     BrOnCast {
         src_type: String,
@@ -1396,11 +1447,23 @@ pub enum Immediate {
     },
     /// try_table: catch tag index list
     TryTable(Vec<u32>),
+    TryTableFull {
+        block_type: String,
+        catches: Vec<CatchIr>,
+    },
     /// throw / rethrow: tag index
     TagIndex(u32),
     /// Any unrecognized immediate, stored as the wasmparser Debug text
     /// for display and hashing compatibility.
     Unrecognized(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CatchIr {
+    One { tag: u32, label: u32 },
+    OneRef { tag: u32, label: u32 },
+    All { label: u32 },
+    AllRef { label: u32 },
 }
 
 impl Immediate {
@@ -1432,13 +1495,26 @@ impl Immediate {
             Immediate::Global(idx) => format!("global_index:{idx}"),
             Immediate::Branch(depth) => format!("relative_depth:{depth}"),
             Immediate::MemArg { align, offset } => format!("align:{align},offset:{offset}"),
+            Immediate::MemoryArg {
+                align,
+                offset,
+                memory,
+            } => format!("align:{align},offset:{offset},memory:{memory}"),
             Immediate::MemoryIndex(idx) => format!("mem:{idx}"),
             Immediate::MemoryCopy {
                 dst_index,
                 src_index,
             } => format!("dst:{dst_index},src:{src_index}"),
             Immediate::DataIndex(idx) => format!("data:{idx}"),
+            Immediate::MemoryInit {
+                data_index,
+                memory_index,
+            } => format!("data:{data_index},memory:{memory_index}"),
             Immediate::ElemIndex(idx) => format!("elem:{idx}"),
+            Immediate::TableInit {
+                elem_index,
+                table_index,
+            } => format!("elem:{elem_index},table:{table_index}"),
             Immediate::TableCopy {
                 dst_table,
                 src_table,
@@ -1446,14 +1522,8 @@ impl Immediate {
             Immediate::TableIndex(idx) => format!("table:{idx}"),
             Immediate::I32Const(v) => format!("value:{v}"),
             Immediate::I64Const(v) => format!("value:{v}"),
-            Immediate::F32Const(bits) => {
-                let v = f32::from_bits(*bits);
-                format!("value:{v}")
-            }
-            Immediate::F64Const(bits) => {
-                let v = f64::from_bits(*bits);
-                format!("value:{v}")
-            }
+            Immediate::F32Const(bits) => format!("bits:{bits:08x}"),
+            Immediate::F64Const(bits) => format!("bits:{bits:016x}"),
             Immediate::RefNull(ht) => format!("hty:{ht}"),
             Immediate::RefFunc(idx) => format!("function_index:{idx}"),
             Immediate::Lane(idx) => format!("lane:{idx}"),
@@ -1464,6 +1534,12 @@ impl Immediate {
             } => {
                 format!("align:{align},offset:{offset},lane:{lane}")
             }
+            Immediate::SimdMemoryLane {
+                align,
+                offset,
+                memory,
+                lane,
+            } => format!("align:{align},offset:{offset},memory:{memory},lane:{lane}"),
             Immediate::Shuffle(lanes) => {
                 let lanes_str = lanes
                     .iter()
@@ -1511,6 +1587,10 @@ impl Immediate {
                     .join(",");
                 format!("tags:[{tags_str}]")
             }
+            Immediate::TryTableFull {
+                block_type,
+                catches,
+            } => format!("blockty:{block_type},catches:{catches:?}"),
             Immediate::TagIndex(idx) => format!("tag_index:{idx}"),
             Immediate::Unrecognized(s) => s.clone(),
         }
@@ -1564,13 +1644,16 @@ impl ParsedOperator {
             Immediate::MemArg { align, offset } => {
                 format!("{kind} {{ memarg: MemArg {{ align: {align}, max_align: 0, offset: {offset}, memory: 0 }} }}")
             }
+            Immediate::MemoryArg { align, offset, memory } => format!("{kind} {{ memarg: {{ align: {align}, offset: {offset}, memory: {memory} }} }}"),
             Immediate::MemoryIndex(mem) => format!("{kind} {{ mem: {mem} }}"),
             Immediate::MemoryCopy {
                 dst_index,
                 src_index,
             } => format!("{kind} {{ dst_mem: {dst_index}, src_mem: {src_index} }}"),
             Immediate::DataIndex(idx) => format!("{kind} {{ data_index: {idx} }}"),
+            Immediate::MemoryInit { data_index, memory_index } => format!("{kind} {{ data_index: {data_index}, mem: {memory_index} }}"),
             Immediate::ElemIndex(idx) => format!("{kind} {{ elem_index: {idx} }}"),
+            Immediate::TableInit { elem_index, table_index } => format!("{kind} {{ elem_index: {elem_index}, table: {table_index} }}"),
             Immediate::TableCopy {
                 dst_table,
                 src_table,
@@ -1580,11 +1663,11 @@ impl ParsedOperator {
             Immediate::I64Const(v) => format!("{kind} {{ value: {v} }}"),
             Immediate::F32Const(bits) => {
                 let v = f32::from_bits(*bits);
-                format!("{kind} {{ value: {v} }}")
+                format!("{kind} {{ value: {v}, bits: 0x{bits:08x} }}")
             }
             Immediate::F64Const(bits) => {
                 let v = f64::from_bits(*bits);
-                format!("{kind} {{ value: {v} }}")
+                format!("{kind} {{ value: {v}, bits: 0x{bits:016x} }}")
             }
             Immediate::RefNull(ht) => format!("{kind} {{ hty: {ht} }}"),
             Immediate::RefFunc(idx) => format!("{kind} {{ function_index: {idx} }}"),
@@ -1596,6 +1679,7 @@ impl ParsedOperator {
             } => {
                 format!("{kind} {{ memarg: MemArg {{ align: {align}, max_align: 0, offset: {offset}, memory: 0 }}, lane: {lane} }}")
             }
+            Immediate::SimdMemoryLane { align, offset, memory, lane } => format!("{kind} {{ memarg: {{ align: {align}, offset: {offset}, memory: {memory} }}, lane: {lane} }}"),
             Immediate::Shuffle(lanes) => {
                 format!("{kind} {{ lanes: {lanes:?} }}")
             }
@@ -1640,6 +1724,7 @@ impl ParsedOperator {
             Immediate::TryTable(tags) => {
                 format!("{kind} {{ tags: {tags:?} }}")
             }
+            Immediate::TryTableFull { block_type, catches } => format!("{kind} {{ blockty: {block_type}, catches: {catches:?} }}"),
             Immediate::TagIndex(idx) => format!("{kind} {{ tag_index: {idx} }}"),
             Immediate::Unrecognized(s) => s.clone(),
         }
@@ -1723,6 +1808,38 @@ pub struct AnalysisModule {
     pub call_graph: CallGraphIr,
     pub reachability: ReachabilityIr,
     pub unsafe_paths: Vec<UnsafePathIr>,
+    /// These graphs are exploratory models, not proofs of runtime reachability.
+    pub completeness: AnalysisCompletenessIr,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStatusIr {
+    #[default]
+    NotDerived,
+    /// Derived under the current static model; input typing and runtime
+    /// behavior have not been proved by this analysis.
+    Approximate,
+    /// The input contains a known limitation of the current graph model.
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AnalysisCompletenessIr {
+    pub cfg: AnalysisStatusIr,
+    pub call_graph: AnalysisStatusIr,
+    pub reachability: AnalysisStatusIr,
+    pub unsafe_paths: AnalysisStatusIr,
+    pub model_validated: bool,
+    pub warnings: Vec<AnalysisWarningIr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnalysisWarningIr {
+    pub code: String,
+    pub message: String,
+    pub function_index: Option<u32>,
+    pub operator_offset: Option<u64>,
 }
 
 impl AnalysisModule {
@@ -1733,6 +1850,7 @@ impl AnalysisModule {
             call_graph: CallGraphIr::default(),
             reachability: ReachabilityIr::default(),
             unsafe_paths: Vec::new(),
+            completeness: AnalysisCompletenessIr::default(),
         }
     }
 
@@ -1749,6 +1867,7 @@ impl AnalysisModule {
             call_graph,
             reachability,
             unsafe_paths,
+            completeness: AnalysisCompletenessIr::default(),
         }
     }
 }
@@ -1768,6 +1887,9 @@ impl Deref for AnalysisModule {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ModuleIr {
     pub types: Vec<TypeIr>,
+    /// Every core type, including GC types, in the module's type index space.
+    pub type_definitions: Vec<TypeDefinitionIr>,
+    pub recursion_groups: Vec<RecursionGroupIr>,
     pub imports: Vec<ImportIr>,
     pub exports: Vec<ExportIr>,
     pub tables: Vec<TableIr>,
@@ -1790,6 +1912,53 @@ pub struct TypeIr {
     pub results: Vec<String>,
 }
 
+/// A recursion group is an encoding and type identity boundary, even when it
+/// contains just one type. Its members retain their individual module indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecursionGroupIr {
+    pub source_index: u32,
+    pub offset: u64,
+    pub first_type_index: u32,
+    pub type_count: u32,
+    pub explicit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TypeDefinitionIr {
+    pub source_index: u32,
+    pub offset: u64,
+    pub recursion_group_index: u32,
+    pub is_final: bool,
+    pub supertype: Option<String>,
+    pub shared: bool,
+    pub descriptor: Option<String>,
+    pub describes: Option<String>,
+    pub composite: CompositeTypeIr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CompositeTypeIr {
+    Function {
+        params: Vec<String>,
+        results: Vec<String>,
+    },
+    Struct {
+        fields: Vec<FieldTypeIr>,
+    },
+    Array {
+        field: FieldTypeIr,
+    },
+    Continuation {
+        type_index: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldTypeIr {
+    pub storage_type: String,
+    pub mutable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImportIr {
     pub id: String,
@@ -1807,6 +1976,7 @@ pub struct ExportIr {
     pub name: String,
     pub kind: ExternalKindIr,
     pub item_index: u32,
+    pub exact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2016,11 +2186,48 @@ mod tests {
         assert_eq!(op.variant_name(), "Unrecognized");
         assert_eq!(op.as_str(), "0xff");
     }
+
+    #[test]
+    fn floating_point_payloads_remain_distinguishable_in_hashes_and_reports() {
+        for (opcode, first, second) in [
+            (
+                Opcode::F32Const,
+                Immediate::F32Const(0x7fc00001),
+                Immediate::F32Const(0x7fc00002),
+            ),
+            (
+                Opcode::F64Const,
+                Immediate::F64Const(0x7ff8000000000001),
+                Immediate::F64Const(0x7ff8000000000002),
+            ),
+        ] {
+            assert_ne!(first.as_hash_text(), second.as_hash_text());
+            let first = ParsedOperator {
+                offset: 0,
+                opcode: opcode.clone(),
+                immediate: first,
+            };
+            let second = ParsedOperator {
+                offset: 0,
+                opcode,
+                immediate: second,
+            };
+            assert_ne!(first.display_text(), second.display_text());
+        }
+        assert_ne!(
+            Immediate::F32Const(0).as_hash_text(),
+            Immediate::F32Const(0x80000000).as_hash_text()
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TypeRefIr {
-    Func { type_index: u32, type_id: String },
+    Func {
+        type_index: u32,
+        type_id: String,
+        exact: bool,
+    },
     Table(String),
     Memory(String),
     Global(String),
