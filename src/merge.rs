@@ -8,7 +8,7 @@ use crate::audit::{self, AuditModule, AuditSection, Region, Span};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
-use wasmparser::{BinaryReader, Validator, WasmFeatures};
+use wasmparser::BinaryReader;
 
 #[derive(Debug, Serialize)]
 pub struct MergeEvidence {
@@ -143,7 +143,7 @@ fn custom_key(bytes: &[u8], section: &AuditSection) -> Option<Vec<u8>> {
         BinaryReader::new(raw(bytes, section.payload_span), section.payload_span.start);
     // The custom convention itself can remain opaque. Only the binary name
     // string establishes an existing section's position in the layout.
-    let name = reader.read_string().ok()?;
+    let name = reader.read_unlimited_string().ok()?;
     Some(name.as_bytes().to_vec())
 }
 
@@ -335,23 +335,48 @@ pub fn merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<MergeReport, Str
         report.framing_fixups.clear();
         return Ok(report);
     }
-    match Validator::new_with_features(WasmFeatures::all()).validate_all(&output) {
-        Ok(_) => {
-            report.validation = "valid_with_all_known_features".into();
-            report.status = "clean".into();
-            report.bytes = Some(output);
-        }
-        Err(error) => {
-            report.validation = "failed_or_unsupported".into();
-            report.framing_fixups.clear();
-            report.conflict(
-                "module/validation",
+    let inspected = audit::inspect(&output)?;
+    if inspected.validation == "valid_with_all_known_features"
+        && inspected.standard.validation == "valid"
+    {
+        report.validation = "valid_with_all_known_features".into();
+        report.status = "clean".into();
+        report.bytes = Some(output);
+    } else {
+        report.validation = "failed_or_unsupported".into();
+        report.framing_fixups.clear();
+        let detail = inspected
+            .standard
+            .evidence
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.status.as_str(),
+                    "invalid_encoding" | "invalid_semantics" | "unknown"
+                )
+            })
+            .map(|entry| {
                 format!(
-                    "synthesized module failed validation: {error}; no output module is returned"
-                ),
-                whole_evidence(inputs),
-            );
-        }
+                    "strict output audit at {} [{},{}) ({}): {}",
+                    entry.path, entry.span.start, entry.span.end, entry.status, entry.reason
+                )
+            })
+            .or_else(|| {
+                inspected
+                    .standard
+                    .validator_error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+            })
+            .unwrap_or_else(|| "strict output grammar or feature audit is incomplete".into());
+        report.conflict(
+            "module/validation",
+            format!(
+                "synthesized module failed validation: {detail}; all-known feature validator_valid={}; no output module is returned",
+                inspected.standard.validator_valid
+            ),
+            whole_evidence(inputs),
+        );
     }
     Ok(report)
 }

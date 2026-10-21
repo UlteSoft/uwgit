@@ -4,7 +4,7 @@
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::diff::{DiffChange, DiffReport, OperatorDelta};
+use crate::diff::{CallBindingDelta, CallBindingSite, DiffChange, DiffReport, OperatorDelta};
 use crate::ir::ModuleIr;
 use crate::matcher::MatchReason;
 
@@ -97,6 +97,51 @@ pub fn diff_text(report: &DiffReport) -> String {
         }
     }
 
+    if !report.call_binding_notes.is_empty() {
+        lines.push(
+            "Uncertain call/reference bindings (no known function modification counted):".into(),
+        );
+        for note in &report.call_binding_notes {
+            lines.push(format!(
+                "  {} -> {}",
+                safe_text(&note.old_id),
+                safe_text(&note.new_id)
+            ));
+            push_binding_text(&note.call_bindings, &mut lines);
+        }
+    }
+
+    if !report.export_binding_notes.is_empty() {
+        lines.push("Export binding evidence (export roles excluded; static references require a unique dependency proof; identity unproven):".into());
+        for note in &report.export_binding_notes {
+            lines.push(format!(
+                "  {} ({}) export_index={} -> {} item_index={} -> {} relation={} target_changed={:?} identity_unproven={}",
+                safe_text(&note.old.name), note.old.kind, note.old.export_index, note.new.export_index,
+                note.old.item_index, note.new.item_index, note.relation, note.target_changed,
+                note.identity_unproven,
+            ));
+            lines.push(format!(
+                "    old target={:?}; new target={:?}; independent match={:?}",
+                note.old
+                    .target
+                    .as_ref()
+                    .map(|target| safe_text(&format!("{target:?}"))),
+                note.new
+                    .target
+                    .as_ref()
+                    .map(|target| safe_text(&format!("{target:?}"))),
+                note.target_match
+            ));
+            if let Some(root) = &note.dependency_proof {
+                lines.push(format!(
+                    "    dependency proof root {} -> {} depth={}",
+                    root.old_source_index, root.new_source_index, root.depth
+                ));
+            }
+        }
+    }
+    push_dependency_text(report, &mut lines);
+
     lines.join("\n")
 }
 
@@ -172,6 +217,46 @@ fn push_summary_lines(report: &DiffReport, lines: &mut Vec<String>) {
         report.summary.operator_deletions.to_string().red(),
         "deleted"
     ));
+    let binding_changes = report
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            DiffChange::FunctionChanged { function } => Some(&function.call_bindings),
+            _ => None,
+        })
+        .flatten()
+        .filter(|binding| binding.target_changed == Some(true))
+        .count();
+    if binding_changes > 0 {
+        lines.push(format!("  call/reference target changes: {binding_changes} (alignment-relative; identity unproven)"));
+    }
+    if !report.call_binding_notes.is_empty() {
+        lines.push(format!(
+            "  uncertain call/reference binding notes: {} (not counted as known modifications)",
+            report.call_binding_notes.len()
+        ));
+    }
+    if !report.export_binding_notes.is_empty() {
+        let notes = &report.export_binding_notes;
+        lines.push(format!("  export bindings: {} evidence records, {} candidate relocations, {} different targets, {} unproved (identity unproven)",
+            notes.len(), notes.iter().filter(|note| note.target_changed == Some(false)).count(),
+            notes.iter().filter(|note| note.target_changed == Some(true)).count(),
+            notes.iter().filter(|note| note.target_changed.is_none()).count()));
+    }
+    if report
+        .export_binding_notes
+        .iter()
+        .any(|note| note.dependency_proof.is_some())
+    {
+        lines.push(format!("  export dependency proof: {} unique static nodes (identity unproven; no runtime equivalence claim)",
+            report.export_dependency_graph.nodes.len()));
+    }
+    let call_proofs = call_bindings(report)
+        .filter(|binding| binding.dependency_proof.is_some())
+        .count();
+    if call_proofs > 0 {
+        lines.push(format!("  call/reference dependency proofs: {call_proofs} roots in export_dependency_graph (export roles excluded; identity unproven)"));
+    }
 
     if report.summary.types_added > 0
         || report.summary.types_removed > 0
@@ -179,6 +264,10 @@ fn push_summary_lines(report: &DiffReport, lines: &mut Vec<String>) {
         || report.summary.imports_removed > 0
         || report.summary.exports_added > 0
         || report.summary.exports_removed > 0
+        || report
+            .export_binding_notes
+            .iter()
+            .any(|note| note.target_changed != Some(false))
     {
         lines.push(format!(
             "  abi: types {} {}, imports {} {}, exports {} {}",
@@ -189,12 +278,99 @@ fn push_summary_lines(report: &DiffReport, lines: &mut Vec<String>) {
             format!("+{}", report.summary.exports_added).green(),
             format!("-{}", report.summary.exports_removed).red(),
         ));
+        if report.summary.exports_added > 0 || report.summary.exports_removed > 0 {
+            lines.push("  export counts are raw target keys, including index movement; see export binding evidence".into());
+        }
     } else {
         lines.push(format!(
             "  {}",
             "abi: unchanged in the listed type/import/export projection; see complete binary audit"
                 .green()
         ));
+    }
+}
+
+fn call_bindings(report: &DiffReport) -> impl Iterator<Item = &CallBindingDelta> {
+    report
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            DiffChange::FunctionChanged { function } => Some(function.call_bindings.iter()),
+            _ => None,
+        })
+        .flatten()
+        .chain(
+            report
+                .call_binding_notes
+                .iter()
+                .flat_map(|note| &note.call_bindings),
+        )
+}
+
+fn push_dependency_text(report: &DiffReport, lines: &mut Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let nodes: BTreeMap<_, _> = report
+        .export_dependency_graph
+        .nodes
+        .iter()
+        .map(|node| (node.old_source_index, node))
+        .collect();
+    let mut pending: Vec<_> = report
+        .export_binding_notes
+        .iter()
+        .filter_map(|note| {
+            note.dependency_proof
+                .as_ref()
+                .map(|root| root.old_source_index)
+        })
+        .collect();
+    pending.extend(call_bindings(report).filter_map(|binding| {
+        binding
+            .dependency_proof
+            .as_ref()
+            .map(|root| root.old_source_index)
+    }));
+    let mut selected = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if selected.insert(index) {
+            if let Some(node) = nodes.get(&index) {
+                pending.extend(node.references.iter().map(|reference| reference.old_target));
+            }
+        }
+    }
+    if selected.is_empty() {
+        return;
+    }
+    lines.push("Export dependency proof witnesses (shared with call/reference roots; typed bodies and static references only; identity unproven):".into());
+    let mut selected: Vec<_> = selected
+        .iter()
+        .filter_map(|index| nodes.get(index).copied())
+        .collect();
+    selected.sort_by_key(|node| (node.depth, node.old_source_index));
+    for node in selected {
+        lines.push(format!(
+            "  {} -> {} {} depth={} type={} import={:?}",
+            node.old_source_index,
+            node.new_source_index,
+            node.kind,
+            node.depth,
+            safe_text(&node.type_id),
+            node.import.as_ref().map(|binding| safe_text(
+                &serde_json::to_string(binding).expect("binding serializes")
+            ))
+        ));
+        for reference in &node.references {
+            lines.push(format!(
+                "    {} old operator[{}] @{} target={} -> new operator[{}] @{} target={}",
+                safe_text(&reference.opcode),
+                reference.old_operator_index,
+                reference.old_offset,
+                reference.old_target,
+                reference.new_operator_index,
+                reference.new_offset,
+                reference.new_target
+            ));
+        }
     }
 }
 
@@ -242,8 +418,12 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
                 lines.push(format!("    {} locals changed", "~".yellow()));
             }
             if function.direct_calls_changed {
-                lines.push(format!("    {} direct calls changed", "~".yellow()));
+                lines.push(format!(
+                    "    {} raw direct-call indices changed",
+                    "~".yellow()
+                ));
             }
+            push_binding_text(&function.call_bindings, lines);
             for operator in &function.operators {
                 match operator {
                     OperatorDelta::Replace { index, old, new } => lines.push(format!(
@@ -271,6 +451,67 @@ fn push_change_text(change: &DiffChange, lines: &mut Vec<String>) {
                     }
                 }
             }
+        }
+    }
+}
+
+fn binding_site_text(site: &Option<CallBindingSite>) -> String {
+    let Some(site) = site else {
+        return "no aligned reference site".into();
+    };
+    let target = site.target.as_ref().map_or_else(
+        || "unresolved target".into(),
+        |target| {
+            if let Some(import) = &target.import {
+                format!(
+                    "import {:?}.{:?} type={} exact={}",
+                    safe_text(&import.module),
+                    safe_text(&import.name),
+                    safe_text(&import.type_id),
+                    import.exact
+                )
+            } else {
+                format!(
+                    "{} {} type={} exports={:?}",
+                    target.kind,
+                    safe_text(&target.id),
+                    safe_text(&target.type_id),
+                    target
+                        .export_names
+                        .iter()
+                        .map(|name| safe_text(name))
+                        .collect::<Vec<_>>()
+                )
+            }
+        },
+    );
+    format!(
+        "op[{}] @{} {} function_index={} [{}]",
+        site.operator_index, site.offset, site.opcode, site.function_index, target
+    )
+}
+
+fn push_binding_text(bindings: &[CallBindingDelta], lines: &mut Vec<String>) {
+    for binding in bindings {
+        lines.push(format!(
+            "    binding {}: {} -> {}; target_changed={} pairing={} identity_unproven={} match_scope={}",
+            binding.relation,
+            binding_site_text(&binding.old),
+            binding_site_text(&binding.new),
+            match binding.target_changed {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "unknown",
+            },
+            binding.pairing,
+            binding.identity_unproven,
+            binding.match_scope,
+        ));
+        if let Some(candidate) = &binding.target_match {
+            lines.push(format!("      callee candidate {} -> {} reason={:?} confidence={:.2} ambiguous={} reference_context_complete={}",candidate.old_source_index,candidate.new_source_index,candidate.reason,candidate.confidence,candidate.ambiguous,candidate.reference_context_complete));
+        }
+        if let Some(root) = &binding.dependency_proof {
+            lines.push(format!("      call/reference dependency proof root {} -> {} depth={} graph=export_dependency_graph", root.old_source_index, root.new_source_index, root.depth));
         }
     }
 }

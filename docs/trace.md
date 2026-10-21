@@ -1,5 +1,12 @@
 # 按字节区间查询历史影响
 
+文件树提交须用 `--file relative/path.wasm` 选择模块。路径缺席是实际历史边界：
+父提交没有该路径时，edge 为 `file_absent`、`parent_wasm=null`，frontier 为 `file_introduced_at_path`。
+它不会生成空模块、猜测改名对应关系，或越过删除去连接更早的同字节文件。
+这些边仍计算在边预算内；实际 DAG 的父链继续完整校验。混合历史中的旧无文件名提交使用已记录的升级映射。
+若查询的 tip 本身仍为旧格式，`--file` 是调用者的显式绑定，selection 会说明旧提交没有文件名，
+不会将其冒充为提交对象已经记录的路径。
+
 `trace` 从一个固定提交中的原始字节区间出发，沿提交 DAG 的全部父边查询相关编辑与影响范围。
 它提供可复核的物理证据，不把相同字节、函数索引或名称解释成唯一的历史身份，也不归属作者。
 
@@ -14,6 +21,27 @@ wasm-git trace ./history HEAD --path module --max-edges 64 --max-bytes 8388608
 `--range` 使用十进制 ASCII 字节偏移与半开区间 `[start,end)`，必须非空且处于起点文件范围内。
 二者必须选一个且不能同时使用。路径只用于选定起点区间，不在祖先中按同名路径猜测对象身份。
 空区间、空 region、反向或越界范围、未知或多义路径均拒绝。
+
+custom 元数据使用固定命名空间和物理序号，名称内容不进入可选择路径：
+
+| 对象 | 路径 |
+| --- | --- |
+| 未识别 custom 的 payload | `custom[n]/payload/opaque` |
+| producers 的值条目 | `custom[n]/producers/{language\|processed-by\|sdk}/value[i]` |
+
+`n` 是 custom section 的出现序号，`i` 是该 producers 字段内从 0 开始的条目序号。
+已识别的 `name`、`producers`、`target_features` 命名空间继续使用固定路径。
+原名称中的 NUL、Unicode、斜线、百分号及超长合法 UTF-8 内容保留在描述及对应 span 的原始字节中，
+路径保持有界 ASCII，不随名称长度增长。这些序号表示物理位置，不是跨版本身份。
+`--path` 只作完整字符串精确匹配，不提供旧名称路径别名，不作文件系统路径整理或百分号解码。
+此前包含元数据名称的路径不保证兼容；应重新 `inspect` 获取当前路径，或使用 `--range`。
+超长合法 custom 外层名称在函数读取和验证时可使用明确披露的临时 reader 视图，
+见 `audit.standard.validator_input`；trace 的区间、节点、编辑、上下文及快照摘要始终来自原字节。
+
+Compact2 import 的共享类型可用 `import[0]/group[n]/shared_type` 选择；
+该区间只覆盖 kind 与 TypeRef，不包含名称数量和名称，即使名称列表为空也存在。
+实际 `import[i]` 名称条目是另一个物理区间，其描述指向共享类型。
+两种路径仍只选定当前快照的字节，不证明跨版本声明身份。
 
 输出为 JSON，`selection` 保存起点区间，`trace.tip` 为实际提交 ID。
 无论是完整结果还是预算范围内的部分结果，只要查询成功，退出码均为 0；

@@ -1,19 +1,36 @@
 pub mod analysis;
+mod archive_commands;
+mod bisect_commands;
 pub use wasm_git::audit;
+mod checkout;
+mod command_args;
+mod describe_commands;
 mod diff;
+mod export_dependencies;
 mod fingerprint;
+mod history_commands;
 pub mod ir;
 mod matcher;
 mod normalize;
+mod operation_commands;
 mod output;
 pub mod parse;
+mod porcelain;
+mod protocol;
+mod query_commands;
+mod rebase_commands;
+mod remote;
 mod report;
 mod repository;
 mod resolve;
+mod server;
+mod tree_output;
+mod tree_resolution;
 
 use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
 use std::path::Path;
+use wasm_git::standard::Standard;
 
 #[derive(Debug, Parser)]
 struct InspectArgs {
@@ -23,6 +40,12 @@ struct InspectArgs {
     /// Read a committed revision instead of a filesystem path.
     #[arg(long)]
     repo: Option<String>,
+    /// Select one path in a committed file tree.
+    #[arg(long, requires = "repo")]
+    file: Option<String>,
+    /// Audit against core1, core2, core3, or every decoder-known proposal.
+    #[arg(long, default_value = "all-known")]
+    standard: Standard,
 }
 
 #[derive(Debug, Parser)]
@@ -36,6 +59,26 @@ struct DiffArgs {
     /// Interpret OLD and NEW as repository revisions.
     #[arg(long)]
     repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    file: Option<String>,
+    /// Select allowed features without changing instruction boundary decoding.
+    #[arg(long, default_value = "all-known")]
+    standard: Standard,
+}
+
+#[derive(Debug, Parser)]
+struct WorktreeDiffArgs {
+    repo_dir: String,
+    #[arg(long)]
+    cached: bool,
+    #[arg(long)]
+    file: Option<String>,
+    #[arg(long, value_enum, default_value_t = DiffFormat::Text)]
+    format: DiffFormat,
+    #[arg(long)]
+    short: bool,
+    #[arg(long, default_value = "all-known")]
+    standard: Standard,
 }
 
 #[derive(Debug, Parser)]
@@ -48,6 +91,8 @@ struct PatchArgs {
     /// Interpret OLD and NEW as revisions in one repository snapshot.
     #[arg(long)]
     repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    file: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -63,12 +108,20 @@ struct ApplyArgs {
     /// Interpret OLD as a repository revision; PATCH is always a file.
     #[arg(long)]
     repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    file: Option<String>,
+    /// Audit the verified result against the selected Core standard.
+    #[arg(long, default_value = "all-known")]
+    standard: Standard,
 }
 
 #[derive(Debug, Parser)]
 struct TraceArgs {
     repo_dir: String,
     revision: String,
+    /// Trace this exact file path; renames are separate delete/add events.
+    #[arg(long)]
+    file: Option<String>,
     /// Nonempty half-open byte range in the selected revision: START:END.
     #[arg(long, required_unless_present = "path", conflicts_with = "path")]
     range: Option<String>,
@@ -100,14 +153,77 @@ fn main() {
         print_usage();
         std::process::exit(1);
     }
+    if query_commands::handles(&args[1]) || args[1] == "bisect" {
+        let output = if args[1] == "bisect" {
+            bisect_commands::bisect_query(&args[1..])
+        } else {
+            query_commands::run(&args[1..])
+        };
+        match output {
+            Ok(output) => {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                if let Err(error) = stdout
+                    .write_all(output.stdout.as_bytes())
+                    .and_then(|_| stdout.flush())
+                {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+                if output.exit_code != 0 {
+                    std::process::exit(output.exit_code);
+                }
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let result = match args[1].as_str() {
         "inspect" => cmd_inspect(&args[2..]),
         "diff" => cmd_diff(&args[2..]),
         "patch" => cmd_patch(&args[2..]),
         "apply" => cmd_apply(&args[2..]),
         "trace" => cmd_trace(&args[2..]),
-        "init" | "commit" | "log" | "show" | "checkout" | "branch" | "switch" | "clone"
-        | "bundle" | "unbundle" | "fsck" | "merge" | "merge-base" => repository::run(&args[1..]),
+        "checkout" => checkout::run(&args[1..]),
+        "show"
+            if args
+                .iter()
+                .any(|arg| arg == "--file" || arg.starts_with("--file=")) =>
+        {
+            tree_output::export_file(&args[1..])
+        }
+        "server" | "serve" => server::run(&args[1..]),
+        "pull" if args.len() >= 3 && !command_args::help_requested(&args[1..]) => {
+            porcelain::with_clean_history(&args[2], |_| remote::run(&args[1..]))
+        }
+        "remote" | "fetch" | "pull" | "push" => remote::run(&args[1..]),
+        "clone" if args.get(2).is_some_and(|url| remote::is_remote_url(url)) => {
+            remote::run(&args[1..])
+        }
+        "merge" | "cherry-pick" | "revert" | "rebase"
+            if operation_commands::requested(&args[1..]) =>
+        {
+            operation_commands::run(&args[1..])
+        }
+        "cherry-pick" | "revert" | "rebase" => history_commands::run(&args[1..]),
+        "status" | "add" | "rm" | "mv" | "restore" | "reset" | "stash" | "config" | "tag"
+        | "reflog" | "rev-parse" | "cat-file" | "ls-files" => porcelain::run(&args[1..]),
+        "commit" if args.get(3).is_some_and(|arg| arg.starts_with('-')) => {
+            porcelain::run(&args[1..])
+        }
+        "branch" | "switch" => porcelain::run(&args[1..]),
+        "commit" if args.len() >= 3 && !command_args::help_requested(&args[1..]) => {
+            porcelain::with_no_pending(&args[2], |_| repository::run(&args[1..]))
+        }
+        "merge" if tree_resolution::requested(&args[1..]) => tree_resolution::run(&args[2..]),
+        "merge" if args.len() >= 3 && !command_args::help_requested(&args[1..]) => {
+            porcelain::with_clean_history(&args[2], |_| repository::run(&args[1..]))
+        }
+        "init" | "commit" | "log" | "show" | "clone" | "bundle" | "unbundle" | "fsck" | "merge"
+        | "merge-base" => repository::run(&args[1..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(String::new())
@@ -120,12 +236,24 @@ fn main() {
     };
     match result {
         Ok(output) if !output.is_empty() => {
-            let conflict = args[1] == "merge"
-                && serde_json::from_str::<Value>(&output)
-                    .is_ok_and(|report| report["status"] == "conflict");
+            let conflict = matches!(
+                args[1].as_str(),
+                "merge" | "pull" | "cherry-pick" | "revert" | "rebase"
+            ) && serde_json::from_str::<Value>(&output)
+                .is_ok_and(|report| report["status"] == "conflict");
             println!("{output}");
             if conflict {
                 std::process::exit(2);
+            }
+            if args[1] == "push"
+                && serde_json::from_str::<Value>(&output).is_ok_and(|report| {
+                    matches!(
+                        report["status"].as_str(),
+                        Some("partial" | "rejected" | "unknown")
+                    )
+                })
+            {
+                std::process::exit(1);
             }
         }
         Ok(_) => {}
@@ -149,11 +277,28 @@ fn cmd_inspect(args: &[String]) -> Result<String, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    let inputs = read_inputs(&[&parsed.filepath], parsed.repo.as_deref())?;
+    if let Some(root) = &parsed.repo {
+        let revisions = repository::read_file_revisions(Path::new(root), &[&parsed.filepath])?;
+        let revision = revisions
+            .into_iter()
+            .next()
+            .ok_or("missing revision snapshot")?;
+        if parsed.file.is_none() && revision.legacy.is_none() {
+            return tree_output::inspect_tree(&parsed.filepath, revision, parsed.standard);
+        }
+        let input = tree_output::select_input(&parsed.filepath, revision, parsed.file.as_deref())?;
+        return serde_json::to_string_pretty(&inspect_input(&input, parsed.standard)?)
+            .map_err(|e| e.to_string());
+    }
+    let inputs = read_inputs(&[&parsed.filepath], None, None)?;
     let input = &inputs[0];
-    let audit =
-        audit::inspect(&input.bytes).map_err(|error| format!("wasm parse error: {error}"))?;
-    let (mut output, status) = match normalize_bytes(&input.bytes) {
+    serde_json::to_string_pretty(&inspect_input(input, parsed.standard)?).map_err(|e| e.to_string())
+}
+
+fn inspect_input(input: &Input, standard: Standard) -> Result<Value, String> {
+    let audit = audit::inspect_with_standard(&input.bytes, standard)
+        .map_err(|error| format!("wasm parse error: {error}"))?;
+    let (mut output, status) = match normalize_bytes(&input.bytes, &audit) {
         Ok(module) => (
             serde_json::from_str::<Value>(&report::inspect_json(&module)).unwrap(),
             json!({"available": true}),
@@ -164,13 +309,44 @@ fn cmd_inspect(args: &[String]) -> Result<String, String> {
         ),
     };
     output["schema_version"] = json!(1);
-    output["function_analysis"] = status;
+    output["function_analysis"] = analysis_scope(status, standard);
     output["input"] = input.origin.clone();
     output["audit"] = serde_json::to_value(audit).map_err(|error| error.to_string())?;
-    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+    Ok(output)
 }
 
 fn cmd_diff(args: &[String]) -> Result<String, String> {
+    if args
+        .first()
+        .is_some_and(|root| Path::new(root).join(".uwgit").is_dir())
+        && (args.len() == 1 || args.get(1).is_some_and(|arg| arg.starts_with('-')))
+    {
+        let parsed = match WorktreeDiffArgs::try_parse_from(
+            std::iter::once("wasm-git diff DIR").chain(args.iter().map(String::as_str)),
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+                return Ok(error.to_string())
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let inputs = porcelain::diff_snapshot(&parsed.repo_dir, parsed.cached)?;
+        let labels = DiffArgs {
+            old_path: if parsed.cached { "HEAD" } else { "INDEX" }.into(),
+            new_path: if parsed.cached { "INDEX" } else { "WORKTREE" }.into(),
+            format: parsed.format,
+            short: parsed.short,
+            repo: None,
+            file: parsed.file,
+            standard: parsed.standard,
+        };
+        return tree_output::render_files(
+            &labels,
+            inputs,
+            json!({"kind":if parsed.cached{"commit"}else{"index"}}),
+            json!({"kind":if parsed.cached{"index"}else{"worktree"}}),
+        );
+    }
     if args.len() < 2
         && !args
             .iter()
@@ -187,10 +363,24 @@ fn cmd_diff(args: &[String]) -> Result<String, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
+    if let Some(root) = &parsed.repo {
+        let revisions = repository::read_file_revisions(
+            Path::new(root),
+            &[&parsed.old_path, &parsed.new_path],
+        )?;
+        if parsed.file.is_some() || revisions.iter().any(|r| r.legacy.is_none()) {
+            return tree_output::diff_revisions(&parsed, revisions);
+        }
+    }
     let inputs = read_inputs(
         &[&parsed.old_path, &parsed.new_path],
         parsed.repo.as_deref(),
+        parsed.file.as_deref(),
     )?;
+    render_diff(&parsed, &inputs)
+}
+
+fn render_diff(parsed: &DiffArgs, inputs: &[Input]) -> Result<String, String> {
     let old = &inputs[0].bytes;
     let new = &inputs[1].bytes;
     let bindings = if parsed.repo.is_some() {
@@ -202,9 +392,10 @@ fn cmd_diff(args: &[String]) -> Result<String, String> {
     } else {
         String::new()
     };
-    let audit = audit::compare(old, new).map_err(|error| format!("wasm parse error: {error}"))?;
-    let comparison = normalize_bytes(old).and_then(|old_module| {
-        normalize_bytes(new).map(|new_module| {
+    let audit = audit::compare_with_standard(old, new, parsed.standard)
+        .map_err(|error| format!("wasm parse error: {error}"))?;
+    let comparison = normalize_bytes(old, &audit.old).and_then(|old_module| {
+        normalize_bytes(new, &audit.new).map(|new_module| {
             diff::diff_modules(&parsed.old_path, &old_module, &parsed.new_path, &new_module)
         })
     });
@@ -214,10 +405,11 @@ fn cmd_diff(args: &[String]) -> Result<String, String> {
             Err(error) => format!("Function comparison unavailable: {error}"),
         };
         return Ok(format!(
-            "{bindings}{functions}\nBinary audit: {} ({} edit groups, exact_minimal={})\nDiagnostics: old={}, new={}",
+            "{bindings}{functions}\nBinary audit: {} ({} edit groups, exact_minimal={})\nDiagnostics: old={}, new={}\nSelected standard: {}; validation: old={}, new={} (function interpretation decodes all known proposals)",
             if audit.changed { "changed" } else { "identical" },
             audit.edits.len(), audit.exact_minimal,
-            audit.old.diagnostics.len(), audit.new.diagnostics.len()
+            audit.old.diagnostics.len(), audit.new.diagnostics.len(),
+            parsed.standard, audit.old.standard.validation, audit.new.standard.validation
         ));
     }
     match parsed.format {
@@ -229,13 +421,15 @@ fn cmd_diff(args: &[String]) -> Result<String, String> {
                 ),
                 Err(error) => (
                     json!({"old": parsed.old_path, "new": parsed.new_path,
-                        "summary": null, "function_matches": [], "changes": []}),
+                        "summary": null, "function_matches": [], "changes": [],
+                        "call_binding_notes": [], "export_binding_notes": [],
+                        "export_dependency_graph": null}),
                     json!({"available": false, "reason": error}),
                 ),
             };
             output["schema_version"] = json!(1);
             output["binary_changed"] = json!(audit.changed);
-            output["function_analysis"] = status;
+            output["function_analysis"] = analysis_scope(status, parsed.standard);
             output["inputs"] = json!({"old": &inputs[0].origin, "new": &inputs[1].origin});
             output["audit"] = serde_json::to_value(audit).map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
@@ -245,25 +439,38 @@ fn cmd_diff(args: &[String]) -> Result<String, String> {
                 Ok(report) => report::diff_text(&report),
                 Err(error) => format!("Function comparison unavailable: {error}"),
             };
-            Ok(format!("{bindings}{}\n\n{functions}", audit.to_text()))
+            Ok(format!("{bindings}{}\n\nFunction interpretation (all decoder-known proposals; selected-standard validity is reported above):\n{functions}", audit.to_text()))
         }
     }
 }
 
-fn read_inputs(inputs: &[&str], repo: Option<&str>) -> Result<Vec<Input>, String> {
+fn analysis_scope(mut status: Value, standard: Standard) -> Value {
+    status["decoding_standard"] = json!("all-known");
+    status["selected_standard"] = json!(standard);
+    status["standard_validity_is_separate"] = json!(true);
+    status
+}
+
+fn read_inputs(
+    inputs: &[&str],
+    repo: Option<&str>,
+    file: Option<&str>,
+) -> Result<Vec<Input>, String> {
     match repo {
-        Some(directory) => {
+        Some(directory) if file.is_none() => {
             repository::read_revisions(Path::new(directory), inputs).map(|resolved| {
                 inputs
                     .iter()
                     .zip(resolved)
                     .map(|(reference, revision)| Input {
                         bytes: revision.bytes,
-                        origin: json!({"revision": reference, "commit": revision.commit}),
+                        origin: json!({"revision":reference,"commit":revision.commit}),
                     })
                     .collect()
             })
         }
+        Some(directory) => repository::read_file_revisions(Path::new(directory), inputs)
+            .and_then(|resolved| tree_output::select_inputs(inputs, resolved, file)),
         None => inputs
             .iter()
             .map(|path| {
@@ -302,10 +509,11 @@ fn cmd_patch(args: &[String]) -> Result<String, String> {
     let inputs = read_inputs(
         &[&parsed.old_path, &parsed.new_path],
         parsed.repo.as_deref(),
+        parsed.file.as_deref(),
     )?;
     let patch = wasm_git::patch::create(&inputs[0].bytes, &inputs[1].bytes)?;
     let encoded = patch.to_bytes()?;
-    output::write_new_file(Path::new(&parsed.output), &encoded)?;
+    output::write_export_file(Path::new(&parsed.output), &encoded)?;
     serde_json::to_string_pretty(&json!({
         "schema_version": 1,
         "patch": patch_summary(&patch),
@@ -326,16 +534,20 @@ fn cmd_apply(args: &[String]) -> Result<String, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    let inputs = read_inputs(&[&parsed.old_path], parsed.repo.as_deref())?;
+    let inputs = read_inputs(
+        &[&parsed.old_path],
+        parsed.repo.as_deref(),
+        parsed.file.as_deref(),
+    )?;
     let encoded = std::fs::read(&parsed.patch_path)
         .map_err(|error| format!("cannot read {}: {error}", parsed.patch_path))?;
     let patch = wasm_git::patch::BytePatch::from_bytes(&encoded)?;
     let bytes = patch.apply(&inputs[0].bytes)?;
     // Recompute explanations from verified bytes. The artifact supplies no
     // trusted feature, context, validation, or minimum-edit claims.
-    let audit = audit::compare(&inputs[0].bytes, &bytes)?;
+    let audit = audit::compare_with_standard(&inputs[0].bytes, &bytes, parsed.standard)?;
     if let Some(destination) = &parsed.output {
-        output::write_new_file(Path::new(destination), &bytes)?;
+        output::write_export_file(Path::new(destination), &bytes)?;
     }
     serde_json::to_string_pretty(&json!({
         "schema_version": 1,
@@ -348,7 +560,31 @@ fn cmd_apply(args: &[String]) -> Result<String, String> {
     .map_err(|error| error.to_string())
 }
 
-fn normalize_bytes(bytes: &[u8]) -> Result<ir::NormalizedModule, String> {
+fn normalize_bytes(
+    bytes: &[u8],
+    audit: &audit::AuditModule,
+) -> Result<ir::NormalizedModule, String> {
+    if let Some(section) = audit
+        .sections
+        .iter()
+        .find(|section| section.id != 0 && section.status != "decoded")
+    {
+        return Err(format!(
+            "incomplete Core grammar at {} ({}); function analysis cannot use unproven declaration or instruction boundaries; see the lossless binary audit",
+            section.path, section.status
+        ));
+    }
+    if let Some(entry) = audit
+        .standard
+        .evidence
+        .iter()
+        .find(|entry| entry.status == "invalid_encoding")
+    {
+        return Err(format!(
+            "invalid Core encoding at {} [{},{}); function analysis cannot normalize an invalid wire form; see the lossless binary audit",
+            entry.path, entry.span.start, entry.span.end
+        ));
+    }
     parse::parse_module(bytes)
         .map(|parsed| parsed.resolve().normalize())
         .map_err(|error| error.to_string())
@@ -421,7 +657,23 @@ fn cmd_trace(args: &[String]) -> Result<String, String> {
         Err(error) => return Err(error.to_string()),
     };
     let numeric_range = parsed.range.as_deref().map(parse_trace_range).transpose()?;
-    let history = repository::read_history(Path::new(&parsed.repo_dir), &parsed.revision)?;
+    let (history, absent, legacy_path, tip_legacy) = if let Some(file) = &parsed.file {
+        let selected =
+            repository::read_file_history(Path::new(&parsed.repo_dir), &parsed.revision, file)?;
+        (
+            selected.history,
+            selected.absent,
+            selected.legacy_path,
+            selected.tip_legacy,
+        )
+    } else {
+        (
+            repository::read_history(Path::new(&parsed.repo_dir), &parsed.revision)?,
+            Default::default(),
+            None,
+            false,
+        )
+    };
     let commit = history
         .commits
         .get(&history.tip)
@@ -453,12 +705,21 @@ fn cmd_trace(args: &[String]) -> Result<String, String> {
         max_compared_bytes: parsed.max_bytes,
         ..Default::default()
     };
-    let report = wasm_git::trace::trace(&history, span, limits)?;
+    let report = wasm_git::trace::trace_with_absences(&history, &absent, span, limits)?;
+    let mut selection = json!({"kind": if parsed.path.is_some() { "path" } else { "range" }, "path":parsed.path,"span":span});
+    if let Some(file) = parsed.file {
+        selection["file"] = json!(file);
+        selection["file_identity"] = json!(if tip_legacy {
+            "explicit selected path; legacy commits have no filename"
+        } else {
+            "exact_path; rename identity is not inferred"
+        });
+        selection["legacy_path"] = json!(legacy_path);
+    }
     serde_json::to_string_pretty(&json!({
         "schema_version": 1,
         "repository_verified": true,
-        "selection": {"kind": if parsed.path.is_some() { "path" } else { "range" },
-            "path": parsed.path, "span": span},
+        "selection": selection,
         "trace": report
     }))
     .map_err(|error| error.to_string())
@@ -466,17 +727,66 @@ fn cmd_trace(args: &[String]) -> Result<String, String> {
 
 fn print_usage() {
     eprintln!("usage: wasm-git <command> [<args>]\n");
-    eprintln!("  inspect <FILE|REV> [--repo DIR] [--json]");
-    eprintln!("  diff <OLD> <NEW> [--repo DIR] [--short] [--format text|json]");
-    eprintln!("  patch <OLD> <NEW> --output NEW_PATCH [--repo DIR]");
-    eprintln!("  apply <OLD> <PATCH> (--check | --output NEW_WASM) [--repo DIR]");
     eprintln!(
-        "  trace <DIR> <REV> (--range START:END | --path PATH) [--max-edges N] [--max-bytes N]"
+        "  inspect <FILE|REV> [--repo DIR] [--file PATH] [--json] [--standard core1|core2|core3|all-known]"
+    );
+    eprintln!(
+        "  diff <OLD> <NEW> [--repo DIR] [--file PATH] [--short] [--format text|json] [--standard STANDARD]"
+    );
+    eprintln!("  diff <DIR> [--cached] [--file PATH] [--short] [--format text|json] [--standard STANDARD]");
+    eprintln!("  patch <OLD> <NEW> --output NEW_PATCH [--repo DIR --file PATH]");
+    eprintln!(
+        "  apply <OLD> <PATCH> (--check | --output NEW_WASM) [--repo DIR --file PATH] [--standard STANDARD]"
+    );
+    eprintln!(
+        "  trace <DIR> <REV> [--file PATH] (--range START:END | --path PATH) [--max-edges N] [--max-bytes N]"
     );
     eprintln!("  init <DIR> | commit <DIR> <WASM> -m <MESSAGE> | log <DIR> [REV]");
-    eprintln!("  show <DIR> <REV> [--output NEW_FILE] | checkout <DIR> <REV> <NEW_FILE>");
+    eprintln!("  show <DIR> <REV> [--file PATH] [--output NEW_FILE] | checkout <DIR> <REV> <NEW_FILE> [--file PATH]");
+    eprintln!("  checkout <DIR> <BRANCH> | checkout <DIR> -b <NAME> [REV]");
+    eprintln!("  checkout <DIR> [REV] -- <PATH>...");
     eprintln!("  branch <DIR> [NAME [REV]] | switch <DIR> <NAME>");
+    eprintln!("  branch <DIR> -u <REMOTE/BRANCH> [NAME] | branch <DIR> --unset-upstream [NAME] | branch <DIR> -vv");
     eprintln!("  clone <SOURCE_DIR> <NEW_DIR> | bundle <DIR> <NEW_BUNDLE_FILE>");
     eprintln!("  unbundle <DIR> <BUNDLE> <BRANCH> | fsck <DIR>");
     eprintln!("  merge <DIR> <REV> -m <MESSAGE> | merge-base <DIR> <LEFT> <RIGHT>");
+    eprintln!("  merge <DIR> <REV> --ff-only [-m MESSAGE]");
+    eprintln!("  merge <DIR> <TARGET_ID> -m <MESSAGE> --resolved-index --expect-head <HEAD_ID> [--expect-branch NAME]");
+    eprintln!("  add <DIR> <RELATIVE_WASM>... | status <DIR> | commit <DIR> -m <MESSAGE>");
+    eprintln!("  restore <DIR> [--source REV] | reset <DIR> [--soft|--mixed|--hard] [REV]");
+    eprintln!(
+        "  rm <DIR> [--cached] [FILE...] | mv <DIR> <OLD> <NEW> | stash <DIR> [push|list|apply|pop|drop]"
+    );
+    eprintln!("  tag <DIR> [NAME [REV]|-d NAME] | reflog <DIR> | rev-parse <DIR> <REV>");
+    eprintln!("  cat-file <DIR> <REV> | ls-files <DIR> | config <DIR> [KEY [VALUE]]");
+    eprintln!("  ls-tree <DIR> <REV> [-r] [--json|--name-only|--object-only] [-z] [-- PATH...]");
+    eprintln!("  show-ref <DIR> [--head] [--heads|--tags] [--verify] [--quiet|--hash|--json] [PATTERN...]");
+    eprintln!(
+        "  for-each-ref <DIR> [--json|--format STR] [--sort KEY]... [--count N] [PATTERN...]"
+    );
+    eprintln!(
+        "  count-objects <DIR> [-v] [-H] | ls-remote <URL|DIR [REMOTE]> [--json] [PATTERN...]"
+    );
+    eprintln!(
+        "  cherry-pick <DIR> <REV> | revert <DIR> <REV> | rebase <DIR> <UPSTREAM> [--onto REV]"
+    );
+    eprintln!("  cherry-pick|revert <DIR> <TARGET_ID> [--mainline N] --resolved-index --expect-head <HEAD_ID> [--expect-branch NAME] [-m MESSAGE]");
+    eprintln!(
+        "  merge|cherry-pick|revert <DIR> <REV> --record-conflict [-m MESSAGE] [--mainline N]"
+    );
+    eprintln!("  merge|cherry-pick|revert <DIR> --continue --resolved-index | --abort | --quit");
+    eprintln!("  cherry-pick|revert <DIR> --skip");
+    eprintln!("  rebase <DIR> <UPSTREAM> [--onto REV] --record-conflict");
+    eprintln!("  rebase <DIR> --continue --resolved-index | --abort | --skip | --quit");
+    eprintln!("  remote <DIR> [add NAME URL|remove NAME|-v] | fetch <DIR> [REMOTE]");
+    eprintln!("  push <DIR> [REMOTE] [SRC:DST] | pull <DIR> [REMOTE] [BRANCH] -m <MESSAGE>");
+    eprintln!("  push <DIR> [REMOTE] [LOCAL_BRANCH:REMOTE_BRANCH] --set-upstream");
+    eprintln!("  pull <DIR> [REMOTE] [BRANCH] --ff-only [-m MESSAGE]");
+    eprintln!("  clone <http(s)://HOST/REPO|ssh://USER@HOST/ROOT/REPO> <NEW_DIR>");
+    eprintln!("  describe <DIR> [REV] [--tags] [--exact-match] [--always] [--long] [--first-parent] [--abbrev N]");
+    eprintln!("  archive <DIR> <REV> --output NEW_TAR [--format tar] [--prefix PREFIX/] [--legacy-path NAME] [-- PATH...]");
+    eprintln!("  bisect <DIR> start [--no-checkout] [--first-parent] <BAD> <GOOD>...");
+    eprintln!("  bisect <DIR> good|skip [REV...] | bad [REV] | status | next | log | reset");
+    eprintln!("  server --root <DIR> [--listen ADDRESS] [--token-file FILE --allow-write]");
+    eprintln!("  server --stdio --root <DIR> [--allow-force]");
 }

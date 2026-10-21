@@ -1,0 +1,40 @@
+[package]
+name = "wasm-git-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wasm-git = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+wat = { version = "=1.249.0", optional = true }
+
+[features]
+seed-generator = ["dep:wat"]
+
+[[bin]]
+name = "raw_audit"
+path = "fuzz_targets/raw_audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "generate_seeds"
+path = "generate_seeds.rs"
+required-features = ["seed-generator"]
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+wasmparser = { path = "../vendor/wasmparser" }

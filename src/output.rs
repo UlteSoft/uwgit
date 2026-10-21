@@ -109,6 +109,40 @@ pub fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     StagedOutput::new(parent_directory(path), bytes)?.publish(path)
 }
 
+/// Export through an existing resolved directory outside repository metadata.
+/// Resolve parent aliases once and use that same directory for publication.
+pub fn write_export_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // file_name normalizes trailing separators and `.` components. Preserve
+    // the requested directory semantics before selecting a destination name.
+    let final_component = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .rsplit(|byte| std::path::is_separator(*byte as char))
+        .next()
+        .unwrap_or_default();
+    if final_component.is_empty() || final_component == b"." || final_component == b".." {
+        return Err(format!(
+            "output path must name a new file: {}",
+            path.display()
+        ));
+    }
+    let filename = path
+        .file_name()
+        .ok_or_else(|| format!("output path must name a new file: {}", path.display()))?;
+    let parent = parent_directory(path);
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| io_error("resolve output parent", parent, error))?;
+    if parent.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| part.eq_ignore_ascii_case(".uwgit"))
+    }) {
+        return Err("output must be outside repository metadata".into());
+    }
+    write_new_file(&parent.join(filename), bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +194,103 @@ mod tests {
         assert_eq!(parent_directory(Path::new("result.wasm")), Path::new("."));
         assert_eq!(parent_directory(Path::new("./result.wasm")), Path::new("."));
         assert_eq!(parent_directory(Path::new("a/result.wasm")), Path::new("a"));
+    }
+
+    #[test]
+    fn exports_reject_metadata_components_and_preserve_internal_publication() {
+        let temp = TempDirectory::new();
+        for (case, name) in [("lower", ".uwgit"), ("mixed", ".UwGiT")] {
+            let container = temp.path(case);
+            fs::create_dir(&container).unwrap();
+            let metadata = container.join(name);
+            fs::create_dir(&metadata).unwrap();
+            let nested = metadata.join("tmp");
+            fs::create_dir(&nested).unwrap();
+            for parent in [&metadata, &nested] {
+                let destination = parent.join("export.wasm");
+                assert!(write_export_file(&destination, b"export").is_err());
+                assert!(!destination.exists());
+                assert!(fs::read_dir(parent).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".uwgit-output-")
+                }));
+            }
+            let internal = metadata.join("internal");
+            write_new_file(&internal, b"metadata").unwrap();
+            assert_eq!(fs::read(internal).unwrap(), b"metadata");
+        }
+        let ordinary = temp.path(".uwgit-exports");
+        fs::create_dir(&ordinary).unwrap();
+        let destination = ordinary.join("result.wasm");
+        write_export_file(&destination, b"complete export").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"complete export");
+        assert!(write_export_file(&destination, b"replacement").is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"complete export");
+        let missing = temp.path("missing").join("result.wasm");
+        assert!(write_export_file(&missing, b"unpublished").is_err());
+        assert!(!temp.path("missing").exists());
+    }
+
+    #[test]
+    fn exports_preserve_lexical_directory_requests_and_invalid_parents() {
+        let temp = TempDirectory::new();
+        for name in ["missing/", "missing/.", "missing/.//"] {
+            assert!(write_export_file(&temp.path(name), b"unpublished").is_err());
+            assert!(temp.entries().is_empty());
+        }
+        let directory = temp.path("existing");
+        fs::create_dir(&directory).unwrap();
+        let parent_file = temp.path("parent-file");
+        fs::write(&parent_file, b"preserve parent bytes").unwrap();
+        let before = temp.entries();
+        for name in [
+            "existing/",
+            "existing/.",
+            "existing/.//",
+            "parent-file/child",
+        ] {
+            assert!(write_export_file(&temp.path(name), b"unpublished").is_err());
+            assert_eq!(temp.entries(), before);
+            assert!(fs::read_dir(&directory).unwrap().next().is_none());
+            assert_eq!(fs::read(&parent_file).unwrap(), b"preserve parent bytes");
+        }
+        let ordinary = temp.path("ordinary.wasm");
+        write_export_file(&ordinary, b"complete export").unwrap();
+        assert_eq!(fs::read(ordinary).unwrap(), b"complete export");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = temp.0.join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
+            write_export_file(&non_utf8, b"non-UTF-8 filename").unwrap();
+            assert_eq!(fs::read(non_utf8).unwrap(), b"non-UTF-8 filename");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_resolve_parent_aliases_before_metadata_check_and_publication() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDirectory::new();
+        let metadata = temp.path(".uwgit");
+        fs::create_dir(&metadata).unwrap();
+        let blocked_alias = temp.path("metadata-alias");
+        symlink(&metadata, &blocked_alias).unwrap();
+        assert!(write_export_file(&blocked_alias.join("index.lock"), b"blocked").is_err());
+        assert!(fs::read_dir(&metadata).unwrap().next().is_none());
+        let ordinary = temp.path("exports");
+        fs::create_dir(&ordinary).unwrap();
+        let ordinary_alias = temp.path("export-alias");
+        symlink(&ordinary, &ordinary_alias).unwrap();
+        write_export_file(&ordinary_alias.join("result.wasm"), b"exported").unwrap();
+        assert_eq!(fs::read(ordinary.join("result.wasm")).unwrap(), b"exported");
+        let target = ordinary.join("preserve");
+        fs::write(&target, b"existing bytes").unwrap();
+        symlink(&target, ordinary.join("existing-link")).unwrap();
+        assert!(write_export_file(&ordinary_alias.join("existing-link"), b"replacement").is_err());
+        assert_eq!(fs::read(target).unwrap(), b"existing bytes");
     }
 
     #[test]

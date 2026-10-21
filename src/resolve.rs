@@ -4,7 +4,7 @@
 //! stable function identity, and stays intentionally un-normalized so both diff
 //! and future analysis passes can branch from the same resolved module.
 
-use crate::fingerprint::stable_function_id;
+use crate::fingerprint::resolved_function_ids;
 use crate::ir::{ExternalKindIr, ModuleIr, ParsedModule, ResolvedModule};
 
 pub fn resolve_module(parsed: ParsedModule) -> ResolvedModule {
@@ -35,25 +35,7 @@ impl ParsedModule {
 }
 
 fn refresh_function_stable_ids(module: &mut ModuleIr) {
-    // Export identities do not depend on body hashes. Publish them before
-    // hashing callers, so a shifted callee index does not leak into a caller's
-    // canonical fingerprint through the parser's temporary ID.
-    let exported_ids = module
-        .functions
-        .iter()
-        .enumerate()
-        .filter(|(_, function)| !function.export_names.is_empty())
-        .map(|(index, function)| (index, stable_function_id(module, function)))
-        .collect::<Vec<_>>();
-    for (index, id) in exported_ids {
-        module.functions[index].id = id;
-    }
-    let ids = module
-        .functions
-        .iter()
-        .map(|function| stable_function_id(module, function))
-        .collect::<Vec<_>>();
-
+    let ids = resolved_function_ids(module);
     for (function, id) in module.functions.iter_mut().zip(ids) {
         function.id = id;
     }
@@ -77,5 +59,85 @@ mod tests {
         assert_eq!(function.export_names, ["add"]);
         assert_eq!(function.id, "func:export:add:type:i32,i32->i32");
         assert!(function.fingerprint.is_none());
+    }
+
+    #[test]
+    fn unexported_chain_ids_survive_reordering_and_unused_imports() {
+        let old = resolve_module(
+            parse_module(
+                &wat::parse_str(
+                    "(module
+                        (func $leaf (result i32) i32.const 7)
+                        (func $mid (result i32) call $leaf)
+                        (func $top (result i32) call $mid))",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let new = resolve_module(
+            parse_module(
+                &wat::parse_str(
+                    "(module
+                        (import \"env\" \"unused\" (func))
+                        (func $top (result i32) call $mid)
+                        (func $leaf (result i32) i32.const 7)
+                        (func $mid (result i32) call $leaf))",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+
+        for (old_index, new_index) in [(0, 2), (1, 3), (2, 1)] {
+            assert_eq!(old.functions[old_index].id, new.functions[new_index].id);
+        }
+        for module in [&old, &new] {
+            for (function, fingerprint) in module
+                .functions
+                .iter()
+                .zip(crate::fingerprint::module_fingerprints(module))
+            {
+                assert!(fingerprint.reference_context_complete);
+                assert_eq!(function.id, fingerprint.stable_id);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_unexported_chain_uses_iterative_callee_first_identity_resolution() {
+        const DEPTH: usize = 1024;
+        let chain = |reverse: bool| {
+            let mut text = String::from("(module ");
+            for position in 0..DEPTH {
+                let index = if reverse {
+                    DEPTH - position - 1
+                } else {
+                    position
+                };
+                let body = if index == 0 {
+                    "i32.const 7".to_owned()
+                } else {
+                    format!("call $f{}", index - 1)
+                };
+                text.push_str(&format!("(func $f{index} (result i32) {body})"));
+            }
+            text.push(')');
+            resolve_module(parse_module(&wat::parse_str(text).unwrap()).unwrap())
+        };
+        let forward = chain(false);
+        let reverse = chain(true);
+
+        for index in 0..DEPTH {
+            assert_eq!(
+                forward.functions[index].id,
+                reverse.functions[DEPTH - index - 1].id
+            );
+        }
+        for module in [&forward, &reverse] {
+            assert!(crate::fingerprint::module_fingerprints(module)
+                .iter()
+                .all(|fingerprint| fingerprint.reference_context_complete));
+        }
     }
 }

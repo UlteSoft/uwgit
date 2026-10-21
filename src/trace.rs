@@ -119,7 +119,8 @@ pub struct TraceEvent {
 pub struct TraceEdge {
     pub parent: String,
     pub child: String,
-    pub parent_wasm: String,
+    /// Null when a file is proven absent from this parent tree.
+    pub parent_wasm: Option<String>,
     pub child_wasm: String,
     pub selected: Vec<TraceRange>,
     pub status: String,
@@ -178,7 +179,18 @@ fn span(start: usize, end: usize) -> Span {
 /// Validate the entire reachable graph before consuming traversal budgets.
 /// Metadata keys are checked for consistency; authentication belongs to the
 /// repository layer, and is not inferred by hashing these engine inputs.
-fn order(history: &HistorySnapshot) -> Result<Vec<String>, String> {
+fn order(history: &HistorySnapshot, absent: &BTreeSet<String>) -> Result<Vec<String>, String> {
+    for id in absent {
+        let node = history
+            .commits
+            .get(id)
+            .ok_or_else(|| format!("absent-file marker references missing commit {id}"))?;
+        if !node.wasm.is_empty() {
+            return Err(format!(
+                "absent-file commit {id} must not name a Wasm object"
+            ));
+        }
+    }
     let mut colors = BTreeMap::<String, u8>::new();
     let mut checked_blobs = BTreeSet::new();
     let mut stack = vec![(history.tip.clone(), false)];
@@ -213,7 +225,7 @@ fn order(history: &HistorySnapshot) -> Result<Vec<String>, String> {
                 return Err(format!("missing parent {parent} of commit {id}"));
             }
         }
-        if checked_blobs.insert(&node.wasm) {
+        if !absent.contains(&id) && checked_blobs.insert(&node.wasm) {
             let bytes = history
                 .blobs
                 .get(&node.wasm)
@@ -487,7 +499,23 @@ pub fn trace(
     query: Span,
     limits: TraceLimits,
 ) -> Result<TraceReport, String> {
-    let order = order(history)?;
+    trace_with_absences(history, &BTreeSet::new(), query, limits)
+}
+
+/// Trace one file path through the real commit DAG. Absence is supplied only
+/// after repository tree verification; it is not represented by fake Wasm bytes.
+/// A path introduction ends propagation along that parent edge. This function
+/// does not infer rename identity or jump across an intervening deletion.
+pub fn trace_with_absences(
+    history: &HistorySnapshot,
+    absent: &BTreeSet<String>,
+    query: Span,
+    limits: TraceLimits,
+) -> Result<TraceReport, String> {
+    let order = order(history, absent)?;
+    if absent.contains(&history.tip) {
+        return Err("trace file is absent from the selected tip".into());
+    }
     let tip = &history.commits[&history.tip];
     let tip_bytes = &history.blobs[&tip.wasm];
     if query.start >= query.end || query.end > tip_bytes.len() {
@@ -566,7 +594,11 @@ pub fn trace(
             let mut edge = TraceEdge {
                 parent: parent_id.clone(),
                 child: id.clone(),
-                parent_wasm: parent.wasm.clone(),
+                parent_wasm: if absent.contains(parent_id) {
+                    None
+                } else {
+                    Some(parent.wasm.clone())
+                },
                 child_wasm: node.wasm.clone(),
                 selected: selected.clone(),
                 status: "stopped".into(),
@@ -581,6 +613,18 @@ pub fn trace(
                 events: Vec::new(),
                 parent_influence: Vec::new(),
             };
+            if absent.contains(parent_id) {
+                edge.status = "file_absent".into();
+                report.frontier.push(TraceFrontier {
+                    commit: id.clone(),
+                    selected: selected.clone(),
+                    reason: "file_introduced_at_path".into(),
+                    parent: Some(parent_id.clone()),
+                    child: Some(id.clone()),
+                });
+                report.edges.push(edge);
+                continue;
+            }
             let mut stop_reason = None;
             if report.usage.records >= limits.max_records {
                 stop_reason = Some("max_records");
@@ -726,6 +770,125 @@ mod tests {
 
     fn run(history: &HistorySnapshot, query: Span) -> TraceReport {
         trace(history, query, TraceLimits::default()).unwrap()
+    }
+
+    fn absent_node(history: &mut HistorySnapshot, id: &str, parents: &[&str]) {
+        history.commits.insert(
+            id.into(),
+            HistoryCommit {
+                id: id.into(),
+                wasm: String::new(),
+                parents: parents.iter().map(|p| (*p).into()).collect(),
+                message: format!("absent {id}"),
+            },
+        );
+    }
+
+    #[test]
+    fn file_absence_is_a_boundary_without_synthetic_bytes_or_rename_identity() {
+        let bytes = custom(b"same bytes");
+        let mut history = empty("again");
+        add(&mut history, "first", "real", &[], bytes.clone());
+        absent_node(&mut history, "deleted", &["first"]);
+        add(&mut history, "again", "real", &["deleted"], bytes.clone());
+        let absent = BTreeSet::from(["deleted".into()]);
+        let report = trace_with_absences(
+            &history,
+            &absent,
+            span(0, bytes.len()),
+            TraceLimits::default(),
+        )
+        .unwrap();
+        assert!(report.complete);
+        assert_eq!(
+            report
+                .nodes
+                .iter()
+                .map(|n| n.commit.as_str())
+                .collect::<Vec<_>>(),
+            vec!["again"]
+        );
+        assert_eq!(report.edges.len(), 1);
+        assert_eq!(report.edges[0].status, "file_absent");
+        assert_eq!(report.edges[0].parent_wasm, None);
+        assert_eq!(report.frontier[0].reason, "file_introduced_at_path");
+        assert_eq!(report.frontier[0].parent.as_deref(), Some("deleted"));
+        assert_eq!(report.usage.compared_bytes, 0);
+        assert_eq!(report.usage.edges, 1);
+        assert!(!history.blobs.contains_key(""));
+    }
+
+    #[test]
+    fn merge_keeps_present_and_absent_file_edges_and_honors_edge_budget() {
+        let bytes = custom(b"merge");
+        let mut history = empty("merge");
+        add(&mut history, "present", "real", &[], bytes.clone());
+        absent_node(&mut history, "absent", &[]);
+        add(
+            &mut history,
+            "merge",
+            "real",
+            &["present", "absent"],
+            bytes.clone(),
+        );
+        let absent = BTreeSet::from(["absent".into()]);
+        let query = span(0, bytes.len());
+        let report = trace_with_absences(&history, &absent, query, TraceLimits::default()).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.edges.len(), 2);
+        assert_eq!(report.nodes.len(), 2);
+        assert_eq!(
+            report
+                .frontier
+                .iter()
+                .filter(|f| f.reason == "file_introduced_at_path")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .frontier
+                .iter()
+                .filter(|f| f.reason == "root_snapshot")
+                .count(),
+            1
+        );
+        let limits = TraceLimits {
+            max_edges: 0,
+            ..Default::default()
+        };
+        let report = trace_with_absences(&history, &absent, query, limits).unwrap();
+        assert!(!report.complete);
+        assert!(report.edges.is_empty());
+        assert_eq!(report.frontier.len(), 2);
+        assert!(report.frontier.iter().all(|f| f.reason == "max_edges"));
+    }
+
+    #[test]
+    fn absence_cannot_hide_invalid_dag_or_claim_a_wasm_object() {
+        let bytes = custom(b"checked");
+        let mut history = empty("tip");
+        absent_node(&mut history, "absent", &[]);
+        add(&mut history, "tip", "real", &["absent"], bytes.clone());
+        let query = span(0, bytes.len());
+        let absent = BTreeSet::from(["absent".into()]);
+        assert!(trace_with_absences(
+            &history,
+            &BTreeSet::from(["missing".into()]),
+            query,
+            TraceLimits::default()
+        )
+        .is_err());
+        history.commits.get_mut("absent").unwrap().wasm = "real".into();
+        assert!(trace_with_absences(&history, &absent, query, TraceLimits::default()).is_err());
+        history.commits.get_mut("absent").unwrap().wasm = String::new();
+        history.commits.get_mut("absent").unwrap().parents = vec!["missing".into()];
+        assert!(trace_with_absences(&history, &absent, query, TraceLimits::default()).is_err());
+        history.commits.get_mut("absent").unwrap().parents = vec!["tip".into()];
+        assert!(trace_with_absences(&history, &absent, query, TraceLimits::default()).is_err());
+        history.commits.get_mut("absent").unwrap().parents.clear();
+        history.tip = "absent".into();
+        assert!(trace_with_absences(&history, &absent, query, TraceLimits::default()).is_err());
     }
 
     #[test]

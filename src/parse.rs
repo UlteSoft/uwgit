@@ -52,7 +52,8 @@ pub fn parse_module(bytes: &[u8]) -> Result<ParsedModule, ParseError> {
     let mut next_defined_function = 0_usize;
     let mut saw_module = false;
 
-    for payload in Parser::new(0).parse_all(bytes) {
+    let reader_bytes = crate::audit::core_reader_bytes(bytes);
+    for payload in Parser::new(0).parse_all(&reader_bytes) {
         match payload? {
             Payload::Version { encoding, .. } => {
                 if encoding != Encoding::Module {

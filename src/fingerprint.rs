@@ -4,7 +4,7 @@
 //! Phase 1: fingerprint calculation now uses typed ParsedOperator (Opcode + Immediate)
 //! instead of parsing wasmparser Debug strings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
 use serde_json::json;
@@ -18,7 +18,7 @@ fn serialize_fingerprint_hash<S: serde::Serializer>(
     value: &u64,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&format!("{:016x}", value))
+    serializer.serialize_str(&format!("{value:016x}"))
 }
 
 impl FingerprintHash {
@@ -33,6 +33,9 @@ pub struct FuncFingerprint {
     pub type_sig_hash: FingerprintHash,
     pub exact_body_hash: FingerprintHash,
     pub canonical_body_hash: FingerprintHash,
+    /// Static function references resolve through an acyclic structural context
+    /// or import/export roles. This does not prove historical identity.
+    pub reference_context_complete: bool,
     pub opcode_histogram: Vec<OpcodeCount>,
     pub direct_call_targets: Vec<StableFuncRef>,
     pub instruction_count: u32,
@@ -50,30 +53,144 @@ pub struct StableFuncRef {
 }
 
 pub fn module_fingerprints(module: &ResolvedModule) -> Vec<FuncFingerprint> {
+    let identities = function_identities(&module.module);
     module
         .functions
         .iter()
-        .map(|function| function_fingerprint(&module.module, function))
+        .map(|function| fingerprint_with_context(function, &identities))
         .collect()
 }
 
-pub fn function_fingerprint(module: &ModuleIr, function: &FunctionIr) -> FuncFingerprint {
+#[cfg(test)]
+fn function_fingerprint(module: &ModuleIr, function: &FunctionIr) -> FuncFingerprint {
+    let identities = function_identities(module);
+    fingerprint_with_context(function, &identities)
+}
+
+fn fingerprint_with_context(
+    function: &FunctionIr,
+    identities: &[FunctionIdentity],
+) -> FuncFingerprint {
     let exact_body_hash = exact_body_hash(function);
-    let canonical_body_hash = canonical_body_hash(module, function);
+    let canonical_body_hash = canonical_body_hash(function, |index| {
+        identities.get(index).map(|identity| identity.id.as_str())
+    });
+    let reference_context_complete = references_complete(function, identities);
 
     FuncFingerprint {
-        stable_id: stable_function_id_for_hash(function, canonical_body_hash),
+        stable_id: identity_for_body(function, canonical_body_hash, reference_context_complete),
         type_sig_hash: hash_parts([function.type_id.as_str()]),
         exact_body_hash,
         canonical_body_hash,
+        reference_context_complete,
         opcode_histogram: opcode_histogram(function),
-        direct_call_targets: direct_call_targets(module, function),
+        direct_call_targets: direct_call_targets(identities, function),
         instruction_count: function.operators.len() as u32,
     }
 }
 
-pub fn stable_function_id(module: &ModuleIr, function: &FunctionIr) -> String {
-    stable_function_id_for_hash(function, canonical_body_hash(module, function))
+pub(crate) fn resolved_function_ids(module: &ModuleIr) -> Vec<String> {
+    function_identities(module)
+        .into_iter()
+        .map(|identity| identity.id)
+        .collect()
+}
+
+struct FunctionIdentity {
+    id: String,
+    complete: bool,
+}
+
+fn anchor_id(function: &FunctionIr) -> Option<String> {
+    (function.kind == FunctionKindIr::Imported || !function.export_names.is_empty())
+        .then(|| stable_function_id_for_hash(function, FingerprintHash(0)))
+}
+
+fn function_references(function: &FunctionIr) -> impl Iterator<Item = usize> + '_ {
+    function
+        .operators
+        .iter()
+        .filter_map(|operator| match &operator.immediate {
+            Immediate::Call(index) | Immediate::RefFunc(index) => Some(*index as usize),
+            _ => None,
+        })
+}
+
+fn references_complete(function: &FunctionIr, identities: &[FunctionIdentity]) -> bool {
+    function_references(function).all(|index| {
+        identities
+            .get(index)
+            .is_some_and(|identity| identity.complete)
+    })
+}
+
+fn identity_for_body(function: &FunctionIr, body_hash: FingerprintHash, complete: bool) -> String {
+    if let Some(id) = anchor_id(function) {
+        id
+    } else if complete {
+        stable_function_id_for_hash(function, body_hash)
+    } else {
+        format!(
+            "func:context-incomplete:type:{}:raw-body:{}",
+            function.type_id,
+            exact_body_hash(function).hex()
+        )
+    }
+}
+
+/// Resolve unanchored DAG identities from callees to callers without recursion.
+/// Cycles and their unanchored dependants stay explicitly incomplete. Export
+/// roles terminate identity dependencies even if the exported body is recursive.
+fn function_identities(module: &ModuleIr) -> Vec<FunctionIdentity> {
+    let count = module.functions.len();
+    let mut ids: Vec<Option<String>> = module.functions.iter().map(anchor_id).collect();
+    let mut pending = vec![0usize; count];
+    let mut blocked = vec![false; count];
+    let mut dependants = vec![Vec::new(); count];
+    let mut ready = VecDeque::new();
+
+    for (index, function) in module.functions.iter().enumerate() {
+        if ids[index].is_some() {
+            continue;
+        }
+        let references: BTreeSet<_> = function_references(function).collect();
+        for target in references {
+            if target >= count {
+                blocked[index] = true;
+            } else if ids[target].is_none() {
+                pending[index] += 1;
+                dependants[target].push(index);
+            }
+        }
+        if pending[index] == 0 && !blocked[index] {
+            ready.push_back(index);
+        }
+    }
+
+    while let Some(index) = ready.pop_front() {
+        let function = &module.functions[index];
+        let body_hash = canonical_body_hash(function, |target| {
+            ids.get(target).and_then(Option::as_deref)
+        });
+        ids[index] = Some(stable_function_id_for_hash(function, body_hash));
+        for &caller in &dependants[index] {
+            pending[caller] -= 1;
+            if pending[caller] == 0 && !blocked[caller] {
+                ready.push_back(caller);
+            }
+        }
+    }
+
+    ids.into_iter()
+        .zip(&module.functions)
+        .map(|(id, function)| {
+            let complete = id.is_some();
+            FunctionIdentity {
+                id: id.unwrap_or_else(|| identity_for_body(function, FingerprintHash(0), false)),
+                complete,
+            }
+        })
+        .collect()
 }
 
 fn stable_function_id_for_hash(
@@ -111,7 +228,10 @@ fn exact_body_hash(function: &FunctionIr) -> FingerprintHash {
     hash_owned_parts(parts)
 }
 
-fn canonical_body_hash(module: &ModuleIr, function: &FunctionIr) -> FingerprintHash {
+fn canonical_body_hash<'a>(
+    function: &FunctionIr,
+    target_id: impl Fn(usize) -> Option<&'a str>,
+) -> FingerprintHash {
     let mut parts = vec!["canonical-body".to_owned(), function.type_id.clone()];
     parts.extend(
         function
@@ -123,7 +243,7 @@ fn canonical_body_hash(module: &ModuleIr, function: &FunctionIr) -> FingerprintH
         format!(
             "op:{}:{}",
             operator.opcode.as_str(),
-            canonical_operator_text(module, operator)
+            canonical_operator_text(operator, &target_id)
         )
     }));
     hash_owned_parts(parts)
@@ -131,16 +251,36 @@ fn canonical_body_hash(module: &ModuleIr, function: &FunctionIr) -> FingerprintH
 
 /// Produce canonical text for an operator's immediate, replacing
 /// raw call target indices with stable function IDs.
-fn canonical_operator_text(module: &ModuleIr, operator: &ParsedOperator) -> String {
+fn canonical_operator_text<'a>(
+    operator: &ParsedOperator,
+    target_id: &impl Fn(usize) -> Option<&'a str>,
+) -> String {
     match &operator.immediate {
-        Immediate::Call(index) | Immediate::RefFunc(index) => {
-            module.functions.get(*index as usize).map_or_else(
+        Immediate::Call(index) | Immediate::RefFunc(index) => target_id(*index as usize)
+            .map_or_else(
                 || format!("function_index:{index}"),
-                |target| format!("{} {{ function: {} }}", operator.opcode.as_str(), target.id),
-            )
-        }
+                |id| format!("{} {{ function: {} }}", operator.opcode.as_str(), id),
+            ),
         immediate => immediate.as_hash_text(),
     }
+}
+
+/// Decoded canonical operands accompany a hash when constructing match keys.
+/// A canonical hash alone is only a candidate accelerator.
+pub(crate) fn canonical_operators(module: &ModuleIr, function: &FunctionIr) -> Vec<String> {
+    function
+        .operators
+        .iter()
+        .map(|operator| {
+            format!(
+                "{}:{}",
+                operator.opcode.as_str(),
+                canonical_operator_text(operator, &|index| {
+                    module.functions.get(index).map(|target| target.id.as_str())
+                })
+            )
+        })
+        .collect()
 }
 
 fn opcode_histogram(function: &FunctionIr) -> Vec<OpcodeCount> {
@@ -156,11 +296,14 @@ fn opcode_histogram(function: &FunctionIr) -> Vec<OpcodeCount> {
         .collect()
 }
 
-fn direct_call_targets(module: &ModuleIr, function: &FunctionIr) -> Vec<StableFuncRef> {
+fn direct_call_targets(
+    identities: &[FunctionIdentity],
+    function: &FunctionIr,
+) -> Vec<StableFuncRef> {
     let mut targets = function
         .direct_calls
         .iter()
-        .filter_map(|index| module.functions.get(*index as usize))
+        .filter_map(|index| identities.get(*index as usize))
         .map(|target| StableFuncRef {
             stable_id: target.id.clone(),
         })
@@ -370,6 +513,79 @@ mod tests {
             assert_eq!(first.stable_id, second.stable_id);
             assert_ne!(first.exact_body_hash, second.exact_body_hash);
         }
+    }
+
+    #[test]
+    fn unexported_ref_func_context_survives_reordering_and_import_drift() {
+        let old = resolved(
+            &wat::parse_str(
+                "(module
+                    (func $leaf (result i32) i32.const 7)
+                    (elem declare func $leaf)
+                    (func $holder (result funcref) ref.func $leaf))",
+            )
+            .unwrap(),
+        );
+        let new = resolved(
+            &wat::parse_str(
+                "(module
+                    (import \"env\" \"unused\" (func))
+                    (func $holder (result funcref) ref.func $leaf)
+                    (func $leaf (result i32) i32.const 7)
+                    (elem declare func $leaf))",
+            )
+            .unwrap(),
+        );
+        let old_fingerprint = function_fingerprint(&old.module, &old.functions[1]);
+        let new_fingerprint = function_fingerprint(&new.module, &new.functions[1]);
+
+        assert!(old_fingerprint.reference_context_complete);
+        assert!(new_fingerprint.reference_context_complete);
+        assert_eq!(old_fingerprint.stable_id, new_fingerprint.stable_id);
+        assert_eq!(
+            old_fingerprint.canonical_body_hash,
+            new_fingerprint.canonical_body_hash
+        );
+        assert_ne!(
+            old_fingerprint.exact_body_hash,
+            new_fingerprint.exact_body_hash
+        );
+    }
+
+    #[test]
+    fn recursive_and_dependent_contexts_are_explicitly_incomplete() {
+        let module = resolved(
+            &wat::parse_str(
+                "(module
+                    (func $cycle (result i32) call $cycle)
+                    (func $caller (result i32) call $cycle)
+                    (func (export \"entry\") (result i32) call $caller))",
+            )
+            .unwrap(),
+        );
+        let fingerprints = module_fingerprints(&module);
+
+        assert!(fingerprints
+            .iter()
+            .all(|fingerprint| !fingerprint.reference_context_complete));
+        assert!(module.functions[0]
+            .id
+            .starts_with("func:context-incomplete:"));
+        assert!(module.functions[1]
+            .id
+            .starts_with("func:context-incomplete:"));
+        assert_eq!(module.functions[2].id, "func:export:entry:type:->i32");
+        for (function, fingerprint) in module.functions.iter().zip(fingerprints) {
+            assert_eq!(function.id, fingerprint.stable_id);
+        }
+    }
+
+    #[test]
+    fn out_of_range_function_references_do_not_acquire_complete_context() {
+        let mut module = resolved(include_bytes!("../tests/fixtures/old.wasm"));
+        module.module.functions[0].operators[0].immediate = crate::ir::Immediate::Call(u32::MAX);
+        let fingerprint = function_fingerprint(&module.module, &module.functions[0]);
+        assert!(!fingerprint.reference_context_complete);
     }
 
     #[test]

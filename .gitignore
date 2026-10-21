@@ -8,6 +8,10 @@
 /reports/
 /corpus/
 /corpus-*/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
 /uwvm-examples-*/
 
 # Local wasm-git repositories and generated exchange files.
@@ -21,3 +25,6 @@ __pycache__/
 *.log
 .DS_Store
 ._*
+
+# Historical test run reports belong outside the source tree.
+/docs/testing-round*.md

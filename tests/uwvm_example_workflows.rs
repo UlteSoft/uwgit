@@ -6,6 +6,8 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +42,18 @@ fn now() -> u64 {
         .as_millis()
         .try_into()
         .unwrap()
+}
+
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -183,10 +197,10 @@ impl Case {
         let started = now();
         let expected_status = match expected {
             Expected::Success => "success".to_owned(),
-            Expected::Failure => "nonzero (excluding timeout)".to_owned(),
+            Expected::Failure => "nonzero exit or SIGILL=4 (excluding timeout/kill)".to_owned(),
             Expected::Code(code) => format!("exit {code}"),
         };
-        let before = json!({"label":label,"program":program,"argv":arguments,"cwd":self.directory,"timeout_seconds":seconds,"expected":expected_status,"started_unix_ms":started,"status":"RUNNING","stdout":stdout,"stderr":stderr});
+        let before = json!({"label":label,"program":program,"argv":arguments,"cwd":self.directory,"timeout_seconds":seconds,"expected":expected_status,"started_unix_ms":started,"status":"RUNNING","signal":null,"stdout":stdout,"stderr":stderr});
         std::fs::write(&record, serde_json::to_vec_pretty(&before).unwrap()).unwrap();
         self.commands.push(before);
         self.persist("RUNNING");
@@ -202,7 +216,7 @@ impl Case {
         let output = match result {
             Ok(output) => output,
             Err(error) => {
-                let failure = json!({"label":label,"program":program,"argv":arguments,"status":"SPAWN_FAILED","error":error.to_string(),"started_unix_ms":started,"elapsed_ms":timer.elapsed().as_millis()});
+                let failure = json!({"label":label,"program":program,"argv":arguments,"status":"SPAWN_FAILED","signal":null,"error":error.to_string(),"started_unix_ms":started,"elapsed_ms":timer.elapsed().as_millis()});
                 std::fs::write(&record, serde_json::to_vec_pretty(&failure).unwrap()).unwrap();
                 *self.commands.last_mut().unwrap() = failure;
                 self.persist("FAILED");
@@ -214,6 +228,7 @@ impl Case {
         let mut completed = self.commands.last().unwrap().clone();
         completed["status"] = json!("COMPLETED");
         completed["returncode"] = json!(output.status.code());
+        completed["signal"] = json!(exit_signal(&output.status));
         completed["elapsed_ms"] = json!(timer.elapsed().as_millis());
         completed["stdout_sha256"] = json!(sha(&output.stdout));
         completed["stderr_sha256"] = json!(sha(&output.stderr));
@@ -221,12 +236,17 @@ impl Case {
         *self.commands.last_mut().unwrap() = completed;
         self.persist("RUNNING");
         assert!(
-            !matches!(output.status.code(), Some(124 | 137)),
-            "{label}: timeout is never an expected negative"
+            !matches!(output.status.code(), Some(124 | 137 | 143))
+                && !matches!(exit_signal(&output.status), Some(9 | 15)),
+            "{label}: timeout or forced termination is never an expected negative"
         );
         let accepted = match expected {
             Expected::Success => output.status.success(),
-            Expected::Failure => !output.status.success(),
+            Expected::Failure => match exit_signal(&output.status) {
+                Some(4) => true,
+                None => output.status.code().is_some_and(|code| code != 0),
+                _ => false,
+            },
             Expected::Code(code) => output.status.code() == Some(code),
         };
         assert!(
@@ -333,11 +353,9 @@ impl Case {
         expected: Expected,
     ) -> Output {
         let command = args(&[
-            "--runtime-aot",
+            "--runtime-int",
             "--runtime-compile-threads",
             "1",
-            "--runtime-llvm-jit-cache-path",
-            "disable",
             "--wasip1-global-disable",
             "--wasip1-global-set-argv0",
             "global-entry",
@@ -533,6 +551,30 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     let mut output = BTreeMap::new();
     visit(root, root, &mut output);
     output
+}
+
+fn store_evidence(state: &BTreeMap<PathBuf, Option<Vec<u8>>>) -> Vec<Value> {
+    state
+        .iter()
+        .map(|(path, bytes)| match bytes {
+            Some(bytes) => json!({"path":path,"directory":false,"length":bytes.len(),"sha256":sha(bytes),"hex":digest(bytes)}),
+            None => json!({"path":path,"directory":true}),
+        })
+        .collect()
+}
+
+fn unchanged_store(
+    case: &mut Case,
+    label: &str,
+    repo: &Path,
+    before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) {
+    let after = snapshot(&repo.join(".uwgit"));
+    assert_eq!(
+        &after, before,
+        "{label}: no refs, objects, locks, or directories may change"
+    );
+    case.save(label, json!({"repository":repo,"full_bytes_equal":true,"before":store_evidence(before),"after":store_evidence(&after)}));
 }
 
 fn decode_hex(value: &Value) -> Vec<u8> {
@@ -734,12 +776,18 @@ fn lifecycle(case: &mut Case, label: &str, old_file: &Path, new_file: &Path) {
 }
 
 fn require_trap(output: &Output) {
-    let diagnostics = format!(
-        "{} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .to_ascii_lowercase();
+    let signal = exit_signal(&output.status);
+    let nonzero_exit = signal.is_none()
+        && output
+            .status
+            .code()
+            .is_some_and(|code| code != 0 && !matches!(code, 124 | 137 | 143));
+    assert!(
+        signal == Some(4) || nonzero_exit,
+        "expected SIGILL=4 or an ordinary nonzero exit for guest assertion trap: {}",
+        output.status
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     assert!(
         diagnostics.contains("trap") || diagnostics.contains("unreachable"),
         "expected actual guest assertion trap: {diagnostics}"
@@ -1311,5 +1359,868 @@ fn real_ros_proxy_call_and_tail_call_pair_have_independent_opcode_oracles() {
     );
     case.save("tailcall-scope",json!({"real_existing_source_pair":true,"expected_call_target":0,"old_opcode":"Call","new_opcode":"ReturnCall","runtime_executed":false,"ros_network_executed":false}));
     lifecycle(&mut case, "tailcall", &normal, &tail);
+    case.finish();
+}
+
+#[test]
+#[ignore = "requires staged real uwvm2-ros examples, WABT, existing UWVM LLVM runtime, and SSH Linux cgroup"]
+fn real_independent_peers_resolve_overlap_and_return_verified_two_parent_history() {
+    let mut case = Case::new("preload-multi-peer-resolution");
+    let main_source = case.source("0004.preload_wasm/main.wat");
+    let library_source = case.source("0004.preload_wasm/lib.wat");
+    let left_source = replaced(&main_source, "i32.const 3", "i32.const 4");
+    let right_source = replaced(&main_source, "i32.const 3", "i32.const 5");
+    let resolved_source = replaced(&main_source, "i32.const 3", "i32.const 6");
+    let resolved_library_source = replaced(
+        &library_source,
+        "i32.const 0\n    i32.load)",
+        "i32.const 0\n    i32.load\n    i32.const 3\n    i32.add)",
+    );
+    let base_file = case.compile("peer.main.base", &main_source);
+    let left_file = case.compile("peer.main.left-const4", &left_source);
+    let right_file = case.compile("peer.main.right-const5", &right_source);
+    let resolved_file = case.compile("peer.main.resolved-const6", &resolved_source);
+    let provider = case.compile("peer.lib.argc-plus3", &resolved_library_source);
+    let base_bytes = std::fs::read(&base_file).unwrap();
+    let left_bytes = std::fs::read(&left_file).unwrap();
+    let right_bytes = std::fs::read(&right_file).unwrap();
+    let resolved_bytes = std::fs::read(&resolved_file).unwrap();
+    let parsed = [
+        oracle(&base_bytes),
+        oracle(&left_bytes),
+        oracle(&right_bytes),
+        oracle(&resolved_bytes),
+    ];
+    let operators: Vec<Value> = parsed
+        .iter()
+        .zip([3, 4, 5, 6])
+        .map(|(module, value)| {
+            let matching: Vec<_> = instructions(module)
+                .into_iter()
+                .filter(|op| op["code"] == "I32Const" && op["value"] == value)
+                .collect();
+            assert_eq!(matching.len(), 1);
+            matching[0].clone()
+        })
+        .collect();
+    for module in &parsed[1..] {
+        assert_eq!(module["imports"], parsed[0]["imports"]);
+        assert_eq!(module["start"], parsed[0]["start"]);
+        assert_eq!(
+            module["functions"].as_array().unwrap().len(),
+            parsed[0]["functions"].as_array().unwrap().len()
+        );
+    }
+    case.save("peer-independent-instruction-oracles", json!({
+        "mutation":"same real $start argc assertion: base=3, peer_a=4, peer_b=5, manual_resolution=6",
+        "base":operators[0],"peer_a":operators[1],"peer_b":operators[2],"resolved":operators[3],
+        "expected_runtime_argc":6,"provider_operation":"original args_sizes_get argc 3 + i32.const 3 + i32.add",
+    }));
+
+    let origin = case.path("peer.origin");
+    let peer_a = case.path("peer.a");
+    let peer_b = case.path("peer.b");
+    let peer_c = case.path("peer.c");
+    case.cli("peer-origin-init", &args(&["init", &text(&origin)]));
+    let base_id = commit(
+        &mut case,
+        &origin,
+        &base_file,
+        "shared real preload baseline",
+    );
+    let origin_state = snapshot(&origin.join(".uwgit"));
+    case.cli(
+        "peer-clone-a",
+        &args(&["clone", &text(&origin), &text(&peer_a)]),
+    );
+    case.cli(
+        "peer-clone-b",
+        &args(&["clone", &text(&origin), &text(&peer_b)]),
+    );
+    let left_id = commit(
+        &mut case,
+        &peer_a,
+        &left_file,
+        "peer A independent argc assertion 4",
+    );
+    let left_state = snapshot(&peer_a.join(".uwgit"));
+    let right_id = commit(
+        &mut case,
+        &peer_b,
+        &right_file,
+        "peer B independent argc assertion 5",
+    );
+    assert_ne!(left_id, right_id);
+    unchanged_store(
+        &mut case,
+        "peer-a-independent-of-b-commit",
+        &peer_a,
+        &left_state,
+    );
+    unchanged_store(
+        &mut case,
+        "origin-independent-of-peer-commits",
+        &origin,
+        &origin_state,
+    );
+    let peer_b_state = snapshot(&peer_b.join(".uwgit"));
+    let peer_bundle = case.path("peer.b-to-a.bundle");
+    case.cli(
+        "peer-b-bundle",
+        &args(&["bundle", &text(&peer_b), &text(&peer_bundle)]),
+    );
+    case.artifact(
+        "independent peer B history for offline exchange",
+        &peer_bundle,
+    );
+
+    let before_non_ff = snapshot(&peer_a.join(".uwgit"));
+    assert!(!peer_a.join(".uwgit/objects").join(&right_id).exists());
+    let refused = case.run(
+        "peer-non-fast-forward-refused",
+        Path::new(env!("CARGO_BIN_EXE_wasm-git")),
+        &args(&["unbundle", &text(&peer_a), &text(&peer_bundle), "main"]),
+        Expected::Code(1),
+        20,
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("non-fast-forward"));
+    unchanged_store(
+        &mut case,
+        "peer-non-fast-forward-store-unchanged",
+        &peer_a,
+        &before_non_ff,
+    );
+    let corrupt_bundle = case.path("peer.b-corrupt.bundle");
+    let mut corrupt = std::fs::read(&peer_bundle).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&corrupt_bundle, corrupt).unwrap();
+    case.artifact(
+        "deliberate final-byte bundle corruption; must never publish",
+        &corrupt_bundle,
+    );
+    let before_corrupt = snapshot(&peer_a.join(".uwgit"));
+    let refused = case.run(
+        "peer-corrupt-bundle-refused",
+        Path::new(env!("CARGO_BIN_EXE_wasm-git")),
+        &args(&[
+            "unbundle",
+            &text(&peer_a),
+            &text(&corrupt_bundle),
+            "corrupt-must-not-exist",
+        ]),
+        Expected::Code(1),
+        20,
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("hash mismatch"));
+    unchanged_store(
+        &mut case,
+        "peer-corrupt-bundle-store-unchanged",
+        &peer_a,
+        &before_corrupt,
+    );
+    case.cli(
+        "peer-import-incoming",
+        &args(&["unbundle", &text(&peer_a), &text(&peer_bundle), "incoming"]),
+    );
+    let incoming = case.cli_json(
+        "peer-show-incoming",
+        &args(&["show", &text(&peer_a), "incoming"]),
+    );
+    assert_eq!(incoming["id"], right_id);
+    let current = case.cli_json(
+        "peer-show-local-head",
+        &args(&["show", &text(&peer_a), "HEAD"]),
+    );
+    assert_eq!(current["id"], left_id);
+    case.save(
+        "peer-import-bindings",
+        json!({"local_head":current,"incoming":incoming}),
+    );
+
+    let before_conflict = snapshot(&peer_a.join(".uwgit"));
+    let conflict_output = case.run(
+        "peer-overlap-must-conflict",
+        Path::new(env!("CARGO_BIN_EXE_wasm-git")),
+        &args(&[
+            "merge",
+            &text(&peer_a),
+            &right_id,
+            "-m",
+            "independent peer overlap requires review",
+        ]),
+        Expected::Code(2),
+        20,
+    );
+    let conflict: Value = serde_json::from_slice(&conflict_output.stdout).unwrap();
+    assert_eq!(conflict["status"], "conflict");
+    assert_eq!(conflict["base"], base_id);
+    assert_eq!(conflict["old_head"], left_id);
+    assert_eq!(conflict["target"], right_id);
+    assert!(conflict["commit"].is_null());
+    let conflicts = conflict["report"]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0]["path"]
+        .as_str()
+        .unwrap()
+        .contains("/operator["));
+    for ((side, bytes), operator) in [
+        ("base", &base_bytes),
+        ("ours", &left_bytes),
+        ("theirs", &right_bytes),
+    ]
+    .into_iter()
+    .zip(&operators)
+    {
+        let evidence = &conflicts[0][side];
+        assert_eq!(evidence["span"]["start"], operator["start"]);
+        assert_eq!(evidence["span"]["end"], operator["end"]);
+        let start = operator["start"].as_u64().unwrap() as usize;
+        let end = operator["end"].as_u64().unwrap() as usize;
+        assert_eq!(decode_hex(&evidence["hex"]), bytes[start..end]);
+    }
+    case.save("peer-full-physical-instruction-conflict", conflict);
+    unchanged_store(
+        &mut case,
+        "peer-conflict-store-unchanged",
+        &peer_a,
+        &before_conflict,
+    );
+
+    let resolved = case.cli_json(
+        "peer-manual-resolution",
+        &args(&[
+            "merge",
+            &text(&peer_a),
+            &right_id,
+            "-m",
+            "explicit real-source resolution argc 6",
+            "--resolved",
+            &text(&resolved_file),
+            "--expect-head",
+            &left_id,
+        ]),
+    );
+    assert_eq!(resolved["status"], "merged_resolved");
+    assert_eq!(resolved["old_head"], left_id);
+    assert_eq!(resolved["target"], right_id);
+    assert_eq!(resolved["base"], base_id);
+    assert_eq!(resolved["manual_resolution"]["supplied_bytes"], true);
+    assert_eq!(
+        resolved["manual_resolution"]["audit_validation"],
+        "valid_with_all_known_features"
+    );
+    let resolved_id = resolved["commit"].as_str().unwrap().to_owned();
+    assert_ne!(resolved_id, left_id);
+    assert_ne!(resolved_id, right_id);
+    case.save("peer-manual-resolution-result", resolved);
+    let parents = [left_id.clone(), right_id.clone()];
+    let evidence = verify_commit(&peer_a, &resolved_id, &parents, &resolved_bytes);
+    case.save("peer-manual-two-parent-raw-object-verification", evidence);
+    let before_stale = snapshot(&peer_a.join(".uwgit"));
+    let stale = case.run(
+        "peer-stale-resolution-refused",
+        Path::new(env!("CARGO_BIN_EXE_wasm-git")),
+        &args(&[
+            "merge",
+            &text(&peer_a),
+            &right_id,
+            "-m",
+            "stale reviewed head must not publish",
+            "--resolved",
+            &text(&resolved_file),
+            "--expect-head",
+            &left_id,
+        ]),
+        Expected::Code(1),
+        20,
+    );
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("HEAD changed since resolution"));
+    unchanged_store(
+        &mut case,
+        "peer-stale-resolution-store-unchanged",
+        &peer_a,
+        &before_stale,
+    );
+    let shown = case.cli_json(
+        "peer-show-resolved-head",
+        &args(&["show", &text(&peer_a), "HEAD"]),
+    );
+    assert_eq!(shown["id"], resolved_id);
+    assert_eq!(shown["parents"], json!(parents));
+    let checked = case.path("peer.a.resolved-checkout.wasm");
+    case.cli(
+        "peer-checkout-resolved",
+        &args(&["checkout", &text(&peer_a), &resolved_id, &text(&checked)]),
+    );
+    assert_eq!(std::fs::read(&checked).unwrap(), resolved_bytes);
+    case.artifact(
+        "manual resolution checkout equals independently compiled source",
+        &checked,
+    );
+    let checked_fsck = case.cli_json("peer-resolved-fsck", &args(&["fsck", &text(&peer_a)]));
+    assert_eq!(checked_fsck["commits"], 4);
+    assert_eq!(checked_fsck["wasm_blobs"], 4);
+    case.save("peer-resolved-fsck-report", checked_fsck);
+
+    let resolved_bundle = case.path("peer.a-resolved-to-c.bundle");
+    case.cli(
+        "peer-resolved-bundle",
+        &args(&["bundle", &text(&peer_a), &text(&resolved_bundle)]),
+    );
+    case.artifact(
+        "resolved original bytes and complete double-parent ancestry for third peer",
+        &resolved_bundle,
+    );
+    case.cli("peer-c-init", &args(&["init", &text(&peer_c)]));
+    case.cli(
+        "peer-c-import-reviewed",
+        &args(&[
+            "unbundle",
+            &text(&peer_c),
+            &text(&resolved_bundle),
+            "reviewed",
+        ]),
+    );
+    let received = case.cli_json(
+        "peer-c-show-reviewed",
+        &args(&["show", &text(&peer_c), "reviewed"]),
+    );
+    assert_eq!(received["id"], resolved_id);
+    assert_eq!(received["parents"], json!(parents));
+    let third_fsck = case.cli_json("peer-c-fsck", &args(&["fsck", &text(&peer_c)]));
+    assert_eq!(third_fsck["commits"], 4);
+    assert_eq!(third_fsck["wasm_blobs"], 4);
+    let third_checkout = case.path("peer.c.received-resolution.wasm");
+    case.cli(
+        "peer-c-checkout-reviewed",
+        &args(&[
+            "checkout",
+            &text(&peer_c),
+            "reviewed",
+            &text(&third_checkout),
+        ]),
+    );
+    assert_eq!(std::fs::read(&third_checkout).unwrap(), resolved_bytes);
+    case.artifact(
+        "third-peer received manual resolution exact original bytes",
+        &third_checkout,
+    );
+    let ancestry = vec![
+        verify_commit(&peer_c, &base_id, &[], &base_bytes),
+        verify_commit(
+            &peer_c,
+            &left_id,
+            std::slice::from_ref(&base_id),
+            &left_bytes,
+        ),
+        verify_commit(
+            &peer_c,
+            &right_id,
+            std::slice::from_ref(&base_id),
+            &right_bytes,
+        ),
+        verify_commit(&peer_c, &resolved_id, &parents, &resolved_bytes),
+    ];
+    case.save(
+        "peer-c-independent-complete-parent-chain",
+        json!({"commits":ancestry,"fsck":third_fsck}),
+    );
+    let query = format!(
+        "{}:{}",
+        operators[3]["start"].as_u64().unwrap(),
+        operators[3]["end"].as_u64().unwrap()
+    );
+    let before_trace = snapshot(&peer_c.join(".uwgit"));
+    let traced = case.cli_json(
+        "peer-c-trace-all-reviewed-parents",
+        &args(&["trace", &text(&peer_c), "reviewed", "--range", &query]),
+    );
+    verify_trace(
+        &traced,
+        &BTreeMap::from([
+            (base_id.clone(), base_bytes),
+            (left_id.clone(), left_bytes),
+            (right_id.clone(), right_bytes),
+            (resolved_id.clone(), resolved_bytes.clone()),
+        ]),
+    );
+    assert_eq!(traced["trace"]["tip"], resolved_id);
+    let edges = traced["trace"]["edges"].as_array().unwrap();
+    let incoming: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge["child"] == resolved_id)
+        .map(|edge| edge["parent"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(incoming, parents);
+    assert_eq!(edges.len(), 4);
+    assert_eq!(
+        traced["trace"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["commit"] == base_id)
+            .count(),
+        1
+    );
+    case.save("peer-c-all-parent-physical-trace", traced);
+    unchanged_store(
+        &mut case,
+        "peer-c-trace-store-unchanged",
+        &peer_c,
+        &before_trace,
+    );
+    unchanged_store(
+        &mut case,
+        "peer-b-unchanged-by-resolution-and-return",
+        &peer_b,
+        &peer_b_state,
+    );
+    unchanged_store(
+        &mut case,
+        "origin-unchanged-by-resolution-and-return",
+        &origin,
+        &origin_state,
+    );
+    case.runtime(
+        "runtime-peer-independent-resolved-source",
+        &provider,
+        "lib.test",
+        &resolved_file,
+        Expected::Success,
+    );
+    case.runtime(
+        "runtime-peer-third-checkout-same-result",
+        &provider,
+        "lib.test",
+        &third_checkout,
+        Expected::Success,
+    );
+    case.finish();
+}
+
+// Separate from the product's resolver: expand real function signatures and
+// interpret each numeric call through this module's own import/declaration
+// tables. Source-controlled variants establish this test's correspondence;
+// these descriptors do not assert general historical function identity.
+fn reference_oracle(bytes: &[u8]) -> Value {
+    let mut signatures = Vec::new();
+    let mut imports: Vec<Value> = Vec::new();
+    let mut declarations = Vec::new();
+    let mut calls = Vec::new();
+    let mut defined_index = 0usize;
+    let mut start = None;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.expect("independent reference oracle framing") {
+            Payload::TypeSection(reader) => {
+                for group in reader {
+                    for (_, ty) in group.unwrap().into_types_and_offsets() {
+                        let wasmparser::CompositeInnerType::Func(function) =
+                            ty.composite_type.inner
+                        else {
+                            panic!("this real preload fixture must contain only ordinary function signatures");
+                        };
+                        signatures.push(json!({
+                            "params":function.params().iter().map(|ty|format!("{ty:?}")).collect::<Vec<_>>(),
+                            "results":function.results().iter().map(|ty|format!("{ty:?}")).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for group in reader {
+                    for item in group.unwrap().into_iter() {
+                        let (_, import) = item.unwrap();
+                        let (type_index, exact) = match import.ty {
+                            TypeRef::Func(index) => (index, false),
+                            TypeRef::FuncExact(index) => (index, true),
+                            _ => panic!("the chosen real preload main has only function imports"),
+                        };
+                        imports.push(json!({
+                            "function_index":imports.len(),"module":import.module,"name":import.name,
+                            "type_index":type_index,"signature":signatures[type_index as usize],"exact":exact,
+                        }));
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for type_index in reader {
+                    declarations.push(type_index.unwrap());
+                }
+            }
+            Payload::StartSection { func, .. } => start = Some(func),
+            Payload::CodeSectionEntry(body) => {
+                let mut reader = body.get_operators_reader().unwrap();
+                let mut ordinal = 0usize;
+                while !reader.eof() {
+                    let offset = reader.original_position();
+                    let op = reader.read().unwrap();
+                    if let Operator::Call { function_index } = op {
+                        let target_index = function_index as usize;
+                        let target = if target_index < imports.len() {
+                            let import = &imports[target_index];
+                            json!({"kind":"import","module":import["module"],"name":import["name"],"signature":import["signature"],"exact":import["exact"]})
+                        } else {
+                            let target_defined = target_index - imports.len();
+                            let type_index = declarations[target_defined];
+                            json!({"kind":"defined","defined_index":target_defined,"signature":signatures[type_index as usize]})
+                        };
+                        calls.push(json!({
+                            "defined_function_index":defined_index,"global_function_index":imports.len()+defined_index,
+                            "operator_ordinal":ordinal,"span":{"start":offset,"end":reader.original_position()},
+                            "opcode":"Call","operand_index":function_index,"resolved_target":target,
+                        }));
+                    }
+                    ordinal += 1;
+                }
+                defined_index += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(defined_index, declarations.len());
+    let section_hashes: Vec<_> = sections(bytes).into_iter().filter(|(id,_,_)|*id!=0).map(|(id,range,_)| {
+        json!({"id":id,"raw_span":{"start":range.start,"end":range.end},"sha256":sha(&bytes[range])})
+    }).collect();
+    json!({"raw_sha256":sha(bytes),"signatures":signatures,"imports":imports,"declarations":declarations,"start":start,"call_sites":calls,"standard_sections":section_hashes})
+}
+
+// This workflow selects import bytes for physical history. In particular, it
+// does not ask trace to turn unchanged numeric call bytes into semantic origin.
+fn reference_roundtrip(case: &mut Case, label: &str, old_file: &Path, new_file: &Path) -> Value {
+    let old = std::fs::read(old_file).unwrap();
+    let new = std::fs::read(new_file).unwrap();
+    let difference = case.cli_json(
+        "bindings-diff",
+        &args(&["diff", &text(old_file), &text(new_file), "--format", "json"]),
+    );
+    assert_eq!(difference["audit"]["changed"], true);
+    let patch = case.path(&format!("{label}.uwgp"));
+    case.cli_json(
+        "bindings-patch",
+        &args(&[
+            "patch",
+            &text(old_file),
+            &text(new_file),
+            "--output",
+            &text(&patch),
+        ]),
+    );
+    let patch_json: Value = serde_json::from_slice(&std::fs::read(&patch).unwrap()).unwrap();
+    replay_patch_independently(&patch_json, &old, &new);
+    case.artifact("reference-binding raw offline patch", &patch);
+    case.cli_json(
+        "bindings-apply-check",
+        &args(&["apply", &text(old_file), &text(&patch), "--check"]),
+    );
+    let replayed = case.path(&format!("{label}.replayed.wasm"));
+    case.cli_json(
+        "bindings-apply",
+        &args(&[
+            "apply",
+            &text(old_file),
+            &text(&patch),
+            "--output",
+            &text(&replayed),
+        ]),
+    );
+    assert_eq!(std::fs::read(&replayed).unwrap(), new);
+    case.artifact(
+        "reference-binding patch replay equals independent WABT target",
+        &replayed,
+    );
+    let repo = case.path(&format!("{label}.repo"));
+    case.cli("bindings-init", &args(&["init", &text(&repo)]));
+    let base_id = commit(case, &repo, old_file, "independent numeric call baseline");
+    let tip_id = commit(case, &repo, new_file, "independent import context variant");
+    let verified = verify_commit(&repo, &tip_id, std::slice::from_ref(&base_id), &new);
+    case.save(&format!("{label}.typed-objects"), verified);
+    case.cli_json("bindings-fsck", &args(&["fsck", &text(&repo)]));
+    let import_range = sections(&new)
+        .into_iter()
+        .find(|(id, _, _)| *id == 2)
+        .unwrap()
+        .1;
+    let query = format!("{}:{}", import_range.start, import_range.end);
+    let before = snapshot(&repo.join(".uwgit"));
+    let traced = case.cli_json(
+        "bindings-trace-physical-import-only",
+        &args(&["trace", &text(&repo), &tip_id, "--range", &query]),
+    );
+    assert_eq!(
+        traced["trace"]["query"],
+        json!({"start":import_range.start,"end":import_range.end})
+    );
+    verify_trace(
+        &traced,
+        &BTreeMap::from([(base_id, old), (tip_id.clone(), new.clone())]),
+    );
+    assert!(traced["trace"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| !edge["events"].as_array().unwrap().is_empty()));
+    unchanged_store(case, &format!("{label}.trace-read-only"), &repo, &before);
+    case.save(&format!("{label}.physical-import-history"),json!({"meaning":"Only selected physical import bytes; unchanged call-byte gaps are not a semantic dependency trace","report":traced}));
+    transfer(case, label, &repo, &tip_id, &new);
+    difference
+}
+
+#[test]
+#[ignore = "requires staged real uwvm2-ros examples, independent WABT, existing UWVM LLVM runtime, and SSH Linux cgroup"]
+fn real_preload_call_indices_and_actual_import_targets_are_distinct_oracles() {
+    let mut case = Case::new("preload-reference-bindings");
+    let source = case.source("0004.preload_wasm/main.wat");
+    let library_source = case.source("0004.preload_wasm/lib.wat");
+    let numeric = replaced(
+        &replaced(&source, "call $get_argc\n", "call 0\n"),
+        "call $get_argv_buf_size\n",
+        "call 1\n",
+    );
+    let shifted = replaced(
+        &source,
+        "(module",
+        "(module\n  (import \"lib.test\" \"get_argc\" (func $unused (result i32)))",
+    );
+    let argc_import = "  (import \"lib.test\" \"get_argc\" (func $get_argc (result i32)))";
+    let argv_import =
+        "  (import \"lib.test\" \"get_argv_buf_size\" (func $get_argv_buf_size (result i32)))";
+    let rebound = replaced(
+        &numeric,
+        &format!("{argc_import}\n{argv_import}"),
+        &format!("{argv_import}\n{argc_import}"),
+    );
+    let confirmed = replaced(
+        &replaced(
+            &rebound,
+            "call 0\n    i32.const 3",
+            "call 0\n    i32.const 16",
+        ),
+        "call 1\n    i32.const 16",
+        "call 1\n    i32.const 3",
+    );
+    let base = case.compile("bindings.main.numeric-baseline", &numeric);
+    let relocated = case.compile("bindings.main.index-relocated-same-target", &shifted);
+    let changed = case.compile("bindings.main.same-index-rebound", &rebound);
+    let accepted = case.compile("bindings.main.rebound-confirmed-16-3", &confirmed);
+    let library = case.compile("bindings.library", &library_source);
+    let bytes = [
+        std::fs::read(&base).unwrap(),
+        std::fs::read(&relocated).unwrap(),
+        std::fs::read(&changed).unwrap(),
+        std::fs::read(&accepted).unwrap(),
+    ];
+    let oracle: Vec<_> = bytes.iter().map(|bytes| reference_oracle(bytes)).collect();
+    for module in &oracle {
+        for import in module["imports"].as_array().unwrap() {
+            assert_eq!(import["signature"], json!({"params":[],"results":["I32"]}));
+        }
+    }
+    let calls = |module: &Value| {
+        module["call_sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["operand_index"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(calls(&oracle[0]), vec![0, 2, 1, 2]);
+    assert_eq!(calls(&oracle[1]), vec![1, 3, 2, 3]);
+    assert_eq!(calls(&oracle[2]), vec![0, 2, 1, 2]);
+    assert_eq!(calls(&oracle[3]), vec![0, 2, 1, 2]);
+    assert_eq!(
+        oracle[1]["start"].as_u64().unwrap(),
+        oracle[0]["start"].as_u64().unwrap() + 1
+    );
+    assert_eq!(oracle[2]["start"], oracle[0]["start"]);
+    let base_calls = oracle[0]["call_sites"].as_array().unwrap();
+    for (before, after) in base_calls
+        .iter()
+        .zip(oracle[1]["call_sites"].as_array().unwrap())
+    {
+        assert_eq!(
+            after["operand_index"].as_u64().unwrap(),
+            before["operand_index"].as_u64().unwrap() + 1
+        );
+        assert_eq!(before["resolved_target"], after["resolved_target"]);
+    }
+    let rebound_calls = oracle[2]["call_sites"].as_array().unwrap();
+    assert_eq!(base_calls[0]["resolved_target"]["name"], "get_argc");
+    assert_eq!(
+        rebound_calls[0]["resolved_target"]["name"],
+        "get_argv_buf_size"
+    );
+    assert_eq!(
+        base_calls[2]["resolved_target"]["name"],
+        "get_argv_buf_size"
+    );
+    assert_eq!(rebound_calls[2]["resolved_target"]["name"], "get_argc");
+    let code = |bytes: &[u8]| {
+        sections(bytes)
+            .into_iter()
+            .filter(|(id, _, _)| *id == 10)
+            .map(|(_, range, _)| bytes[range].to_vec())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        code(&bytes[0]),
+        code(&bytes[2]),
+        "same numeric calls despite changed import targets"
+    );
+    assert_ne!(
+        code(&bytes[0]),
+        code(&bytes[1]),
+        "index relocation changes code encoding"
+    );
+    assert_ne!(
+        code(&bytes[2]),
+        code(&bytes[3]),
+        "counterfactual checks must encode 16/3 instead of 3/16"
+    );
+    case.save("reference-independent-expanded-bindings",json!({
+        "base":oracle[0],"index_relocated_same_target":oracle[1],"same_index_different_target":oracle[2],"rebound_results_confirmed":oracle[3],
+        "base_and_rebound_raw_code_identical":true,
+        "identity_scope":"Controlled source variants establish this oracle; no general historical identity claim. Duplicate unused imports are not asserted to have unique historical counterparts.",
+    }));
+    case.runtime(
+        "runtime-bindings-baseline-pass",
+        &library,
+        "lib.test",
+        &base,
+        Expected::Success,
+    );
+    case.runtime(
+        "runtime-bindings-relocated-same-target",
+        &library,
+        "lib.test",
+        &relocated,
+        Expected::Success,
+    );
+    require_trap(&case.runtime(
+        "runtime-bindings-rebound-wrong-expectations",
+        &library,
+        "lib.test",
+        &changed,
+        Expected::Failure,
+    ));
+    case.runtime(
+        "runtime-bindings-rebound-values-confirmed",
+        &library,
+        "lib.test",
+        &accepted,
+        Expected::Success,
+    );
+    let relocation_diff = reference_roundtrip(&mut case, "reference-shift", &base, &relocated);
+    let mut relocation_bindings = Vec::new();
+    for change in relocation_diff["changes"].as_array().unwrap() {
+        if let Some(bindings) = change["function"]["call_bindings"].as_array() {
+            relocation_bindings.extend(bindings);
+        }
+    }
+    if let Some(notes) = relocation_diff["call_binding_notes"].as_array() {
+        for note in notes {
+            relocation_bindings.extend(note["call_bindings"].as_array().unwrap());
+        }
+    }
+    assert!(
+        !relocation_bindings
+            .iter()
+            .any(|binding| binding["relation"] == "different_target"),
+        "a duplicate unused import must not invent an external target change"
+    );
+    assert!(relocation_bindings.iter().any(|binding| {
+        binding["relation"] == "same_target_index_relocated"
+            && binding["target_changed"] == false
+            && binding["old"]["target"]["import"]["name"] == "get_argv_buf_size"
+    }));
+    assert!(relocation_bindings.iter().any(|binding| {
+        binding["relation"] == "same_target_index_relocated"
+            && binding["target_changed"] == false
+            && binding["old"]["target"]["kind"] == "defined"
+    }));
+    case.save("reference-index-relocation-product-diff", relocation_diff);
+    let difference = reference_roundtrip(&mut case, "reference-rebound", &base, &changed);
+    assert_eq!(difference["function_analysis"]["available"], true);
+    let callers: Vec<_> = difference["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["kind"] == "function_changed")
+        .map(|change| &change["function"])
+        .filter(|function| {
+            function["call_bindings"]
+                .as_array()
+                .is_some_and(|bindings| {
+                    bindings
+                        .iter()
+                        .any(|binding| binding["relation"] == "different_target")
+                })
+        })
+        .collect();
+    assert_eq!(
+        callers.len(),
+        1,
+        "one real unchanged-byte caller must be reported as changed"
+    );
+    let caller = callers[0];
+    assert_eq!(caller["direct_calls_changed"], false);
+    assert!(
+        caller["operators"].as_array().unwrap().is_empty(),
+        "raw Call operators did not change"
+    );
+    let binding_changes: Vec<_> = caller["call_bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|binding| binding["relation"] == "different_target")
+        .collect();
+    assert_eq!(binding_changes.len(), 2);
+    for (operand, old_name, new_name) in [
+        (0, "get_argc", "get_argv_buf_size"),
+        (1, "get_argv_buf_size", "get_argc"),
+    ] {
+        let binding = binding_changes
+            .iter()
+            .find(|binding| binding["old"]["function_index"] == operand)
+            .unwrap();
+        assert_eq!(binding["pairing"], "opcode_alignment");
+        assert_eq!(binding["target_changed"], true);
+        assert_eq!(binding["identity_unproven"], true);
+        let independent_old = base_calls
+            .iter()
+            .find(|call| call["operand_index"] == operand)
+            .unwrap();
+        let independent_new = rebound_calls
+            .iter()
+            .find(|call| call["operand_index"] == operand)
+            .unwrap();
+        for (side, name, independent) in [
+            ("old", old_name, independent_old),
+            ("new", new_name, independent_new),
+        ] {
+            assert_eq!(binding[side]["function_index"], operand);
+            assert_eq!(binding[side]["opcode"], "Call");
+            assert_eq!(
+                binding[side]["operator_index"],
+                independent["operator_ordinal"]
+            );
+            assert_eq!(binding[side]["offset"], independent["span"]["start"]);
+            assert_eq!(binding[side]["target"]["kind"], "imported");
+            assert_eq!(binding[side]["target"]["import"]["module"], "lib.test");
+            assert_eq!(binding[side]["target"]["import"]["name"], name);
+        }
+        assert_eq!(
+            binding["old"]["target"]["type_id"],
+            binding["new"]["target"]["type_id"]
+        );
+        assert!(!binding["old"]["target"]["type_id"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+    assert!(difference["summary"]["functions_changed"].as_u64().unwrap() >= 1);
+    case.save(
+        "reference-rebound-product-reports-changed-caller",
+        difference,
+    );
     case.finish();
 }

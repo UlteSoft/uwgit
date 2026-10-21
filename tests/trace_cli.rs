@@ -152,6 +152,69 @@ fn custom(payload: &[u8]) -> (Vec<u8>, usize) {
     (bytes, start)
 }
 
+fn append_named_custom(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) -> usize {
+    let mut outer = leb(name.len());
+    outer.extend_from_slice(name.as_bytes());
+    let prefix_len = outer.len();
+    outer.extend_from_slice(payload);
+    bytes.push(0);
+    bytes.extend(leb(outer.len()));
+    let data_start = bytes.len() + prefix_len;
+    bytes.extend(outer);
+    data_start
+}
+
+fn named_payload_fixture(name: &str, payload: &[u8]) -> (Vec<u8>, usize, usize) {
+    let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+    let start = append_named_custom(&mut bytes, name, payload);
+    let end = bytes.len();
+    (bytes, start, end)
+}
+
+fn producer_payload(name: &str, version: &str) -> (Vec<u8>, usize) {
+    let mut data = vec![1, 8];
+    data.extend_from_slice(b"language");
+    data.push(1);
+    let value_start = data.len();
+    data.extend(leb(name.len()));
+    data.extend_from_slice(name.as_bytes());
+    data.extend(leb(version.len()));
+    data.extend_from_slice(version.as_bytes());
+    (data, value_start)
+}
+
+fn producer_fixture(name: &str, version: &str) -> (Vec<u8>, usize, usize) {
+    let (data, value_start) = producer_payload(name, version);
+    let (bytes, start, end) = named_payload_fixture("producers", &data);
+    (bytes, start + value_start, end)
+}
+
+fn assert_canonical_metadata_trace(
+    old: Vec<u8>,
+    new: Vec<u8>,
+    path: &str,
+    start: usize,
+    end: usize,
+) {
+    assert!(path.is_ascii());
+    let mut history = History::new("canonical-metadata-path");
+    let root = history.commit(&old, "original metadata bytes");
+    let tip = history.commit(&new, "metadata bytes changed; no identity assertion");
+    let named = history.query(&["trace", &history.repo, &tip, "--path", path]);
+    let numeric = history.trace(&tip, start, end);
+    assert_eq!(named["selection"]["span"], span(start, end));
+    assert_eq!(named["selection"]["path"], path);
+    assert_eq!(named["trace"], numeric["trace"]);
+    assert_eq!(named["trace"]["complete"], true);
+    assert_eq!(named["trace"]["identity_unproven"], true);
+    assert!(!edge(&named["trace"], &root, &tip)["events"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    verify_evidence(&history, &named);
+    verify_evidence(&history, &numeric);
+}
+
 fn valid(bytes: &[u8]) {
     Validator::new_with_features(WasmFeatures::all())
         .validate_all(bytes)
@@ -292,15 +355,195 @@ fn exact_paths_select_physical_regions_and_empty_or_missing_paths_fail() {
     assert_eq!(hex(&bytes[operator.span.start..operator.span.end]), "4111");
     let (empty, _) = custom(&[]);
     let empty_tip = history.commit(&empty, "empty custom payload");
-    for path in ["", "absent", "code", "code[9]", "custom[0]/x/opaque"] {
+    for path in [
+        "",
+        "absent",
+        "code",
+        "code[9]",
+        "custom[0]/payload/opaque",
+        "custom[0]/x/opaque",
+    ] {
         let before = snapshot(&history.directory);
         let output = invoke(&["trace", &history.repo, &empty_tip, "--path", path]);
         assert!(
             !output.status.success(),
             "nonexistent or empty path {path:?}"
         );
+        if path == "custom[0]/payload/opaque" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("empty region"));
+        }
+        if path == "custom[0]/x/opaque" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("not present"));
+        }
         assert_eq!(snapshot(&history.directory), before);
     }
+}
+
+#[test]
+fn canonical_metadata_paths_select_nul_slash_unicode_and_empty_names() {
+    for (old_name, new_name) in [
+        ("\0before", "\0after"),
+        ("slash/旧名", "slash/新名"),
+        ("", ""),
+    ] {
+        let (old, _, _) = named_payload_fixture(old_name, &[0x31, 0x42, 0x53]);
+        let (new, start, end) = named_payload_fixture(new_name, &[0x31, 0x64, 0x53]);
+        assert_canonical_metadata_trace(old, new, "custom[0]/payload/opaque", start, end);
+        let (old, _, _) = producer_fixture(old_name, "version/旧");
+        let (new, start, end) = producer_fixture(new_name, "version/新");
+        assert_canonical_metadata_trace(
+            old,
+            new,
+            "custom[0]/producers/language/value[0]",
+            start,
+            end,
+        );
+    }
+}
+
+#[test]
+fn canonical_metadata_paths_do_not_put_fixed_long_names_into_process_arguments() {
+    // One fixed length exceeds both the pinned100000 string limit and the
+    // usual single-argument byte limit. Trace operates on raw module bytes.
+    let name = "x".repeat(131_073);
+    let (old, _, _) = named_payload_fixture(&name, &[0x31, 0x42, 0x53]);
+    let (new, start, end) = named_payload_fixture(&name, &[0x31, 0x64, 0x53]);
+    assert_canonical_metadata_trace(old, new, "custom[0]/payload/opaque", start, end);
+    let (old, _, _) = producer_fixture(&name, "1");
+    let (new, start, end) = producer_fixture(&name, "2");
+    assert_canonical_metadata_trace(
+        old,
+        new,
+        "custom[0]/producers/language/value[0]",
+        start,
+        end,
+    );
+}
+
+#[test]
+fn opaque_names_and_producer_metadata_do_not_change_function_identity_or_feature_policy() {
+    let core =
+        wat("(module (func (export \"run\") v128.const i32x4 0 0 0 0 drop i32.const 42 drop))");
+    let metadata_module = |malformed: bool| {
+        let mut bytes = core[..8].to_vec();
+        let names = if malformed {
+            // Duplicate function index0 violates the recognized fixed name map.
+            vec![1, 7, 2, 0, 1, b'A', 0, 1, b'B']
+        } else {
+            vec![1, 4, 1, 0, 1, b'A']
+        };
+        append_named_custom(&mut bytes, "name", &names);
+        let (producer, _) = producer_payload(
+            if malformed {
+                "\0compiler/新"
+            } else {
+                "\0compiler/旧"
+            },
+            if malformed { "2" } else { "1" },
+        );
+        append_named_custom(&mut bytes, "producers", &producer);
+        append_named_custom(
+            &mut bytes,
+            "target_features",
+            &[
+                1,
+                if malformed { b'-' } else { b'+' },
+                4,
+                b's',
+                b'i',
+                b'm',
+                b'd',
+            ],
+        );
+        bytes.extend_from_slice(&core[8..]);
+        bytes
+    };
+    let old = metadata_module(false);
+    let new = metadata_module(true);
+    let mut history = History::new("metadata-projection");
+    let root = history.commit(&old, "recognized optional metadata");
+    let tip = history.commit(
+        &new,
+        "opaque names and renamed producer; physical metadata change",
+    );
+    for standard in ["core1", "core2", "core3", "all-known"] {
+        let before = run_json(&[
+            "inspect",
+            &root,
+            "--repo",
+            &history.repo,
+            "--standard",
+            standard,
+        ]);
+        let after = run_json(&[
+            "inspect",
+            &tip,
+            "--repo",
+            &history.repo,
+            "--standard",
+            standard,
+        ]);
+        assert_eq!(before["function_analysis"]["available"], true);
+        assert_eq!(after["function_analysis"]["available"], true);
+        assert_eq!(
+            before["module"]["functions"][0]["id"],
+            after["module"]["functions"][0]["id"]
+        );
+        assert_eq!(
+            before["module"]["functions"][0]["fingerprint"],
+            after["module"]["functions"][0]["fingerprint"]
+        );
+        let expected = if standard == "core1" {
+            "invalid"
+        } else {
+            "valid"
+        };
+        assert_eq!(before["audit"]["standard"]["validation"], expected);
+        assert_eq!(after["audit"]["standard"]["validation"], expected);
+        assert!(after["audit"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|section| { section["kind"] == "custom:name" && section["status"] == "opaque" }));
+        let diff = run_json(&[
+            "diff",
+            &root,
+            &tip,
+            "--repo",
+            &history.repo,
+            "--format",
+            "json",
+            "--standard",
+            standard,
+        ]);
+        assert_eq!(diff["binary_changed"], true);
+        assert!(!diff["audit"]["edits"].as_array().unwrap().is_empty());
+        assert_eq!(diff["function_analysis"]["available"], true);
+        assert_eq!(diff["summary"]["functions_changed"], 0);
+        assert_eq!(diff["function_matches"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            diff["function_matches"][0]["old_id"],
+            diff["function_matches"][0]["new_id"]
+        );
+    }
+    let inspected = wasm_git::audit::inspect(&new).unwrap();
+    let value = inspected
+        .sections
+        .iter()
+        .flat_map(|section| &section.regions)
+        .flat_map(|region| &region.children)
+        .find(|region| region.path == "custom[1]/producers/language/value[0]")
+        .unwrap();
+    let named = history.query(&[
+        "trace",
+        &history.repo,
+        &tip,
+        "--path",
+        "custom[1]/producers/language/value[0]",
+    ]);
+    let numeric = history.trace(&tip, value.span.start, value.span.end);
+    assert_eq!(named["trace"], numeric["trace"]);
+    verify_evidence(&history, &named);
 }
 
 #[test]

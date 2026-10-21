@@ -198,6 +198,227 @@ fn assert_conflict(history: &History) -> Value {
     result
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TrustContext {
+    BareValue,
+    UnknownGlobal,
+    ExplicitReference,
+}
+
+fn trust_fixture(context: TrustContext, a: u8, b: u8, x: u8, y: u8) -> Vec<u8> {
+    fn unsigned(mut value: u32, bytes: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            bytes.push(byte | if value != 0 { 0x80 } else { 0 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    fn section(bytes: &mut Vec<u8>, id: u8, payload: &[u8]) {
+        bytes.push(id);
+        unsigned(payload.len() as u32, bytes);
+        bytes.extend_from_slice(payload);
+    }
+    assert!(a < 64 && b < 64);
+    let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+    let types = if matches!(context, TrustContext::BareValue) {
+        // Pinned normalization accepts type1's forbidden bare index0 as
+        // (ref null type0), while strict wire auditing rejects that shorthand.
+        vec![2, 0x60, 0, 0, 0x60, 1, 0, 0]
+    } else {
+        // One fixed complete type index space makes positive s33 index127 a
+        // known reference. Repetition here constructs the fixture, not a search.
+        let mut types = vec![0x80, 1];
+        for _ in 0..128 {
+            types.extend_from_slice(&[0x60, 0, 0]);
+        }
+        types
+    };
+    section(&mut bytes, 1, &types);
+    section(&mut bytes, 3, &[1, 0]);
+    match context {
+        TrustContext::BareValue => {}
+        TrustContext::UnknownGlobal => {
+            // Bare FF00 is an unknown ValType prefix, despite the pinned
+            // fallback treating it as a nullable reference to function type127.
+            section(&mut bytes, 6, &[1, 0xff, 0, 0, 0xd0, 0xff, 0, 0x0b]);
+        }
+        TrustContext::ExplicitReference => {
+            // The same FF00 is a legal heap index after the explicit63 prefix.
+            section(&mut bytes, 6, &[1, 0x63, 0xff, 0, 0, 0xd0, 0xff, 0, 0x0b]);
+        }
+    }
+    section(
+        &mut bytes,
+        10,
+        &[1, 8, 0, 0x41, a, 0x1a, 0x41, b, 0x1a, 0x0b],
+    );
+    // Two different, opaque custom conventions can be chosen atomically.
+    section(&mut bytes, 0, &[1, b'x', x]);
+    section(&mut bytes, 0, &[1, b'y', y]);
+    bytes
+}
+
+#[test]
+fn synthesized_merge_rejects_pinned_accepted_untrusted_contexts_without_store_writes() {
+    for context in [TrustContext::BareValue, TrustContext::UnknownGlobal] {
+        for custom in [false, true] {
+            let base = trust_fixture(context, 1, 2, 0, 0);
+            let left = if custom {
+                trust_fixture(context, 1, 2, 1, 0)
+            } else {
+                trust_fixture(context, 3, 2, 0, 0)
+            };
+            let right = if custom {
+                trust_fixture(context, 1, 2, 0, 1)
+            } else {
+                trust_fixture(context, 1, 4, 0, 0)
+            };
+            for bytes in [&base, &left, &right] {
+                Validator::new_with_features(WasmFeatures::all())
+                    .validate_all(bytes)
+                    .expect("the pinned validator alone must miss this fixed wire/trust gap");
+                let audit = wasm_git::audit::inspect(bytes).unwrap();
+                assert_eq!(audit.validation, "failed_or_unsupported");
+                assert_eq!(audit.standard.validation, "invalid");
+            }
+            let history = History::fork("strict-context-conflict", base, left, right);
+            let result = assert_conflict(&history);
+            assert_eq!(result["report"]["validation"], "failed_or_unsupported");
+            assert!(result["report"].get("bytes").is_none());
+            assert!(result["report"]["framing_fixups"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(result["report"]["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|conflict| { conflict["path"] == "module/validation" }));
+        }
+    }
+}
+
+#[test]
+fn exact_fast_forward_and_manual_choices_preserve_untrusted_bytes_with_failed_validation() {
+    for context in [TrustContext::BareValue, TrustContext::UnknownGlobal] {
+        let valid = trust_fixture(TrustContext::ExplicitReference, 1, 2, 0, 0);
+        let selected = trust_fixture(context, 3, 2, 0, 0);
+        let history = History::fork(
+            "strict-context-exact",
+            valid.clone(),
+            selected.clone(),
+            valid.clone(),
+        );
+        let result = history.merge();
+        assert_eq!(result["status"], "merged");
+        assert_eq!(result["report"]["validation"], "failed_or_unsupported");
+        assert_eq!(result["report"]["decisions"][0]["path"], "module");
+        assert_eq!(history.checkout("HEAD", "exact.wasm"), selected);
+        let inspected = json_success(&["inspect", "HEAD", "--repo", &history.repo]);
+        assert_eq!(inspected["audit"]["validation"], "failed_or_unsupported");
+
+        let tmp = Temp::new("strict-context-fast-forward");
+        let repo = tmp.path("repo");
+        let input = tmp.path("input.wasm");
+        success(&["init", &repo]);
+        let base = commit(&repo, &input, &valid, "base");
+        success(&["branch", &repo, "right", &base]);
+        success(&["switch", &repo, "right"]);
+        let target = commit(&repo, &input, &selected, "preserve unknown bytes");
+        success(&["switch", &repo, "main"]);
+        let objects = snapshot(&Path::new(&repo).join(".uwgit/objects"));
+        let result = json_success(&["merge", &repo, &target, "-m", "fast forward"]);
+        assert_eq!(result["status"], "fast_forward");
+        assert_eq!(snapshot(&Path::new(&repo).join(".uwgit/objects")), objects);
+        let checkout = tmp.path("fast-forward.wasm");
+        success(&["checkout", &repo, "HEAD", &checkout]);
+        assert_eq!(std::fs::read(checkout).unwrap(), selected);
+        let inspected = json_success(&["inspect", "HEAD", "--repo", &repo]);
+        assert_eq!(inspected["audit"]["validation"], "failed_or_unsupported");
+
+        let manual = History::fork(
+            "strict-context-manual",
+            valid,
+            trust_fixture(TrustContext::ExplicitReference, 3, 2, 0, 0),
+            trust_fixture(TrustContext::ExplicitReference, 1, 4, 0, 0),
+        );
+        let resolution = trust_fixture(context, 9, 9, 1, 1);
+        let file = manual.tmp.path("resolution.wasm");
+        std::fs::write(&file, &resolution).unwrap();
+        let result = json_success(&[
+            "merge",
+            &manual.repo,
+            &manual.right,
+            "-m",
+            "explicit wire preservation",
+            "--resolved",
+            &file,
+            "--expect-head",
+            &manual.left,
+        ]);
+        assert_eq!(result["status"], "merged_resolved");
+        assert!(result["report"].is_null());
+        assert_eq!(result["manual_resolution"]["supplied_bytes"], true);
+        assert_eq!(
+            result["manual_resolution"]["audit_validation"],
+            "failed_or_unsupported"
+        );
+        assert_eq!(manual.checkout("HEAD", "resolved.wasm"), resolution);
+        assert_eq!(
+            json_success(&["show", &manual.repo, "HEAD"])["parents"],
+            json!([manual.left, manual.right])
+        );
+        assert_eq!(json_success(&["fsck", &manual.repo])["commits"], 4);
+    }
+}
+
+#[test]
+fn explicit_indexed_reference_context_and_opaque_custom_sections_allow_synthesis() {
+    for custom in [false, true] {
+        let context = TrustContext::ExplicitReference;
+        let base = trust_fixture(context, 1, 2, 0, 0);
+        let (left, right, expected) = if custom {
+            (
+                trust_fixture(context, 1, 2, 1, 0),
+                trust_fixture(context, 1, 2, 0, 1),
+                trust_fixture(context, 1, 2, 1, 1),
+            )
+        } else {
+            (
+                trust_fixture(context, 3, 2, 0, 0),
+                trust_fixture(context, 1, 4, 0, 0),
+                trust_fixture(context, 3, 4, 0, 0),
+            )
+        };
+        let history = History::fork("strict-context-positive", base, left, right);
+        let result = history.merge();
+        assert_eq!(result["status"], "merged");
+        assert_eq!(
+            result["report"]["validation"],
+            "valid_with_all_known_features"
+        );
+        assert_eq!(history.checkout("HEAD", "combined.wasm"), expected);
+        let inspected = json_success(&["inspect", "HEAD", "--repo", &history.repo]);
+        assert_eq!(
+            inspected["audit"]["validation"],
+            "valid_with_all_known_features"
+        );
+        assert_eq!(inspected["audit"]["standard"]["validation"], "valid");
+        assert_eq!(
+            inspected["audit"]["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|section| { section["id"] == 0 && section["status"] == "opaque" })
+                .count(),
+            2
+        );
+    }
+}
+
 fn assert_exported_constant(inspection: &Value, export: &str, expected: i32) {
     let function = inspection["module"]["functions"]
         .as_array()

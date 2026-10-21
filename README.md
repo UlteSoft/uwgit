@@ -7,11 +7,17 @@ Wasm 1.0–3.0 的二进制头版本均为 1；本工具不通过文件头推断
 原始文件是事实来源：不通过 WAT 往返转换，不丢弃 custom section，不把规范化结果作为存储对象。
 函数匹配用于解释对应关系；完整字节审计决定是否发生变化。
 
+函数引用会结合解析目标比较：同一个 `call 0` 可能因 import 换序而改绑，
+不同数值索引也可能仍指向同一候选。`call_bindings` 给出逐位置的目标、签名与匹配依据，
+覆盖 `call`、`return_call`、`ref.func`；递归或重复目标的身份不确定性会明确保留。
+
 ## 比较与定位
 
 ```sh
 wasm-git inspect module.wasm --json
+wasm-git inspect module.wasm --standard core1 --json
 wasm-git diff old.wasm new.wasm
+wasm-git diff old.wasm new.wasm --standard core3 --format json
 wasm-git diff old.wasm new.wasm --format json
 wasm-git diff old.wasm new.wasm --short
 ```
@@ -25,6 +31,11 @@ JSON 的 `audit` 包含全部物理 section、已解码条目/函数/局部变�
 `try_table`/catch/throw，以及 memory、global、element、data 和初始化表达式。
 指令特性由固定版本 `wasmparser` 的操作码表标注，包括已知的额外提案。
 `validation` 与解码结果分开报告：读懂字节不等于模块满足类型及结构验证。
+
+`inspect`、`diff`、`apply` 可选 `--standard core1|core2|core3|all-known`，默认 `all-known`。
+标准配置独立判断每个节、类型、编码形式与指令的要求；已识别但禁用的内容以 binary 视图标注，
+仍完整读取已知立即数，保留后续受支持指令的位置。非法编码、非法语义和真正未知的扩展分别报告。
+配置不改变原始 ByteEdit 或补丁结果。使用方法与未知指令的恢复边界见[标准配置](docs/standards.md)。
 
 未知指令会标出 opcode 起始偏移，保留其所在表达式/函数剩余内容，不猜测后续指令长度；
 有长度边界的后续函数和 section 仍可审计。未知 section 也保留并标注。
@@ -100,30 +111,42 @@ checkout、bundle 和补丁输出通过不覆盖目标的原子发布创建完�
 不写入部分结果。手工解决保留双父历史，并以预期 HEAD 和不可变目标 ID 防止使用过期解决文件。
 具体范围、退出码及用法见[合并说明](docs/merge.md)。
 
-尚未提供网络传输协议、签名、压缩 pack 或垃圾回收；自动合并也不证明行为符合开发者意图。
+提供暂存区、状态、撤销、stash、标签、reflog、线性历史重放和 HTTP/SSH remote/server。
+暂存提交支持多模块文件树，新增、删除、改名和空树均进入版本历史：
+
+```sh
+wasm-git add ./history modules/a.wasm modules/b.wasm
+wasm-git commit ./history -m 'track module tree'
+wasm-git inspect HEAD --repo ./history --json
+wasm-git diff main incoming --repo ./history --format json
+wasm-git show ./history HEAD --file modules/a.wasm --output exported.wasm
+wasm-git trace ./history HEAD --file modules/a.wasm --range 40:48
+```
+
+文件树 inspect/diff 默认列出所有路径；`--file` 选择单个模块用于解释、导出或补丁。
+新增和删除保留完整单侧字节证据，改名明确表示为删除加新增，不猜历史身份。
+旧单模块对象、提交 ID 和读取方式保持兼容，升级时显式记录旧内容对应的路径。
+整树手工合并可用 `merge --resolved-index --expect-head OURS_ID` 提交完整暂存结果，
+绑定不可变的另一父提交，并报告 base、ours、theirs、resolved 四侧原始证据；不改写暂存区或脏工作区。
+文件与目录可相互转换，写入前检查整组路径，拒绝覆盖未跟踪内容。
+日常命令与工作区规则见[类 Git 工作流](docs/git-workflows.md)，
+部署、认证、引用租约及传输格式见[HTTP 与 SSH 服务](docs/server.md)。
+与 Git 常用命令的已支持、部分支持和缺失项见[命令能力矩阵](docs/git-command-coverage.md)；checkout 提供分支、显式路径恢复和兼容的独占导出入口。
+本轮路径匹配、overlay 与路径 reset 的实现边界及最终结果见[checkout 与路径恢复验证](docs/checkout-paths.md)。
+merge／pull 另支持 `--ff-only`；cherry-pick／revert 可用 `--resolved-index --expect-head ID`
+提交用户审定的完整暂存树，保持单父历史和未暂存工作字节，详见[快进约束与单父手工重放](docs/replay-resolution.md)。
+分支 upstream 支持设置、取消、`-vv` 与 `@{u}` 查询，并接入默认 pull/push；网络 clone、分支及 remote 的 rename/delete 同步维护关联，详见[upstream 验证与范围](docs/upstream.md)。
+merge/cherry-pick/revert 可用 `--record-conflict` 录制单目标冲突，再用 `--continue --resolved-index`、`--abort` 或 `--quit`；pick/revert 另支持单目标 `--skip`，详见[续作契约与验证](docs/pending.md)。
+线性 rebase 也可用 `--record-conflict` 冻结队列；`--continue --resolved-index` 审定当前冲突步骤后继续，`--skip` 跳过当前步骤，另支持 `--abort/--quit`。原 HEAD 保持到全队列成功才一次发布，详见[rebase 续作契约](docs/rebase-pending.md)。
+`ls-tree`、`show-ref`、`for-each-ref` 和 `count-objects` 可查询实际已提交树、引用与唯一对象统计；`ls-remote` 通过 HTTP/SSH 查询远端广告并明确标注对象尚未验证。格式、筛选、退出码与选项子集见[只读查询契约](docs/queries.md)。
+`describe` 可按实际标签祖先生成可回读的修订名；`archive` 可将选定已提交文件的原字节导出为确定的 ustar，旧单模块需显式命名。元数据策略与选项边界见[描述与归档契约](docs/describe-archive.md)。
+`bisect` 可冻结 good/bad 端点并保存测试判断，在完整 DAG 或第一父历史中选择候选；仅支持不切换工作区的流程，skip 歧义明确报告。用法与范围见[历史二分契约](docs/bisect.md)。
+尚未提供签名、压缩 pack 或垃圾回收；自动合并也不证明行为符合开发者意图。
 摘要用于内容完整性，不证明作者身份；本地拥有写权限的人仍可重写引用或删除整个仓库。
-崩溃遗留的 `.uwgit/write.lock` 需确认没有写进程后手动移除。
+崩溃遗留的 `.uwgit/write.lock` 或 `.uwgit/index.lock` 需确认没有写进程后手动移除。
 完整性检查和 bundle 当前需要将对象载入内存，尚未针对超大仓库做性能承诺。
 
 ## 验证
 
-开发测试在 SSH Linux 的既有 cgroup 内运行；本机测试产物只能放在 `/tmp`。
-可复用 [Linux 测试脚本](tools/test-linux.sh)，它只进入指定的现有容器，不创建或修改 cgroup。
-设置 `UWGIT_RUN_SPEC=1 tools/test-linux.sh` 会额外下载并校验固定的官方 Core 1.0/2.0/3.0 语料，
-递归处理其中的 `.wast` 文件并生成逐文件/模块审计记录。该测试不执行 wasm 或 runtime 断言。
-固定依赖使用 `Cargo.lock`；测试包括有效 Core 特性样本、逐字节编辑重放、未知/畸形内容、
-custom 识别回退，以及 clone/分支/bundle/fsck 的端到端流程。
-
-设计依据、对象格式和已知边界见 [设计文档](docs/design.md)。
-最新结果为 226 项回归测试通过，其中区间追踪还包含 1,922 次短数据查询覆盖检查；
-固定官方语料 479 个文件的审计检查也通过。
-12,941 个二进制模块还完成了共 25,882 次序列化补丁重放。
-历史查询覆盖、Core1 历史验证差异和环境证据见[第五轮验证记录](docs/testing-round5.md)。
-搭配真实 `uwvm2-ros/examples` 的验证可运行 `tools/test-uwvm-examples.sh`；
-默认只读取相邻的 `../uwvm2-ros`，也可用 `UWGIT_UWVM_SOURCE` 指定参考仓库。
-该脚本在现有 Linux cgroup 中编译和测试，核对参考输入前后摘要，不修改参考仓库。
-347 个原始 Wasm、347 个 WAT 产物及 7 个真实 C/C++ 编译产物均通过 WABT/uwvm 双验证；
-另有 6 项版本管理流程及 14 次 preload 实际运行。覆盖范围、固定工具及复跑要求见
-[真实示例验证记录](docs/testing-uwvm-examples.md)。
-此前结果保留在[首轮](docs/testing.md)、[第二轮](docs/testing-round2.md)、
-[第三轮](docs/testing-round3.md)和[第四轮](docs/testing-round4.md)记录。
+测试入口、环境要求及可选阶段。
+常规回归、编译检查与日志在独立任务目录中执行；测试输出不纳入版本控制。

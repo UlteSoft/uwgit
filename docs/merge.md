@@ -35,13 +35,52 @@ wasm-git merge ./history incoming -m 'combine independent function changes'
 - 无法完整解码的并行函数修改保持冲突；未知内容不会被猜测成可拼接的指令。
 - 可对应的 custom section 按整个 section 处理，不把不透明 payload 内的不同字节解释成独立字段。
 
-新组合的模块必须通过当前全部已知 feature 的验证。即使两个输入分别有效，组合后栈类型不一致，
-也会返回冲突而非保存无效结果。这是结构化合并检查，不能证明组合后的程序行为符合开发者意图。
+新组合的模块必须同时通过当前 all-known 的严格二进制审计和 feature validator。
+未变化的类型或初始化上下文也可能原本非法或未知，不能因其三侧字节相同就当作可信。
+宽松 reader 将裸值型归一化后接受的输入，仍须遵守严格审计的 unknown/invalid_encoding 结论。
+失败返回 `module/validation` 冲突；存在严格审计证据时列出合成输出的结构路径、字节范围和状态，
+否则保留 validator 的首错说明，始终列出实际 `validator_valid`；
+不返回合成 bytes，清空临时 framing_fixups，仓库不写对象或移动引用。
+即使两个输入分别有效，组合后栈类型不一致，也会返回冲突。
+检查针对最终合成结果；若一侧完整修复了不可信 code，另一侧只作允许的独立修改，
+结果符合全部检查时仍可合成。原字节整份选择、快进和明确手动解决继续保留既有存储合同，
+不作为有效合成证明。整份选择和手工解决的响应保留审计结果；
+快进只指向已有提交，本次响应不附验证报告，可通过 `inspect` 读取该内容的状态。
+合法超长 custom 名称使用完整原始名称检查对应关系；验证器的临时 reader 投影不参与名称身份或对象存储。
+`standard.validator_input` 披露每个投影字节。
+这是结构化合并检查，不能证明组合后的程序行为符合开发者意图。
 
 只在组合后必要时修正包围内容的长度字段，尽可能保留原来的 LEB 编码宽度，修正记录在 `framing_fixups`。
 可直接选择的完整字节片段不因合并而规范化。生成的模块仍可使用普通 `diff` 逐字节审计。
 
 ## 冲突与手工解决
+
+文件树按路径合并，新增和删除使用真实的存在/缺席状态；双方都修改同一现存文件时调用下述模块合并器。
+文件树的 `file_reports` 按路径报告结果，删除/修改、不同内容的同路径新增、路径前缀或 legacy 映射冲突均拒绝发布。
+下述 `--resolved WASM` 是旧单模块提交的显式解决接口，不能用一个文件替代整个文件树。
+
+文件树冲突可以明确选择暂存区的完整结果：
+
+```sh
+# 编辑/添加所选模块，明确暂存删除；未暂存内容不是解决结果的一部分。
+wasm-git add ./history modules/a.wasm modules/new.wasm
+wasm-git rm ./history --cached modules/deleted.wasm
+wasm-git merge ./history THEIRS_COMMIT_ID -m 'resolve complete tree' \
+  --resolved-index --expect-head OURS_COMMIT_ID --expect-branch main
+```
+
+此操作以完整 index 为结果，包括所有保留路径与真正的空树；不会自动补入另一方的非冲突文件。
+它不修改 index 或工作文件，未暂存修改、缺失的工作文件和未追踪文件原样保留。
+index 必须真实存在且完整通过规范检查；没有 index 的 clone 不代表选择空树。
+目标和预期 HEAD 都必须是完整不可变 ID；可选 expect-branch 还绑定报告中的分支名。
+命令内部再校验入场分支与 HEAD，要求双方分叉且有唯一共同祖先，拒绝过期审阅和猜测 base。
+
+成功状态仍为 merged_resolved，保存 format 2 树提交与 `[ours,theirs]` 父顺序。
+tree_manual_resolution 明确结果是调用者选择，列出 base、ours、theirs、resolved 全部路径的并集。
+每个存在侧提供原始字节、长度、SHA-256 和审计诊断；缺席为 null，不伪造空模块。
+from_ours / from_theirs 分别报告新增、删除和修改，修改的完整 ByteEdit 可重放；
+因此调用者丢弃另一方的文件或选择未知指令也会明确显示，不能把此结果当作自动验证通过的合并。
+此来源标注属于当次响应，不持久化到提交对象；保存 JSON 可作为操作见证。
 
 冲突 JSON 的 `report.conflicts` 提供 path、原因，以及 base/ours/theirs 三侧的原始区间和十六进制字节。
 报告中的 `old_head`、`target`、`base` 为实际使用的提交 ID。

@@ -5,14 +5,16 @@
 //! instructions terminate decoding of their expression; no instruction boundary
 //! is guessed. A malformed custom convention is treated as opaque custom data.
 
+use crate::standard::{Standard, StandardReport, StandardSupport};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use wasmparser::{
     BinaryReader, CompositeInnerType, ConstExpr, Data, DataKind, Element, ElementItems,
-    ElementKind, Export, FromReader, FunctionBody, Global, Imports, MemoryType, Operator,
-    OperatorsReader, RecGroup, Table, TableInit, TagType, TypeRef, Validator, WasmFeatures,
+    ElementKind, Export, FrameStack, FromReader, FunctionBody, Global, Imports, MemoryType,
+    Operator, OperatorsReader, RecGroup, Table, TableInit, TagType, TypeRef, Validator,
+    WasmFeatures,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub struct Region {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feature: Option<String>,
     pub children: Vec<Region>,
+    pub standard_support: StandardSupport,
 }
 
 impl Region {
@@ -66,6 +69,7 @@ impl Region {
             description: description.into(),
             feature: None,
             children: Vec::new(),
+            standard_support: StandardSupport::default(),
         }
     }
     fn feature(mut self, feature: &str) -> Self {
@@ -86,6 +90,7 @@ pub struct AuditSection {
     /// decoded, partially_decoded, opaque, or malformed. Decoding is not validation.
     pub status: String,
     pub regions: Vec<Region>,
+    pub standard_support: StandardSupport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,10 +98,13 @@ pub struct AuditModule {
     pub byte_len: usize,
     pub format: String,
     /// Validation uses every feature known to the pinned wasmparser version.
+    /// Intrinsically invalid wire encodings also fail independently of parser
+    /// normalization, including when its all-known validator accepts them.
     /// Unsupported bytes remain auditable even when validation cannot succeed.
     pub validation: String,
     pub sections: Vec<AuditSection>,
     pub diagnostics: Vec<Diagnostic>,
+    pub standard: StandardReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +181,20 @@ fn section_name(id: u8) -> &'static str {
 /// Inspect a core module without discarding unsupported or malformed payloads.
 /// Invalid headers and Component Model encodings are outside this API's scope.
 pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
+    inspect_with_standard(bytes, Standard::AllKnown)
+}
+
+/// Offset-preserving input for pinned Core parsers that discard custom metadata.
+/// Complete original custom names are independently checked before hiding only
+/// names exceeding the pinned reader's limit. This is not the original module:
+/// never use it for audit, storage, hashing, patches, or custom-name identity.
+#[doc(hidden)]
+pub fn core_reader_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    crate::core_view::ReaderView::new(bytes).bytes
+}
+
+/// Recognize with all-known grammar, then evaluate the selected Core standard.
+pub fn inspect_with_standard(bytes: &[u8], standard: Standard) -> Result<AuditModule, String> {
     if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
         return Err("expected an eight-byte core WebAssembly header".into());
     }
@@ -185,14 +207,53 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
         validation: "not_validated".into(),
         sections: Vec::new(),
         diagnostics: Vec::new(),
+        standard: StandardReport::pending(standard),
     };
     let mut cursor = BinaryReader::new(&bytes[8..], 8);
     let mut occurrences = BTreeMap::<u8, usize>::new();
     let mut imported_functions = 0u32;
     let mut imported_functions_known = true;
+    let mut function_index_context_valid = true;
+    let mut last_section_rank = 0;
     while !cursor.eof() {
         let start = cursor.original_position();
         let id = cursor.read_u8().map_err(|e| e.to_string())?;
+        let occurrence = occurrences.entry(id).or_default();
+        let duplicate = (1..=13).contains(&id) && *occurrence != 0;
+        let path = if id > 13 {
+            format!("unknown:{id}[{occurrence}]")
+        } else {
+            format!("{}[{}]", section_name(id), occurrence)
+        };
+        *occurrence += 1;
+        // The id already proves an ordering/uniqueness failure even if the
+        // following size cannot be read. In particular, a late unreadable
+        // import must retract earlier combined function/index assumptions.
+        let ordering_error = section_rank(id).and_then(|rank| {
+            let error = if duplicate {
+                Some((
+                    "section_duplicate",
+                    format!("non-custom section {id} occurs more than once"),
+                ))
+            } else if rank < last_section_rank {
+                Some((
+                    "section_order",
+                    format!("section {id} is out of Core section order"),
+                ))
+            } else {
+                None
+            };
+            last_section_rank = last_section_rank.max(rank);
+            error
+        });
+        if ordering_error.is_some() {
+            if matches!(id, 2 | 3 | 10) {
+                function_index_context_valid = false;
+            }
+            if id == 2 {
+                imported_functions_known = false;
+            }
+        }
         let size = match cursor.read_var_u32() {
             Ok(size) => size as usize,
             Err(error) => {
@@ -203,7 +264,7 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
                     error.offset(),
                     error.to_string(),
                 );
-                module.sections.push(AuditSection {
+                let mut section = AuditSection {
                     ordinal: module.sections.len(),
                     id,
                     kind: section_name(id).into(),
@@ -212,20 +273,22 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
                     header_span: Span::new(start, bytes.len()),
                     payload_span: Span::new(bytes.len(), bytes.len()),
                     status: "malformed".into(),
-                    regions: Vec::new(),
-                });
+                    regions: vec![Region::new(
+                        format!("unframed[{}]/framing", module.sections.len()),
+                        Span::new(start, bytes.len()),
+                        "invalid section byte length; remaining bytes have no trusted section boundary",
+                    ).feature("invalid_encoding")],
+                    standard_support: StandardSupport::default(),
+                };
+                if let Some((code, message)) = ordering_error {
+                    mark_section_order(&mut section, &mut module.diagnostics, code, message);
+                }
+                module.sections.push(section);
                 break;
             }
         };
         let payload_start = cursor.original_position();
         let end = payload_start.saturating_add(size).min(bytes.len());
-        let occurrence = occurrences.entry(id).or_default();
-        let path = if id > 13 {
-            format!("unknown:{id}[{occurrence}]")
-        } else {
-            format!("{}[{}]", section_name(id), occurrence)
-        };
-        *occurrence += 1;
         let mut section = AuditSection {
             ordinal: module.sections.len(),
             id,
@@ -236,9 +299,15 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
             payload_span: Span::new(payload_start, end),
             status: "decoded".into(),
             regions: Vec::new(),
+            standard_support: StandardSupport::default(),
         };
         if size > cursor.bytes_remaining() {
             section.status = "malformed".into();
+            section.regions.push(Region::new(
+                format!("{}/framing", section.path),
+                section.header_span,
+                "declared section payload extends beyond the actual file; payload grammar is not decoded",
+            ).feature("invalid_encoding"));
             section.regions.push(Region::new(
                 format!("{}/opaque", section.path),
                 section.payload_span,
@@ -254,6 +323,9 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
                     cursor.bytes_remaining()
                 ),
             );
+            if let Some((code, message)) = ordering_error {
+                mark_section_order(&mut section, &mut module.diagnostics, code, message);
+            }
             module.sections.push(section);
             break;
         }
@@ -271,6 +343,34 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
                 imported_functions_known,
             )
         };
+        let decoded = if withdraw_untrusted_expression_suffix(&mut section, &mut module.diagnostics)
+        {
+            // Any upstream error after the unknown frontier depends on the
+            // very value-type fallback whose inferred boundaries we withdrew.
+            Ok(())
+        } else {
+            decoded
+        };
+        if let Some(frontier) = section
+            .regions
+            .iter()
+            .find(|region| region.feature.as_deref() == Some("unknown_declaration_type"))
+        {
+            section.status = "partially_decoded".into();
+            if id == 2 {
+                imported_functions_known = false;
+            }
+            issue(
+                &mut module.diagnostics,
+                "warning",
+                "unknown_declaration_type",
+                frontier
+                    .children
+                    .first()
+                    .map_or(frontier.span.start, |prefix| prefix.span.start),
+                frontier.description.clone(),
+            );
+        }
         if let Err(error) = decoded {
             if id == 2 {
                 imported_functions_known = false;
@@ -294,23 +394,154 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
                 error.offset(),
                 error.to_string(),
             );
-            section.regions.push(Region::new(
-                format!("{}/undecoded", section.path),
-                Span::new(opaque_start, end),
-                "undecoded payload; no entry boundaries inferred after decode error",
-            ));
+            if let Some(recovered) =
+                recover_failed_expression(&section, bytes, opaque_start, &mut module.diagnostics)
+            {
+                section.regions.push(recovered);
+                withdraw_untrusted_expression_suffix(&mut section, &mut module.diagnostics);
+            } else if section
+                .regions
+                .last()
+                .is_none_or(|region| region.feature.as_deref() != Some("invalid_encoding"))
+            {
+                let invalid = if id == 0 {
+                    None
+                } else {
+                    crate::decode_error::section_failure(
+                        &error,
+                        id,
+                        BinaryReader::new(&bytes[opaque_start..end], opaque_start),
+                        opaque_start == payload_start,
+                    )
+                };
+                let mut suffix = Region::new(
+                    format!("{}/undecoded", section.path),
+                    Span::new(opaque_start, end),
+                    format!("{}: {error}; undecoded payload includes the failed entry and remaining bytes, without inferred later entry boundaries", invalid.unwrap_or("unrecognized or unclassified grammar")),
+                ).feature(if invalid.is_some() { "invalid_encoding" } else { "unknown" });
+                let at_payload_start = opaque_start == payload_start;
+                let reader = BinaryReader::new(&bytes[opaque_start..end], opaque_start);
+                let (failure, field_path) = if at_payload_start {
+                    match id {
+                        8 => (
+                            crate::value_guard::scalar_failure(id, &error, reader),
+                            "start_error",
+                        ),
+                        12 => (
+                            crate::value_guard::scalar_failure(id, &error, reader),
+                            "data_count_error",
+                        ),
+                        _ => (
+                            crate::value_guard::count_failure(id, &error, reader),
+                            "count_error",
+                        ),
+                    }
+                } else {
+                    match id {
+                        1 => (
+                            crate::value_guard::type_failure(&error, reader),
+                            "type_error",
+                        ),
+                        2 => (
+                            crate::value_guard::import_failure(&error, reader),
+                            "import_error",
+                        ),
+                        3 => (
+                            crate::value_guard::scalar_failure(id, &error, reader),
+                            "function_error",
+                        ),
+                        7 => (
+                            crate::value_guard::scalar_failure(id, &error, reader),
+                            "export_error",
+                        ),
+                        9..=11 => (
+                            crate::value_guard::segment_failure(id, &error, reader),
+                            match id {
+                                9 => "element_error",
+                                10 => "code_error",
+                                11 => "data_error",
+                                _ => unreachable!(),
+                            },
+                        ),
+                        4 | 5 | 6 | 13 => (
+                            crate::value_guard::header_failure(id, &error, reader),
+                            match id {
+                                4 => "table_error",
+                                5 => "memory_error",
+                                6 => "global_error",
+                                13 => "tag_error",
+                                _ => unreachable!(),
+                            },
+                        ),
+                        _ => (None, ""),
+                    }
+                };
+                if let Some(failure) = failure {
+                    suffix.children.push(
+                        Region::new(
+                            format!("{}/{}", suffix.path, field_path),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!("{}: {}; only this field is diagnosed, remaining bytes stay undecoded", failure.field, failure.reason),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if !at_payload_start {
+                    if let Some(failure) = crate::decode_error::linkage_failure(
+                        id,
+                        BinaryReader::new(&bytes[opaque_start..end], opaque_start),
+                    ) {
+                        suffix.children.push(
+                            Region::new(
+                                format!("{}/{}", suffix.path, failure.field),
+                                Span::new(failure.span.start, failure.span.end),
+                                failure.reason,
+                            )
+                            .feature("invalid_encoding"),
+                        );
+                    }
+                }
+                section.regions.push(suffix);
+            }
         }
         if section.status == "decoded" {
             let emitted = &module.diagnostics[diagnostic_start..];
             if emitted.iter().any(|d| d.severity == "error") {
                 section.status = "malformed".into();
-            } else if emitted.iter().any(|d| d.code == "unknown_operator") {
+            } else if emitted.iter().any(|d| {
+                d.code == "unknown_operator"
+                    || (d.code == "locals_decode" && d.severity == "warning")
+            }) {
                 section.status = "partially_decoded".into();
             }
         }
+        if let Some((code, message)) = ordering_error {
+            mark_section_order(&mut section, &mut module.diagnostics, code, message);
+        }
         module.sections.push(section);
     }
-    match Validator::new_with_features(WasmFeatures::all()).validate_all(bytes) {
+    if !function_index_context_valid {
+        // An import after code can change the supposed combined indices of
+        // bodies already read. Defined ordinals remain physical positions.
+        for section in &mut module.sections {
+            if section.id != 10 {
+                continue;
+            }
+            for region in &mut section.regions {
+                if let Some((_, suffix)) = region
+                    .description
+                    .split_once(' ')
+                    .filter(|_| region.description.starts_with("function_index="))
+                {
+                    region.description = format!(
+                        "function_index=unknown {suffix}; import/function/code section order or uniqueness prevents a proven declaration mapping"
+                    );
+                }
+            }
+        }
+    }
+    let reader_view = crate::core_view::ReaderView::new(bytes);
+    match Validator::new_with_features(WasmFeatures::all()).validate_all(&reader_view.bytes) {
         Ok(_) => module.validation = "valid_with_all_known_features".into(),
         Err(error) => {
             module.validation = "failed_or_unsupported".into();
@@ -323,17 +554,83 @@ pub fn inspect(bytes: &[u8]) -> Result<AuditModule, String> {
             );
         }
     }
+    module.standard =
+        crate::standard::classify(bytes, &mut module.sections, standard, &reader_view);
+    if module
+        .sections
+        .iter()
+        .any(|section| section.id != 0 && section.status != "decoded")
+    {
+        // A permissive validator may accept a bare value-type fallback even
+        // when the primary reader has withdrawn that declaration's grammar.
+        // Its actual result remains in standard.validator_valid; the module
+        // summary cannot claim complete all-known validity across this gap.
+        module.validation = "failed_or_unsupported".into();
+    }
+    for evidence in module
+        .standard
+        .evidence
+        .iter()
+        .filter(|entry| entry.status == "invalid_encoding")
+    {
+        module.validation = "failed_or_unsupported".into();
+        issue(
+            &mut module.diagnostics,
+            "error",
+            "invalid_encoding",
+            evidence.span.start,
+            evidence.reason.clone(),
+        );
+    }
     Ok(module)
+}
+
+fn section_rank(id: u8) -> Option<u8> {
+    Some(match id {
+        1..=5 => id,
+        13 => 6,
+        6..=9 => id + 1,
+        12 => 11,
+        10 => 12,
+        11 => 13,
+        _ => return None,
+    })
+}
+
+fn mark_section_order(
+    section: &mut AuditSection,
+    diagnostics: &mut Vec<Diagnostic>,
+    code: &str,
+    message: String,
+) {
+    section.status = "malformed".into();
+    issue(
+        diagnostics,
+        "error",
+        code,
+        section.header_span.start,
+        message.clone(),
+    );
+    section.regions.push(
+        Region::new(
+            format!("{}/ordering", section.path),
+            section.header_span,
+            message,
+        )
+        .feature("invalid_encoding"),
+    );
 }
 
 fn entries<'a, T: FromReader<'a>>(
     reader: &mut BinaryReader<'a>,
+    section_id: u8,
     path: &str,
     completed: &mut Vec<Region>,
     mut visit: impl FnMut(usize, Span, T) -> wasmparser::Result<Region>,
 ) -> wasmparser::Result<Vec<Region>> {
     let start = reader.original_position();
     let section = wasmparser::SectionLimited::<T>::new(reader.clone())?;
+    let count = section.count() as usize;
     let mut out = vec![Region::new(
         format!("{path}/count"),
         Span::new(start, section.original_position()),
@@ -343,7 +640,39 @@ fn entries<'a, T: FromReader<'a>>(
     let mut index = 0;
     loop {
         let start = it.original_position();
+        if index < count {
+            let mut entry_reader = reader.clone();
+            entry_reader.read_bytes(start - reader.original_position())?;
+            if let Some(offset) = crate::value_guard::unknown_entry_value(section_id, entry_reader)
+            {
+                let mut suffix = Region::new(
+                    format!("{path}/undecoded"),
+                    Span::new(start, reader.range().end),
+                    format!("unknown value-type prefix at offset {offset}; the current entry/group and remaining section are not decoded; no later declaration boundaries inferred"),
+                ).feature("unknown_declaration_type");
+                suffix.children.push(
+                    Region::new(
+                        format!("{path}/undecoded/value_type_start"),
+                        Span::new(offset, offset + 1),
+                        "unrecognized value-type form starts here; its complete length is unknown",
+                    )
+                    .feature("unknown_value_type"),
+                );
+                out.push(suffix);
+                return Ok(out);
+            }
+        }
         let Some(value) = it.next() else { break };
+        if index == count {
+            match value {
+                Err(error) => {
+                    completed.append(&mut out);
+                    completed.push(Region::new(format!("{path}/trailing_bytes"), Span::new(start, reader.range().end), "bytes after the declared section entry count; not decoded as entries or instructions").feature("invalid_encoding"));
+                    return Err(error);
+                }
+                Ok(_) => unreachable!("section iterator cannot exceed its declared count"),
+            }
+        }
         let region =
             value.and_then(|value| visit(index, Span::new(start, it.original_position()), value));
         match region {
@@ -360,16 +689,35 @@ fn entries<'a, T: FromReader<'a>>(
 
 fn simple_entries<'a, T: FromReader<'a> + std::fmt::Debug>(
     reader: &mut BinaryReader<'a>,
+    section_id: u8,
     path: &str,
     completed: &mut Vec<Region>,
 ) -> wasmparser::Result<Vec<Region>> {
-    entries(reader, path, completed, |index, span, value: T| {
-        Ok(Region::new(
-            format!("{path}/entry[{index}]"),
-            span,
-            format!("{value:?}"),
-        ))
-    })
+    entries(
+        reader,
+        section_id,
+        path,
+        completed,
+        |index, span, value: T| {
+            Ok(Region::new(
+                format!("{path}/entry[{index}]"),
+                span,
+                format!("{value:?}"),
+            ))
+        },
+    )
+}
+
+fn locals_field_error(path: &str, failure: crate::value_guard::FieldFailure) -> Region {
+    Region::new(
+        format!("{path}/opaque/locals_error"),
+        Span::new(failure.span.start, failure.span.end),
+        format!(
+            "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+            failure.field, failure.reason
+        ),
+    )
+    .feature("invalid_encoding")
 }
 
 fn core_section(
@@ -380,12 +728,14 @@ fn core_section(
     imported_functions_known: bool,
 ) -> wasmparser::Result<()> {
     let path = section.path.clone();
+    let source = reader.clone();
     // Parse each frame independently. One unknown core section cannot hide later sections.
     section.regions = match section.id {
         1 => {
             let mut type_index = 0usize;
             entries(
                 &mut reader,
+                section.id,
                 &path,
                 &mut section.regions,
                 |index, span, group: RecGroup| {
@@ -419,6 +769,7 @@ fn core_section(
         }
         2 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, imports: Imports<'_>| {
@@ -435,6 +786,25 @@ fn core_section(
                     }
                 };
                 let mut region = Region::new(format!("{path}/group[{index}]"), span, description);
+                let shared = matches!(&imports, Imports::Compact2 { .. });
+                if let Imports::Compact2 { ty, .. } = &imports {
+                    let mut raw = source.clone();
+                    raw.read_bytes(span.start - raw.original_position())?;
+                    let mut raw =
+                        BinaryReader::new(raw.read_bytes(span.end - span.start)?, span.start);
+                    raw.read_unlimited_string()?;
+                    raw.read_unlimited_string()?;
+                    raw.read_u8()?; // Proven Compact2 discriminator, not a type byte.
+                    let start = raw.original_position();
+                    raw.read::<TypeRef>()?;
+                    region.children.push(Region::new(
+                        format!("{path}/group[{index}]/shared_type"),
+                        Span::new(start, raw.original_position()),
+                        format!(
+                            "shared_type={ty:?}; encoded once for the group's actual name entries"
+                        ),
+                    ));
+                }
                 let imports: Vec<_> = imports.into_iter().collect::<wasmparser::Result<_>>()?;
                 for (i, (start, import)) in imports.iter().enumerate() {
                     let end = imports.get(i + 1).map_or(span.end, |(offset, _)| *offset);
@@ -444,15 +814,20 @@ fn core_section(
                     region.children.push(Region::new(
                         format!("{path}/group[{index}]/import[{i}]"),
                         Span::new(*start, end),
-                        format!("{import:?}"),
+                        if shared {
+                            format!("{import:?}; name entry instantiates {path}/group[{index}]/shared_type")
+                        } else {
+                            format!("{import:?}")
+                        },
                     ));
                 }
                 Ok(region)
             },
         )?,
-        3 => simple_entries::<u32>(&mut reader, &path, &mut section.regions)?,
+        3 => simple_entries::<u32>(&mut reader, section.id, &path, &mut section.regions)?,
         4 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, table: Table<'_>| {
@@ -468,9 +843,10 @@ fn core_section(
                 Ok(region)
             },
         )?,
-        5 => simple_entries::<MemoryType>(&mut reader, &path, &mut section.regions)?,
+        5 => simple_entries::<MemoryType>(&mut reader, section.id, &path, &mut section.regions)?,
         6 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, global: Global<'_>| {
@@ -484,7 +860,7 @@ fn core_section(
                 Ok(region)
             },
         )?,
-        7 => simple_entries::<Export<'_>>(&mut reader, &path, &mut section.regions)?,
+        7 => simple_entries::<Export<'_>>(&mut reader, section.id, &path, &mut section.regions)?,
         8 | 12 => {
             let start = reader.original_position();
             let value = reader.read_var_u32()?;
@@ -502,16 +878,20 @@ fn core_section(
                     reader.original_position(),
                     "section size mismatch: trailing bytes after scalar payload",
                 );
-                regions.push(Region::new(
-                    format!("{path}/undecoded"),
-                    Span::new(reader.original_position(), section.payload_span.end),
-                    "trailing bytes after scalar payload",
-                ));
+                regions.push(
+                    Region::new(
+                        format!("{path}/undecoded"),
+                        Span::new(reader.original_position(), section.payload_span.end),
+                        "trailing bytes after scalar payload",
+                    )
+                    .feature("invalid_encoding"),
+                );
             }
             regions
         }
         9 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, element: Element<'_>| {
@@ -569,6 +949,7 @@ fn core_section(
         )?,
         10 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, body: FunctionBody<'_>| {
@@ -583,8 +964,8 @@ fn core_section(
                         )
                     } else {
                         format!(
-                        "function_index=unknown defined_index={index}; import section is incomplete"
-                    )
+                            "function_index=unknown defined_index={index}; import section is incomplete"
+                        )
                     },
                 );
                 let body_span = body.range();
@@ -601,15 +982,51 @@ fn core_section(
                             locals.get_count().to_string(),
                         ));
                         let mut failed = false;
+                        let mut total_count = 0u32;
                         for i in 0..locals.get_count() {
                             let start = locals.original_position();
+                            let mut raw = body.get_binary_reader();
+                            raw.read_bytes(start - body_span.start)
+                                .expect("local cursor is inside the framed body");
+                            let mut value = raw.clone();
+                            // The locals reader checks the cumulative count
+                            // before reading this group's value type.
+                            if value
+                                .read_var_u32()
+                                .ok()
+                                .and_then(|count| total_count.checked_add(count))
+                                .is_some()
+                                && !crate::decode_error::value_prefix_known(&value)
+                            {
+                                let invalid = crate::decode_error::forbidden_bare_index(&value);
+                                issue(
+                                    diagnostics,
+                                    if invalid { "error" } else { "warning" },
+                                    "locals_decode",
+                                    value.original_position(),
+                                    "untrusted local value-type prefix; no later group or instruction boundaries inferred",
+                                );
+                                region.children.push(Region::new(format!("{entry_path}/opaque"), Span::new(start, body_span.end), if invalid { "a bare positive type index is not a value-type shorthand; remaining locals and body are not decoded" } else { "unknown local value-type prefix; remaining locals and body are not decoded" }).feature(if invalid { "invalid_encoding" } else { "unknown" }));
+                                failed = true;
+                                break;
+                            }
                             match locals.read() {
-                                Ok((count, ty)) => region.children.push(Region::new(
-                                    format!("{entry_path}/local_group[{i}]"),
-                                    Span::new(start, locals.original_position()),
-                                    format!("count={count} type={ty:?}"),
-                                )),
+                                Ok((count, ty)) => {
+                                    total_count += count;
+                                    region.children.push(Region::new(
+                                        format!("{entry_path}/local_group[{i}]"),
+                                        Span::new(start, locals.original_position()),
+                                        format!("count={count} type={ty:?}"),
+                                    ));
+                                }
                                 Err(error) => {
+                                    let failure = crate::value_guard::locals_field_failure(
+                                        &error,
+                                        raw.clone(),
+                                        true,
+                                    );
+                                    let invalid =
+                                        crate::decode_error::locals_failure(&error, raw, true);
                                     issue(
                                         diagnostics,
                                         "error",
@@ -617,11 +1034,17 @@ fn core_section(
                                         error.offset(),
                                         error.to_string(),
                                     );
-                                    region.children.push(Region::new(
+                                    let mut suffix = Region::new(
                                         format!("{entry_path}/opaque"),
                                         Span::new(start, body_span.end),
-                                        "undecoded locals and instructions",
-                                    ));
+                                        format!("{}: {error}; undecoded locals and remaining instructions", invalid.unwrap_or("unrecognized or unclassified locals grammar")),
+                                    ).feature(if invalid.is_some() { "invalid_encoding" } else { "unknown" });
+                                    if let Some(failure) = failure {
+                                        suffix
+                                            .children
+                                            .push(locals_field_error(&entry_path, failure));
+                                    }
+                                    region.children.push(suffix);
                                     failed = true;
                                     break;
                                 }
@@ -638,6 +1061,16 @@ fn core_section(
                         }
                     }
                     Err(error) => {
+                        let failure = crate::value_guard::locals_field_failure(
+                            &error,
+                            body.get_binary_reader(),
+                            false,
+                        );
+                        let invalid = crate::decode_error::locals_failure(
+                            &error,
+                            body.get_binary_reader(),
+                            false,
+                        );
                         issue(
                             diagnostics,
                             "error",
@@ -645,11 +1078,25 @@ fn core_section(
                             error.offset(),
                             error.to_string(),
                         );
-                        region.children.push(Region::new(
+                        let mut suffix = Region::new(
                             format!("{entry_path}/opaque"),
                             Span::new(body_span.start, body_span.end),
-                            "undecoded function body",
-                        ));
+                            format!(
+                                "{}: {error}; undecoded function body",
+                                invalid.unwrap_or("unrecognized or unclassified locals grammar")
+                            ),
+                        )
+                        .feature(if invalid.is_some() {
+                            "invalid_encoding"
+                        } else {
+                            "unknown"
+                        });
+                        if let Some(failure) = failure {
+                            suffix
+                                .children
+                                .push(locals_field_error(&entry_path, failure));
+                        }
+                        region.children.push(suffix);
                     }
                 }
                 Ok(region)
@@ -657,6 +1104,7 @@ fn core_section(
         )?,
         11 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, data: Data<'_>| {
@@ -686,6 +1134,7 @@ fn core_section(
         )?,
         13 => entries(
             &mut reader,
+            section.id,
             &path,
             &mut section.regions,
             |index, span, tag: TagType| {
@@ -697,8 +1146,15 @@ fn core_section(
         )?,
         id => {
             section.status = "opaque".into();
-            issue(diagnostics, "warning", "unknown_section", section.span.start,
-                format!("unknown core section id {id}; payload preserved without interpreting its format"));
+            issue(
+                diagnostics,
+                "warning",
+                "unknown_section",
+                section.span.start,
+                format!(
+                    "unknown core section id {id}; payload preserved without interpreting its format"
+                ),
+            );
             vec![Region::new(
                 format!("{path}/opaque"),
                 section.payload_span,
@@ -707,6 +1163,196 @@ fn core_section(
         }
     };
     Ok(())
+}
+
+/// A failed unframed entry can retain an expression prefix only after its
+/// preceding grammar proved the expression start. Never look for an End byte,
+/// and never reinterpret data/string fields after a successfully read expr.
+fn recover_failed_expression(
+    section: &AuditSection,
+    bytes: &[u8],
+    start: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Region> {
+    if !matches!(section.id, 4 | 6 | 9 | 11) || start >= section.payload_span.end {
+        return None;
+    }
+    let index = section
+        .regions
+        .iter()
+        .filter(|region| region.path.starts_with(&format!("{}/entry[", section.path)))
+        .count();
+    let path = format!("{}/entry[{index}]", section.path);
+    let end = section.payload_span.end;
+    let mut reader = BinaryReader::new(&bytes[start..end], start);
+    let mut completed = Vec::new();
+    let mut first_expr_start = None;
+    fn take_expression<'a>(
+        reader: &mut BinaryReader<'a>,
+        path: String,
+        completed: &mut Vec<(String, ConstExpr<'a>)>,
+        first_expr_start: &mut Option<usize>,
+    ) -> Option<(String, BinaryReader<'a>)> {
+        first_expr_start.get_or_insert(reader.original_position());
+        let before = reader.clone();
+        if crate::decode_error::expression_needs_recovery(before.clone()) {
+            return Some((path, before));
+        }
+        match reader.read::<ConstExpr<'_>>() {
+            Ok(expression) => {
+                completed.push((path, expression));
+                None
+            }
+            Err(_) => Some((path, before)),
+        }
+    }
+    let description;
+    let (failed_path, failed) = match section.id {
+        6 => {
+            if !crate::decode_error::value_prefix_known(&reader) {
+                return None;
+            }
+            let ty = reader.read::<wasmparser::GlobalType>().ok()?;
+            description = format!("{ty:?}");
+            take_expression(
+                &mut reader,
+                format!("{path}/init"),
+                &mut completed,
+                &mut first_expr_start,
+            )?
+        }
+        4 => {
+            if reader.read_u8().ok()? != 0x40 || reader.read_u8().ok()? != 0 {
+                return None;
+            }
+            if !crate::decode_error::value_prefix_known(&reader) {
+                return None;
+            }
+            let ty = reader.read::<wasmparser::TableType>().ok()?;
+            description = format!("{ty:?}");
+            take_expression(
+                &mut reader,
+                format!("{path}/init"),
+                &mut completed,
+                &mut first_expr_start,
+            )?
+        }
+        11 => {
+            let flags = reader.read_var_u32().ok()?;
+            let memory = match flags {
+                0 => 0,
+                2 => reader.read_var_u32().ok()?,
+                _ => return None,
+            };
+            description = format!("active memory={memory}");
+            take_expression(
+                &mut reader,
+                format!("{path}/offset"),
+                &mut completed,
+                &mut first_expr_start,
+            )?
+        }
+        9 => {
+            let flags = reader.read_var_u32().ok()?;
+            if flags > 7 {
+                return None;
+            }
+            description = format!("element flags={flags}");
+            let mut failure = None;
+            if flags & 1 == 0 {
+                if flags & 2 != 0 {
+                    reader.read_var_u32().ok()?;
+                }
+                failure = take_expression(
+                    &mut reader,
+                    format!("{path}/offset"),
+                    &mut completed,
+                    &mut first_expr_start,
+                );
+            }
+            if let Some(failure) = failure {
+                failure
+            } else {
+                if flags & 3 != 0 {
+                    if flags & 4 != 0 {
+                        if !crate::decode_error::value_prefix_known(&reader) {
+                            return None;
+                        }
+                        reader.read::<wasmparser::RefType>().ok()?;
+                    } else {
+                        reader.read::<wasmparser::ExternalKind>().ok()?;
+                    }
+                }
+                if flags & 4 == 0 {
+                    return None;
+                }
+                let count = reader.read_var_u32().ok()?;
+                for item in 0..count {
+                    failure = take_expression(
+                        &mut reader,
+                        format!("{path}/item[{item}]"),
+                        &mut completed,
+                        &mut first_expr_start,
+                    );
+                    if failure.is_some() {
+                        break;
+                    }
+                }
+                failure?
+            }
+        }
+        _ => return None,
+    };
+    // ConstExpr stops at the first End and requires that it closes the root.
+    // The same horizon avoids mistaking following payload bytes for operators
+    // when a malformed constant expression contains nested control constructs.
+    let mut horizon = end;
+    let mut scan = OperatorsReader::new(failed.clone());
+    while !scan.eof() {
+        if crate::decode_error::select_value_prefix(scan.get_binary_reader()).is_some() {
+            break;
+        }
+        match scan.read() {
+            Ok(Operator::End) => {
+                horizon = scan.original_position();
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let mut region = Region::new(&path, Span::new(start, end), format!("{description}; incomplete expression/entry, remaining section has no inferred entry boundaries")).feature("recovered_expression");
+    region.children.push(Region::new(
+        format!("{path}/header"),
+        Span::new(start, first_expr_start?),
+        "entry fields before the first known constant expression",
+    ));
+    for (path, expression_value) in completed {
+        region
+            .children
+            .push(expression(expression_value, &path, diagnostics).feature("recovered_expression"));
+    }
+    let mut failed_region = Region::new(
+        &failed_path,
+        Span::new(failed.original_position(), horizon),
+        "incomplete constant expression",
+    )
+    .feature("recovered_expression");
+    decode_operators(
+        OperatorsReader::new(BinaryReader::new(
+            &bytes[failed.original_position()..horizon],
+            failed.original_position(),
+        )),
+        horizon,
+        &failed_path,
+        &mut failed_region.children,
+        diagnostics,
+    );
+    region.children.push(failed_region);
+    if horizon < end {
+        region.children.push(Region::new(format!("{path}/undecoded"), Span::new(horizon, end), "remaining entry/section bytes after expression failure; no entry or payload boundaries inferred").feature("unknown"));
+    }
+    Some(region)
 }
 
 fn expression(expr: ConstExpr<'_>, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Region {
@@ -738,6 +1384,78 @@ fn operator_feature(op: &Operator<'_>) -> &'static str {
     wasmparser::for_each_operator!(feature)
 }
 
+/// A permissive value-type fallback can make the upstream ConstExpr reader
+/// return an apparent End. A strict unknown prefix cannot lend credibility to
+/// later unframed entries, even when that upstream parse happened to succeed.
+fn withdraw_untrusted_expression_suffix(
+    section: &mut AuditSection,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if !matches!(section.id, 4 | 6 | 9 | 11) {
+        return false;
+    }
+    for index in 0..section.regions.len() {
+        let entry = &mut section.regions[index];
+        let Some((expression_index, opaque_index)) =
+            entry
+                .children
+                .iter()
+                .enumerate()
+                .find_map(|(i, expression)| {
+                    expression
+                        .children
+                        .iter()
+                        .position(|child| {
+                            child.path.ends_with("/opaque")
+                                && child.feature.as_deref() == Some("unknown_value_type")
+                        })
+                        .map(|j| (i, j))
+                })
+        else {
+            continue;
+        };
+        let end = section.payload_span.end;
+        let expression = &mut entry.children[expression_index];
+        expression.children.truncate(opaque_index + 1);
+        let opaque = &mut expression.children[opaque_index];
+        opaque.span.end = end;
+        opaque
+            .description
+            .push_str("; remaining section has no trusted entry boundaries");
+        let offset = opaque.span.start;
+        expression.span.end = end;
+        entry.children.truncate(expression_index + 1);
+        for expression in &mut entry.children {
+            if expression.description == "constant expression" {
+                expression.feature = Some("recovered_expression".into());
+            }
+        }
+        entry.span.end = end;
+        entry.feature = Some("recovered_expression".into());
+        if let Some((prefix, _)) = entry.description.split_once(" element_type=") {
+            entry.description = prefix.into();
+        }
+        entry
+            .description
+            .push_str("; unknown value-type prefix prevents later expression or entry boundaries");
+        section.regions.truncate(index + 1);
+        section.status = "partially_decoded".into();
+        diagnostics.retain(|diagnostic| {
+            diagnostic.offset < offset
+                || (diagnostic.offset == offset && diagnostic.code == "unknown_operator")
+        });
+        issue(
+            diagnostics,
+            "warning",
+            "unknown_expression_suffix",
+            offset,
+            "unknown typed-select value-type prefix; later entries in this section are not decoded",
+        );
+        return true;
+    }
+    false
+}
+
 fn decode_operators(
     mut reader: OperatorsReader<'_>,
     end: usize,
@@ -748,6 +1466,43 @@ fn decode_operators(
     let mut index = 0;
     while !reader.eof() {
         let start = reader.original_position();
+        if reader.current_frame().is_none() {
+            let error = reader
+                .finish()
+                .expect_err("remaining bytes after the terminating End");
+            issue(
+                diagnostics,
+                "error",
+                "expression_structure",
+                start,
+                error.to_string(),
+            );
+            regions.push(
+                Region::new(
+                    format!("{path}/trailing_bytes"),
+                    Span::new(start, end),
+                    "bytes after the expression's terminating End; not decoded as instructions",
+                )
+                .feature("invalid_encoding"),
+            );
+            return;
+        }
+        let raw = reader.get_binary_reader();
+        if let Some(invalid) = crate::decode_error::select_value_prefix(raw.clone()) {
+            issue(
+                diagnostics,
+                if invalid { "error" } else { "warning" },
+                if invalid {
+                    "operator_decode"
+                } else {
+                    "unknown_operator"
+                },
+                start,
+                "untrusted typed-select value prefix; no later instruction boundaries inferred",
+            );
+            regions.push(Region::new(format!("{path}/opaque"), Span::new(start, end), if invalid { "a bare positive type index is not a value-type shorthand; typed select and remaining expression are not decoded" } else { "unknown typed-select value-type prefix; instruction and remaining expression are not decoded" }).feature(if invalid { "invalid_encoding" } else { "unknown_value_type" }));
+            return;
+        }
         match reader.read() {
             Ok(op) => {
                 regions.push(
@@ -762,21 +1517,212 @@ fn decode_operators(
             }
             Err(error) => {
                 let message = error.to_string();
+                let heap_failure = crate::value_guard::heap_operand_failure(&error, raw.clone());
+                let br_table_failure = crate::value_guard::br_table_failure(&error, raw.clone());
+                let try_table_failure = crate::value_guard::try_table_failure(&error, raw.clone());
+                let call_indirect_failure =
+                    crate::value_guard::call_indirect_failure(&error, raw.clone());
+                let memarg_failure = crate::value_guard::memarg_failure(&error, raw.clone());
+                let memory_index_failure =
+                    crate::value_guard::memory_index_failure(&error, raw.clone());
+                let bulk_index_failure =
+                    crate::value_guard::bulk_index_failure(&error, raw.clone());
+                let gc_immediate_failure =
+                    crate::value_guard::gc_immediate_failure(&error, raw.clone());
+                let primary_index_failure =
+                    crate::value_guard::primary_index_failure(&error, raw.clone());
+                let simd_immediate_failure =
+                    crate::value_guard::simd_immediate_failure(&error, raw.clone());
+                let invalid = crate::decode_error::operator_failure(&error, raw);
                 let unknown = message.contains("unknown") || message.contains("illegal opcode");
-                issue(diagnostics, if unknown { "warning" } else { "error" },
-                    if unknown { "unknown_operator" } else { "operator_decode" }, start,
-                    format!("{message}; remaining expression opaque from byte {start}, no resynchronization attempted"));
-                regions.push(
-                    Region::new(
+                issue(
+                    diagnostics,
+                    if unknown { "warning" } else { "error" },
+                    if unknown {
+                        "unknown_operator"
+                    } else {
+                        "operator_decode"
+                    },
+                    start,
+                    format!(
+                        "{message}; remaining expression opaque from byte {start}, no resynchronization attempted"
+                    ),
+                );
+                let mut opaque = Region::new(
                         format!("{path}/opaque"),
                         Span::new(start, end),
-                        "unknown or malformed instruction and remaining expression",
+                        format!("{}: {error}; failed instruction and remaining expression are not decoded; no later instruction boundaries inferred", invalid.unwrap_or("unrecognized or unclassified instruction grammar")),
                     )
-                    .feature("unknown"),
-                );
-                break;
+                    .feature(if invalid.is_some() { "invalid_encoding" } else { "unknown" });
+                if let Some(failure) = heap_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/heap_type_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(crate::value_guard::BrTableFailure { failure, target }) =
+                    br_table_failure
+                {
+                    let field = target.map_or_else(
+                        || failure.field.to_owned(),
+                        |index| format!("branch table target[{index}] depth"),
+                    );
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/br_table_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{field}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(crate::value_guard::TryTableFailure { failure, catch }) =
+                    try_table_failure
+                {
+                    let field = catch.map_or_else(
+                        || failure.field.to_owned(),
+                        |index| format!("try table catch[{index}] {}", failure.field),
+                    );
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/try_table_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{field}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = call_indirect_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/call_indirect_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = memarg_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/memarg_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = memory_index_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/memory_index_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = bulk_index_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/bulk_index_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = gc_immediate_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/gc_immediate_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(failure) = primary_index_failure {
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/primary_index_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.field, failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                if let Some(crate::value_guard::SimdImmediateFailure { failure, lane }) =
+                    simd_immediate_failure
+                {
+                    let field = lane.map_or_else(
+                        || failure.field.to_owned(),
+                        |index| format!("i8x16.shuffle lane[{index}] index"),
+                    );
+                    opaque.children.push(
+                        Region::new(
+                            format!("{path}/opaque/simd_immediate_error"),
+                            Span::new(failure.span.start, failure.span.end),
+                            format!(
+                                "{field}: {}; only this field is diagnosed, remaining bytes stay undecoded",
+                                failure.reason
+                            ),
+                        )
+                        .feature("invalid_encoding"),
+                    );
+                }
+                regions.push(opaque);
+                return;
             }
         }
+    }
+    if let Err(error) = reader.finish() {
+        issue(
+            diagnostics,
+            "error",
+            "expression_structure",
+            reader.original_position(),
+            error.to_string(),
+        );
+        regions.push(
+            Region::new(
+                format!("{path}/expression_structure"),
+                Span::new(reader.original_position(), end),
+                "expression ended before all control frames were closed by End",
+            )
+            .feature("invalid_encoding"),
+        );
     }
 }
 
@@ -860,7 +1806,28 @@ fn custom(
 ) -> wasmparser::Result<()> {
     // The custom section name is part of the core binary grammar, including UTF-8.
     let mut outer = BinaryReader::new(payload, section.payload_span.start);
-    let name = outer.read_unlimited_string()?;
+    let name = match (|| {
+        let mut probe = outer.clone();
+        let length = probe.read_var_u32()? as usize;
+        if length > probe.bytes_remaining() {
+            // The pinned reader adds position + length internally. Check the
+            // bounded payload first so a forged u32 length cannot overflow on
+            // 32-bit hosts. This bounded read preserves its public EOF message
+            // and count-end offset without using the forged length again.
+            probe.read_bytes(probe.bytes_remaining() + 1)?;
+        }
+        outer.read_unlimited_string()
+    })() {
+        Ok(name) => name,
+        Err(error) => {
+            section.regions.push(Region::new(
+                format!("{}/outer_name", section.path),
+                section.payload_span,
+                "invalid Core custom-section name encoding; custom payload convention was not examined",
+            ).feature("invalid_encoding"));
+            return Err(error);
+        }
+    };
     let data_start = outer.original_position();
     section.kind = format!("custom:{name}");
     section.regions.push(Region::new(
@@ -868,7 +1835,13 @@ fn custom(
         Span::new(section.payload_span.start, data_start),
         name,
     ));
-    let path = format!("{}/{}", section.path, name);
+    // Logical selectors must remain bounded and representable in an OS argv.
+    // Arbitrary custom names may contain NUL or exceed argument-size limits.
+    let path = if matches!(name, "name" | "producers" | "target_features") {
+        format!("{}/{}", section.path, name)
+    } else {
+        format!("{}/payload", section.path)
+    };
     let mut reader = ConventionReader::new(
         &payload[data_start - section.payload_span.start..],
         data_start,
@@ -894,8 +1867,15 @@ fn custom(
         Ok(regions) => section.regions.extend(regions),
         Err(message) => {
             section.status = "opaque".into();
-            issue(diagnostics, "note", "custom_opaque", data_start,
-                format!("custom {name:?} does not satisfy the recognized fixed convention: {message}; treated as opaque data"));
+            issue(
+                diagnostics,
+                "note",
+                "custom_opaque",
+                data_start,
+                format!(
+                    "custom {name:?} does not satisfy the recognized fixed convention: {message}; treated as opaque data"
+                ),
+            );
             section.regions.push(Region::new(
                 format!("{path}/opaque"),
                 Span::new(data_start, section.payload_span.end),
@@ -1008,7 +1988,7 @@ fn producers_convention(
             format!("field={field} values={values}"),
         );
         let mut names = BTreeSet::new();
-        for _ in 0..values {
+        for index in 0..values {
             let start = reader.position();
             let name = reader.string()?;
             let version = reader.string()?;
@@ -1016,7 +1996,7 @@ fn producers_convention(
                 return Err("repeated producer name".into());
             }
             region.children.push(Region::new(
-                format!("{path}/{field}/{name}"),
+                format!("{path}/{field}/value[{index}]"),
                 Span::new(start, reader.position()),
                 format!("name={name:?} version={version:?}"),
             ));
@@ -1606,8 +2586,17 @@ fn byte_spans(old: &[u8], new: &[u8]) -> (Vec<(Span, Span)>, bool) {
 /// Compare original physical bytes and add decoded evidence at both locations.
 /// Raw edits are authoritative, including encoding-only and opaque-byte changes.
 pub fn compare(old: &[u8], new: &[u8]) -> Result<AuditDiff, String> {
-    let old_module = inspect(old)?;
-    let new_module = inspect(new)?;
+    compare_with_standard(old, new, Standard::AllKnown)
+}
+
+/// Standard selection changes compatibility evidence, never physical edits.
+pub fn compare_with_standard(
+    old: &[u8],
+    new: &[u8],
+    standard: Standard,
+) -> Result<AuditDiff, String> {
+    let old_module = inspect_with_standard(old, standard)?;
+    let new_module = inspect_with_standard(new, standard)?;
     let (spans, exact_minimal) = byte_spans(old, new);
     let old_context = ContextIndex::new(&old_module);
     let new_context = ContextIndex::new(&new_module);
@@ -1664,19 +2653,26 @@ impl AuditModule {
     pub fn to_text(&self) -> String {
         fn regions(out: &mut String, entries: &[Region], depth: usize) {
             for region in entries {
+                let description = if region.standard_support.display == "binary" {
+                    binary_description(&region.standard_support.status)
+                } else {
+                    &region.description
+                };
                 let _ = writeln!(
                     out,
-                    "{}{} [{}..{}) {}{}",
+                    "{}{} [{}..{}) {}{} standard_support={} display={}",
                     "  ".repeat(depth),
                     region.path.escape_debug(),
                     region.span.start,
                     region.span.end,
-                    region.description.escape_debug(),
+                    description.escape_debug(),
                     region
                         .feature
                         .as_ref()
                         .map(|f| format!(" feature={f}"))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    region.standard_support.status,
+                    region.standard_support.display,
                 );
                 regions(out, &region.children, depth + 1);
             }
@@ -1688,7 +2684,7 @@ impl AuditModule {
         for section in &self.sections {
             let _ = writeln!(
                 out,
-                "{} {} [{}..{}) header=[{}..{}) payload=[{}..{}) status={}",
+                "{} {} [{}..{}) header=[{}..{}) payload=[{}..{}) status={} standard_support={}",
                 section.path,
                 section.kind.escape_debug(),
                 section.span.start,
@@ -1697,10 +2693,12 @@ impl AuditModule {
                 section.header_span.end,
                 section.payload_span.start,
                 section.payload_span.end,
-                section.status
+                section.status,
+                section.standard_support.status,
             );
             regions(&mut out, &section.regions, 1);
         }
+        standard_text(&mut out, "", &self.standard);
         for diagnostic in &self.diagnostics {
             let _ = writeln!(
                 out,
@@ -1717,6 +2715,30 @@ impl AuditModule {
 
 impl AuditDiff {
     pub fn to_text(&self) -> String {
+        fn binary_paths(module: &AuditModule) -> BTreeMap<&str, &str> {
+            let mut flattened = BTreeMap::new();
+            for section in &module.sections {
+                flatten(&section.regions, &mut flattened);
+            }
+            flattened
+                .into_values()
+                .filter_map(|region| {
+                    (region.standard_support.display == "binary").then_some((
+                        region.path.as_str(),
+                        region.standard_support.status.as_str(),
+                    ))
+                })
+                .collect()
+        }
+        let old_binary = binary_paths(&self.old);
+        let new_binary = binary_paths(&self.new);
+        let description = |context: &Context, paths: &BTreeMap<&str, &str>| {
+            if let Some(status) = paths.get(context.path.as_str()) {
+                binary_description(status).to_owned()
+            } else {
+                context.description.clone()
+            }
+        };
         let mut out = format!(
             "{}; {} byte edits; exact_minimal={}\n{}\nold validation={}; new validation={}\n",
             if self.changed { "changed" } else { "identical" },
@@ -1726,6 +2748,8 @@ impl AuditDiff {
             self.old.validation,
             self.new.validation
         );
+        standard_text(&mut out, "old ", &self.old.standard);
+        standard_text(&mut out, "new ", &self.new.standard);
         for edit in &self.edits {
             let _ = writeln!(
                 out,
@@ -1737,7 +2761,10 @@ impl AuditDiff {
                 edit.new_span.end,
                 edit.new_hex
             );
-            for (side, contexts) in [("old", &edit.old_context), ("new", &edit.new_context)] {
+            for (side, contexts, binary) in [
+                ("old", &edit.old_context, &old_binary),
+                ("new", &edit.new_context, &new_binary),
+            ] {
                 for context in contexts {
                     let _ = writeln!(
                         out,
@@ -1745,7 +2772,7 @@ impl AuditDiff {
                         context.path.escape_debug(),
                         context.span.start,
                         context.span.end,
-                        context.description.escape_debug()
+                        description(context, binary).escape_debug()
                     );
                 }
             }
@@ -1755,8 +2782,8 @@ impl AuditDiff {
                 out,
                 "decoded {}: {:?} -> {:?}",
                 change.path.escape_debug(),
-                change.old.as_ref().map(|c| c.description.as_str()),
-                change.new.as_ref().map(|c| c.description.as_str())
+                change.old.as_ref().map(|c| description(c, &old_binary)),
+                change.new.as_ref().map(|c| description(c, &new_binary))
             );
         }
         for (side, module) in [("old", &self.old), ("new", &self.new)] {
@@ -1772,6 +2799,93 @@ impl AuditDiff {
             }
         }
         out
+    }
+}
+
+fn binary_description(status: &str) -> &'static str {
+    match status {
+        "invalid_encoding" => "binary (invalid encoding in every standard, including all-known)",
+        "invalid_semantics" => {
+            "binary (invalid semantics for the selected standard; see standard evidence)"
+        }
+        "recognized_but_disabled" => {
+            "binary (recognized grammar is disabled by the selected standard)"
+        }
+        "unknown" => "binary (unknown requirements or index context; see standard evidence)",
+        _ => "binary (see standard evidence)",
+    }
+}
+
+fn standard_text(out: &mut String, side: &str, standard: &StandardReport) {
+    let _ = writeln!(
+        out,
+        "{side}standard={} compatibility={} validator_valid={} validator_input={}; all-known recognition is separate from standard validity",
+        standard.selected_standard, standard.validation, standard.validator_valid, standard.validator_input.kind
+    );
+    for projection in &standard.validator_input.projections {
+        let _ = writeln!(
+            out,
+            "{side}validator custom-name projection {} name=[{}..{}) byte=[{}..{}) {}->{}; temporary reader input only, original audit bytes retained",
+            projection.path, projection.name_span.start, projection.name_span.end,
+            projection.byte_span.start, projection.byte_span.end,
+            projection.original_hex, projection.projected_hex
+        );
+    }
+    let opaque_paths: BTreeSet<_> = standard
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.status == "unknown" && evidence.kind == "opaque")
+        .map(|evidence| evidence.path.as_str())
+        .collect();
+    for evidence in &standard.evidence {
+        // A wholly decoded region already explains its supported grammar.
+        // An opaque declaration still needs its independently proved prefix
+        // fields in text, including names and supported wire features.
+        if evidence.status == "supported" && !opaque_paths.contains(evidence.path.as_str()) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "{side}{} {} [{}..{}) binary={} feature={} recognized={:?}: {}",
+            evidence.status,
+            evidence.path.escape_debug(),
+            evidence.span.start,
+            evidence.span.end,
+            evidence.raw_hex,
+            evidence.feature,
+            evidence
+                .recognized
+                .as_ref()
+                .map(|name| name.escape_debug().to_string()),
+            evidence.reason.escape_debug()
+        );
+    }
+    if let Some(error) = &standard.validator_error {
+        let _ = writeln!(
+            out,
+            "{side}standard validator first error @{}: {}",
+            error.offset,
+            error.message.escape_debug()
+        );
+        let _ = writeln!(
+            out,
+            "{side}validator raw context [{}..{}) binary={} offset_in_module={} offset_is_eof={}; locations are cursor context, not causal attribution",
+            error.byte_context.span.start,
+            error.byte_context.span.end,
+            error.byte_context.raw_hex,
+            error.byte_context.offset_in_module,
+            error.byte_context.offset_is_eof
+        );
+        for location in &error.locations {
+            let _ = writeln!(
+                out,
+                "{side}validator location {} [{}..{}) relation={}",
+                location.path.escape_debug(),
+                location.span.start,
+                location.span.end,
+                location.relation
+            );
+        }
     }
 }
 
@@ -2173,10 +3287,11 @@ mod tests {
         assert!(diff.semantic_changes.iter().any(|change| {
             change.path == "type[0]/type[0]" && change.old.is_some() && change.new.is_some()
         }));
-        assert!(diff.edits.iter().any(|edit| edit
-            .old_context
-            .iter()
-            .any(|context| context.path == "type[0]/type[0]")));
+        assert!(diff.edits.iter().any(|edit| {
+            edit.old_context
+                .iter()
+                .any(|context| context.path == "type[0]/type[0]")
+        }));
     }
     #[test]
     fn a_bad_import_preserves_the_prefix_without_guessing_function_indices() {
@@ -2211,11 +3326,29 @@ mod tests {
     }
     #[test]
     fn undecoded_suffix_includes_failed_leb_bytes_and_trailing_payload() {
-        let parsed = inspect(&module(&[8, 1, 0x80, 7, 2, 0, 0xff])).unwrap();
+        let bytes = module(&[8, 1, 0x80, 7, 2, 0, 0xff]);
+        let parsed = inspect(&bytes).unwrap();
         let regions = all_regions(&parsed);
         assert_eq!(regions["start[0]/undecoded"].span, Span::new(10, 11));
+        assert_eq!(&bytes[10..11], &[0x80]);
         assert_eq!(regions["export[0]/count"].span, Span::new(13, 14));
-        assert_eq!(regions["export[0]/undecoded"].span, Span::new(14, 15));
+        let trailing = regions["export[0]/trailing_bytes"];
+        assert_eq!(trailing.span, Span::new(14, 15));
+        assert_eq!(&bytes[trailing.span.start..trailing.span.end], &[0xff]);
+        assert_eq!(trailing.standard_support.status, "invalid_encoding");
+        assert_eq!(trailing.standard_support.display, "binary");
+        assert!(parsed
+            .standard
+            .evidence
+            .iter()
+            .any(|entry| entry.path == trailing.path
+                && entry.raw_hex == "ff"
+                && entry.status == "invalid_encoding"));
+        assert!(!regions.keys().any(|path| path.contains("/operator[")));
+        assert!(!parsed
+            .diagnostics
+            .iter()
+            .any(|entry| entry.code == "unknown_operator"));
     }
     #[test]
     fn text_reports_escape_control_characters_from_custom_names() {
@@ -2286,6 +3419,7 @@ mod tests {
             format: "test".into(),
             validation: "test".into(),
             diagnostics: Vec::new(),
+            standard: StandardReport::pending(Standard::AllKnown),
             sections: vec![AuditSection {
                 ordinal: 0,
                 id: 10,
@@ -2296,6 +3430,7 @@ mod tests {
                 payload_span: Span::new(10, end),
                 status: "decoded".into(),
                 regions: vec![function],
+                standard_support: StandardSupport::default(),
             }],
         };
         let index = ContextIndex::new(&parsed);

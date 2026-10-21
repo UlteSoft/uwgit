@@ -9,6 +9,7 @@ test lane. Every subprocess has complete logs and an explicit timeout.
 import argparse
 from collections import Counter
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,18 +23,26 @@ import time
 import traceback
 
 
-HEADERS = (
-    "sdk/common/abi.h",
-    "sdk/ros1/abi.h",
-    "sdk/ros1/freestanding.hpp",
-    "sdk/ros2/abi.h",
-    "sdk/ros2/freestanding.hpp",
-)
 SOURCES = tuple(
     f"examples/{backend}/{name}"
     for backend in ("ros1", "ros2")
     for name in ("talker.c", "listener.c", "talker.cpp")
 )
+
+
+def selected_headers(reference):
+    source = Path(__file__).with_name("uwvm-examples-inputs.py")
+    spec = importlib.util.spec_from_file_location("uwgit_product_inputs", source)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load input SDK selection helper")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module.select_sdk_files(reference)
 
 
 def sha256(path):
@@ -57,8 +66,11 @@ def require_tmp(path):
     return resolved
 
 
-def inventory(reference):
-    paths = {reference / name for name in HEADERS + SOURCES}
+def inventory(reference, headers=None):
+    selected = selected_headers(reference)
+    if headers is not None and selected != headers:
+        raise ValueError("selected SDK layout changed during product verification")
+    paths = {reference / name for name in selected + SOURCES}
     examples = reference / "examples"
     if not examples.is_dir():
         raise ValueError(f"reference root must contain examples/: {reference}")
@@ -70,6 +82,13 @@ def inventory(reference):
     }
 
 
+def expected_swap_max():
+    value = os.environ.get("UWGIT_EXPECTED_CGROUP_SWAP_MAX", "0")
+    if re.fullmatch(r"max|0|[1-9][0-9]*", value) is None:
+        raise ValueError("UWGIT_EXPECTED_CGROUP_SWAP_MAX must be max or canonical nonnegative decimal")
+    return value
+
+
 def linux_admission():
     if platform.system() != "Linux":
         raise ValueError("this harness must run on SSH Linux inside the existing cgroup")
@@ -78,19 +97,25 @@ def linux_admission():
     if len(paths) != 1 or not re.fullmatch(r"/system\.slice/docker-[0-9a-f]+\.scope", paths[0]):
         raise ValueError(f"expected the existing docker cgroup, got {text!r}")
     group = Path("/sys/fs/cgroup") / paths[0].lstrip("/")
-    if (group / "memory.max").read_text().strip() != "68719476736":
-        raise ValueError("existing cgroup must have the established 64 GiB memory limit")
-    if (group / "memory.swap.max").read_text().strip() != "0":
-        raise ValueError("existing cgroup must have swap disabled")
+    swap_max = expected_swap_max()
+    expected_limits = {"memory.max": "68719476736", "memory.swap.max": swap_max, "cpuset.cpus.effective": "0-31"}
+    limits = {field: (group / field).read_text().strip() for field in expected_limits}
+    if limits != expected_limits:
+        raise ValueError("existing cgroup limits must match 64 GiB, CPUs 0-31 and the explicit swap expectation")
     if str(os.getpid()) not in (group / "cgroup.procs").read_text().splitlines():
         raise ValueError("harness PID is absent from its reported existing cgroup")
     return {
         "cgroup": text,
         "cgroup_path": str(group),
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-        "memory_max": (group / "memory.max").read_text().strip(),
-        "memory_swap_max": (group / "memory.swap.max").read_text().strip(),
+        "memory_max": limits["memory.max"],
+        "memory_swap_max": limits["memory.swap.max"],
+        "expected_cgroup_swap_max": swap_max,
+        "cpuset_cpus_effective": limits["cpuset.cpus.effective"],
+        "limits_before": limits,
+        "swap_current_before": (group / "memory.swap.current").read_text().strip(),
         "memory_events_before": (group / "memory.events").read_text(),
+        "resource_scope": "Existing shared cgroup; nonfatal memory.max events may reflect other load. Other tasks are not isolated.",
     }
 
 
@@ -98,6 +123,7 @@ class Harness:
     def __init__(self, args):
         self.args = args
         self.reference = args.reference.resolve(strict=True)
+        self.headers = selected_headers(self.reference)
         self.build = require_tmp(args.build_root)
         self.evidence = require_tmp(args.evidence)
         if self.build.is_relative_to(self.reference) or self.evidence.is_relative_to(self.reference):
@@ -111,6 +137,7 @@ class Harness:
             "scope": "real staged ROS C/C++ compilation, independent WABT and UWVM validation, physical diff and patch replay; no guest execution or native ROS delivery",
             "guest_execution_tested": False,
             "native_ros_delivery_tested": False,
+            "command_log_storage": "shared_sha256_payloads_v1",
             "reference": str(self.reference),
             "build_root": str(self.build),
             "commands": [],
@@ -127,17 +154,26 @@ class Harness:
     def fail(self, stage, message, **details):
         self.report["failures"].append({"stage": stage, "message": str(message), **details})
 
+    def stream_record(self, data):
+        # Successful validators usually emit two empty streams. Store identical
+        # bytes once while retaining a separate stream receipt for every command.
+        expected = hashlib.sha256(data).hexdigest()
+        path = self.logs / f"{expected}.log"
+        if not path.exists():
+            path.write_bytes(data)
+        record = file_record(path)
+        if record["sha256"] != expected or record["byte_len"] != len(data):
+            raise ValueError("shared command log content differs from its receipt")
+        return record
+
     def command(self, label, argv, *, timeout=30, inputs=(), outputs=()):
         index = len(self.report["commands"])
-        stem = f"{index:05d}-{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}"
-        stdout_path = self.logs / f"{stem}.stdout"
-        stderr_path = self.logs / f"{stem}.stderr"
         record = {
             "index": index, "label": label, "argv": [str(value) for value in argv],
             "cwd": str(self.build), "timeout_seconds": timeout,
             "inputs": [file_record(Path(path)) for path in inputs],
             "outputs": [], "returncode": None, "timed_out": False,
-            "stdout": str(stdout_path), "stderr": str(stderr_path),
+            "stdout": None, "stderr": None,
         }
         self.report["commands"].append(record)
         started = time.monotonic()
@@ -171,10 +207,10 @@ class Harness:
             raise
         finally:
             record["elapsed_seconds"] = time.monotonic() - started
-            stdout_path.write_bytes(stdout)
-            stderr_path.write_bytes(stderr)
-            record["stdout_record"] = file_record(stdout_path)
-            record["stderr_record"] = file_record(stderr_path)
+            for stream, data in (("stdout", stdout), ("stderr", stderr)):
+                receipt = self.stream_record(data)
+                record[stream] = receipt["path"]
+                record[stream + "_record"] = receipt
             for path in outputs:
                 path = Path(path)
                 record["outputs"].append(file_record(path) if path.is_file() else {"path": str(path), "missing": True})
@@ -217,7 +253,7 @@ class Harness:
 
     def copy_sources(self, destination):
         destination.mkdir(exist_ok=False)
-        for name in HEADERS + SOURCES:
+        for name in self.headers + SOURCES:
             source = self.reference / name
             file_record(source)
             target = destination / name
@@ -236,7 +272,7 @@ class Harness:
         argv += ["-MD", "-MF", str(dependency), "-Wl,--no-entry", "-Wl,--export=_start",
                  "-Wl,--export-memory", "-Wl,--allow-undefined", str(source), "-o", str(output)]
         copied_root = source.parents[2]
-        inputs = [source, *(copied_root / name for name in HEADERS)]
+        inputs = [source, *(copied_root / name for name in self.headers)]
         record = self.command(f"compile-{label}", argv, timeout=60, inputs=inputs, outputs=[output, dependency])
         self.report["compilations"].append({"source": file_record(source), "output": str(output), "command": record["index"], "success": self.succeeded(record)})
         if not self.succeeded(record):
@@ -394,9 +430,38 @@ class Harness:
                 except Exception as error:
                     self.fail("external_product", error, path=str(path), category=category)
 
+    def check_environment(self):
+        environment = self.report["environment"]
+        environment["resource_integrity_preserved"] = False
+        try:
+            group = Path(environment["cgroup_path"])
+            environment["cgroup_after"] = Path("/proc/self/cgroup").read_text()
+            environment["boot_id_after"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            environment["limits_after"] = {field: (group / field).read_text().strip() for field in environment["limits_before"]}
+            environment["swap_current_after"] = (group / "memory.swap.current").read_text().strip()
+            environment["pid_in_admitted_cgroup_after"] = str(os.getpid()) in (group / "cgroup.procs").read_text().splitlines()
+            environment["memory_events_after"] = (group / "memory.events").read_text()
+            before = {key: int(value) for key, value in (line.split() for line in environment["memory_events_before"].splitlines())}
+            after = {key: int(value) for key, value in (line.split() for line in environment["memory_events_after"].splitlines())}
+            environment["memory_event_deltas"] = {key: after.get(key, 0) - before.get(key, 0) for key in sorted(before.keys() | after.keys())}
+            environment["oom_counters_preserved"] = all(key in before and key in after and before[key] == after[key] for key in ("oom", "oom_kill", "oom_group_kill"))
+            environment["resource_integrity_preserved"] = (
+                environment["cgroup_after"] == environment["cgroup"]
+                and environment["boot_id_after"] == environment["boot_id"]
+                and environment["limits_after"] == environment["limits_before"]
+                and environment["limits_after"]["memory.swap.max"] == environment["expected_cgroup_swap_max"]
+                and environment["pid_in_admitted_cgroup_after"]
+                and environment["oom_counters_preserved"]
+            )
+            if not environment["resource_integrity_preserved"]:
+                self.fail("resource_integrity", "cgroup membership, boot, explicit limits or OOM counters changed")
+        except Exception as error:
+            environment["resource_integrity_error"] = repr(error)
+            self.fail("resource_integrity", error)
+
     def run(self):
         self.report["environment"] = linux_admission()
-        self.report["reference_before"] = inventory(self.reference)
+        self.report["reference_before"] = inventory(self.reference, self.headers)
         try:
             self.prepare_tools()
             compiled, disassemblies = self.compile_examples()
@@ -406,12 +471,13 @@ class Harness:
                 self.fail("threshold_variant", error)
             self.validate_external_products()
         finally:
-            self.report["reference_after"] = inventory(self.reference)
-            self.report["reference_unchanged"] = self.report["reference_before"] == self.report["reference_after"]
-            if not self.report["reference_unchanged"]:
-                self.fail("reference_integrity", "reference example/SDK inventory changed during verification")
-            group = Path(self.report["environment"]["cgroup_path"])
-            self.report["environment"]["memory_events_after"] = (group / "memory.events").read_text()
+            try:
+                self.report["reference_after"] = inventory(self.reference, self.headers)
+                self.report["reference_unchanged"] = self.report["reference_before"] == self.report["reference_after"]
+                if not self.report["reference_unchanged"]:
+                    self.fail("reference_integrity", "reference example/SDK inventory changed during verification")
+            finally:
+                self.check_environment()
 
 
 def main():

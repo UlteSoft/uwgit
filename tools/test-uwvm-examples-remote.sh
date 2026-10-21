@@ -3,6 +3,20 @@
 set -euo pipefail
 root=$1
 incoming=$2
+skip_fuzz=${3:-0}
+[[ $skip_fuzz == 0 || $skip_fuzz == 1 ]] || exit 2
+if [[ $# -ge 4 ]]; then
+    corpus_mode=$4
+elif [[ ${UWGIT_CORPUS_MODE+x} ]]; then
+    corpus_mode=$UWGIT_CORPUS_MODE
+elif [[ $skip_fuzz == 1 ]]; then
+    corpus_mode=originals-only
+else
+    corpus_mode=fixed-mutations
+fi
+[[ $corpus_mode == originals-only || $corpus_mode == fixed-mutations ]] || exit 2
+[[ $skip_fuzz != 1 || $corpus_mode == originals-only ]] || exit 2
+export UWGIT_CORPUS_MODE="$corpus_mode"
 cg_path=$(awk -F: '$1 == "0" && $2 == "" {print $3}' /proc/self/cgroup)
 cg="/sys/fs/cgroup$cg_path"
 [[ $(uname -s) == Linux && $cg_path == /system.slice/docker-*.scope ]]
@@ -10,18 +24,22 @@ cg="/sys/fs/cgroup$cg_path"
 grep -Fxq "$$" "$cg/cgroup.procs"
 umask 077
 run="$root/uwvm-examples-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-mkdir -p "$run/reference" "$run/build" "$run/evidence" "$run/bin" "$run/workflow" "$run/tmp" "$root/source"
+mkdir -p "$run/reference" "$run/build" "$run/evidence" "$run/bin" "$run/workflow" "$run/tmp" "$run/source"
 tar -xf "$incoming-reference.tar" -C "$run/reference"
 cp "$incoming-inputs.json" "$run/evidence/inputs.json"
-tar -xf "$incoming-source.tar" -C "$root/source"
+tar -xf "$incoming-source.tar" -C "$run/source"
 rm "$incoming-reference.tar" "$incoming-inputs.json" "$incoming-source.tar"
 export CARGO_HOME="$root/toolchain/cargo" RUSTUP_HOME="$root/toolchain/rustup"
-export CARGO_TARGET_DIR="$root/target" CARGO_BUILD_JOBS=2
+export CARGO_TARGET_DIR="$run/target" CARGO_BUILD_JOBS=2
+export CARGO_INCREMENTAL=0
 export PATH="$root/bin:$CARGO_HOME/bin:$PATH"
 export TMPDIR="$run/tmp"
 [[ -x $CARGO_HOME/bin/cargo && -x $root/bin/wasm-ld && -x /usr/lib/llvm-22/bin/clang ]]
-cd "$root/source"
-sha256sum Cargo.toml Cargo.lock src/*.rs tests/*.rs tests/fixtures/*.wasm tests/fixtures/c/*.c tools/* > "$run/evidence/source.sha256"
+cd "$run/source"
+source tools/regular-test-targets.sh
+sha256sum Cargo.toml Cargo.lock src/*.rs tests/*.rs tests/fixtures/*.wasm tests/fixtures/c/*.c tools/* \
+    fuzz/Cargo.toml fuzz/Cargo.lock fuzz/generate_seeds.rs fuzz/fuzz_targets/*.rs > "$run/evidence/source.sha256"
+find vendor -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >> "$run/evidence/source.sha256"
 {
     cat /proc/sys/kernel/random/boot_id /proc/self/cgroup
     cat "$cg/memory.max" "$cg/memory.swap.max" "$cg/memory.current" "$cg/cpuset.cpus.effective"
@@ -69,7 +87,7 @@ cargo fmt --check > "$run/evidence/fmt.log" 2>&1
 fmt_status=$?
 cargo clippy --locked --all-targets -- -D warnings > "$run/evidence/clippy.log" 2>&1
 clippy_status=$?
-cargo test --locked -- --nocapture > "$run/evidence/tests.log" 2>&1
+cargo test --locked "${regular_targets[@]}" -- "${regular_filters[@]}" --nocapture > "$run/evidence/tests.log" 2>&1
 regular_status=$?
 corpus_status=1
 workflow_status=1
@@ -81,7 +99,7 @@ if [[ $fmt_status == 0 && $clippy_status == 0 && $regular_status == 0 ]]; then
     workflow_status=$?
     if [[ $corpus_status == 0 ]]; then
         python3 tools/verify-uwvm-example-products.py --reference "$run/reference" --build-root "$run/build" \
-            --evidence "$run/evidence/products" --uwgit "$root/target/debug/wasm-git" \
+            --evidence "$run/evidence/products" --uwgit "$CARGO_TARGET_DIR/debug/wasm-git" \
             --uwvm "$run/bin/uwvm" --cc "$root/bin/clang-wasm" > "$run/evidence/products.log" 2>&1
         products_status=$?
     fi
@@ -99,8 +117,8 @@ verification_status=$?
 set -e
 cp "$cg/memory.events" "$run/evidence/memory.events.after"
 cat "$cg/memory.current" > "$run/evidence/memory.current.after"
-printf '{"fmt":%s,"clippy":%s,"regular":%s,"corpus":%s,"workflows":%s,"products":%s,"inputs":%s,"runtime":%s,"libraries":%s,"tools":%s,"verification":%s}\n' \
-    "$fmt_status" "$clippy_status" "$regular_status" "$corpus_status" "$workflow_status" "$products_status" "$inputs_status" "$runtime_status" "$libraries_status" "$tools_status" "$verification_status" > "$run/evidence/status.json"
+printf '{"fmt":%s,"clippy":%s,"regular":%s,"corpus":%s,"workflows":%s,"products":%s,"inputs":%s,"runtime":%s,"libraries":%s,"tools":%s,"verification":%s,"corpus_mode":"%s"}\n' \
+    "$fmt_status" "$clippy_status" "$regular_status" "$corpus_status" "$workflow_status" "$products_status" "$inputs_status" "$runtime_status" "$libraries_status" "$tools_status" "$verification_status" "$corpus_mode" > "$run/evidence/status.json"
 printf '%s\n' "$run" > "$root/uwvm-examples-latest.txt"
 cat "$run/evidence/status.json"
 printf 'Evidence: %s\n' "$run/evidence"
