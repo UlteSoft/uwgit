@@ -37,11 +37,30 @@ abort NUL
 
 每条记录/字段最多 8192 字节，每个事务最多 4096 个引用；持久记录最多 64 MiB。`--no-deref` 及逐条 `option no-deref` 适用于这里的直接引用；不将文件系统符号链接解释成引用。`--create-reflog` 可用，原生模型本来就为所有实际引用变更记录日志。同值 update 和 verify 不追加日志。
 
-准备时同时检查所有旧值、目标 commit 类型及完整对象图、引用名称和最终文件/目录前缀冲突、当前及其他已注册 worktree 的分支占用。任意一项不成立时，整批都不发布。删除 `topic` 并创建 `topic/child`，或相反，可以在同一事务完成；删除的分支同时清理其 upstream 关联。
+默认在准备时同时检查所有旧值、目标 commit 类型及完整对象图、引用名称和最终文件/目录前缀冲突、当前及其他已注册 worktree 的分支占用。任意一项不成立时，整批都不发布。删除 `topic` 并创建 `topic/child`，或相反，可以在同一事务完成；删除的分支同时清理其 upstream 关联。
+
+## 逐项拒绝模式
+
+`--stdin --batch-updates`（或 `--stdin -0`）将可解析请求中的语义失败逐项拒绝，其余项继续作为一笔原生事务发布。`--no-batch-updates` 恢复默认整批检查；两种开关同时出现时，以后一个为准。
+
+```sh
+wasm-git update-ref DIR --stdin --batch-updates <<EOF
+create refs/tags/reviewed EXISTING_COMMIT_ID
+update refs/heads/topic NEW_ID STALE_OLD_ID
+EOF
+```
+
+在 topic 的旧值不匹配时，reviewed 标签仍可创建；对应拒绝记录使用 `rejected REF NEW OLD REASON` 的逐行文本，未提供的值写为 64 个零。NEW/OLD 是同快照解析后的真实对象 ID，拒绝行按完整引用名排序，`-z` 仍输出换行文本。省略 OLD 的 verify 仍要求不存在，不会变成任意值校验。拒绝项没有引用、upstream 或 reflog 写入；同值 update 与 verify 成功项也不追加日志。全部项被拒绝时，处理仍成功退出且不发布事务记录或日志。
+
+可逐项拒绝的情形包括旧值不匹配、要求不存在但已存在、要求旧提交却不存在、完整 ID 指向缺失或非 commit 对象、最终名称前缀冲突，以及 uwgit 的已检出分支保护。已有引用保持其可接受的更新；两个互相冲突的新引用同时拒绝，不依赖输入先后。先过滤失败的删除条件，再检查名称结构；被拒绝的删除不能为另一项创建腾出名称。
+
+错误字段数、重复引用、非法名称、未知修订表达式、create 的零 NEW、delete 的显式零 OLD、不完整 NUL/文本记录、未知命令与选项仍是整批错误。无法读取或损坏的对象、日志、worktree 注册等元数据，以及锁或 I/O 错误也不会变成逐项拒绝。所有准备检查完成后才写入持久决定；提交后的 I/O 失败沿用下述恢复规则，不能解释为已经回滚。
+
+prepare 保存接受项及其拒绝结果，并持有共享锁，不输出拒绝行；只有 commit 完成后才输出拒绝行，随后输出 `commit: ok`。abort 或未提交的 EOF 丢弃整笔事务，包括未发布的拒绝结果。隐式 EOF 提交则在完成后输出拒绝行。后续新的 start 独立处理下一笔事务。
 
 ## 锁、提交和恢复
 
-没有 start 的输入在 EOF 隐式提交；显式 start 后必须 commit，否则 EOF 丢弃当前事务。prepare 验证快照后持有共享 writer 锁，响应 `prepare: ok` 后不会提前发布。abort 或 EOF 释放这个锁，不写入持久提交决定。commit/abort 后可用新的 start 开始下一笔事务；已经提交的前一笔不因后来一笔失败而撤销。各控制响应立即 flush，可用于交互管道。
+没有 start 或 prepare 的输入在 EOF 隐式提交；使用 start 或 prepare 后必须 commit，否则 EOF 丢弃当前事务。start 也可将此前已排队的更新纳入显式事务。prepare 验证快照后持有共享 writer 锁，响应 `prepare: ok` 后不会提前发布。abort 或 EOF 释放这个锁，不写入持久提交决定。commit/abort 后可用新的 start 开始下一笔事务；已经提交的前一笔不因后来一笔失败而撤销。各控制响应立即 flush，可用于交互管道。
 
 commit 先同步 `.uwgit/ref-transaction.json`，保存完整引用前像、逐项旧/新值、原始 upstream 和 reflog 字节。该记录是持久提交决定：随后顺序写入配置、引用和完整日志，最后同步删除记录。返回 I/O 错误时会明确说明提交可能已经发生，不能把错误当作回滚。
 
@@ -53,4 +72,6 @@ commit 先同步 `.uwgit/ref-transaction.json`，保存完整引用前像、逐�
 
 回归覆盖混合更新/创建/删除/校验、旧值失败整批保持、同快照修订解析、NUL 与 C 引号、交互 prepare 的真实锁、EOF/abort、跨 worktree 保护、两向前缀替换和多笔事务。恢复测试在配置、删除、引用写入及 reflog 每个检查点中断，再从普通查询恢复，并验证引用、upstream 和日志原字节；完整安装后再次恢复也只保留一次日志。损坏记录、重复项、缺失对象和第三种人工编辑必须失败保持。
 
-协议语义参考 [Git update-ref](https://git-scm.com/docs/git-update-ref)，实际实现和恢复记录均为 uwgit 原生。本轮不包含 HEAD 或其他符号引用的批量 `symref-*`、`--batch-updates` 的逐项拒绝模式、任意引用命名空间及网络多引用原子推送；这些仍在能力矩阵中列为剩余项。
+逐项模式另覆盖成功/拒绝混合、全拒绝保持、只为接受项记日志、原生分支保护、选项覆盖、交互拒绝输出时机，以及过滤后的接受子集逐写入前缀恢复。独立 Git 仓库对照语义拒绝、名称冲突、prepare/abort/EOF/commit、NUL、格式错误及最终引用值；Wasm 原字节、index 和工作树也必须保持。
+
+协议语义参考 [Git update-ref](https://git-scm.com/docs/git-update-ref)，实际实现和恢复记录均为 uwgit 原生。本轮不包含 HEAD 或其他符号引用的批量 `symref-*`、任意引用命名空间及网络多引用原子推送；这些仍在能力矩阵中列为剩余项。

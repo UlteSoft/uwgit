@@ -154,10 +154,16 @@ fn edit(fields: &[String], nul: bool) -> RepositoryResult<ReferenceEdit> {
     })
 }
 
-pub(super) fn run(repo: &Repository, nul: bool, message: &str) -> RepositoryResult<()> {
+pub(super) fn run(
+    repo: &Repository,
+    nul: bool,
+    allow_failures: bool,
+    message: &str,
+) -> RepositoryResult<()> {
     run_stream(
         repo,
         nul,
+        allow_failures,
         message,
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
@@ -167,6 +173,7 @@ pub(super) fn run(repo: &Repository, nul: bool, message: &str) -> RepositoryResu
 fn run_stream(
     repo: &Repository,
     nul: bool,
+    allow_failures: bool,
     message: &str,
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -184,7 +191,7 @@ fn run_stream(
         }
         match fields.as_slice() {
             [command] if command == "start" => {
-                if prepared.is_some() || !edits.is_empty() || (explicit && !closed) {
+                if prepared.is_some() || (explicit && !closed) {
                     return Err("transaction is already started".into());
                 }
                 explicit = true;
@@ -194,17 +201,25 @@ fn run_stream(
                 if closed || prepared.is_some() {
                     return Err("transaction is closed or already prepared".into());
                 }
-                prepared = Some(repo.prepare_reference_edits(&edits, message)?);
+                prepared = Some(repo.prepare_reference_batch(&edits, message, allow_failures)?);
+                explicit = true;
             }
             [command] if command == "commit" => {
                 if closed {
                     return Err("transaction is closed; start another transaction".into());
                 }
-                prepared
+                let outcome = prepared
                     .take()
                     .map(Ok)
-                    .unwrap_or_else(|| repo.prepare_reference_edits(&edits, message))?
+                    .unwrap_or_else(|| {
+                        repo.prepare_reference_batch(&edits, message, allow_failures)
+                    })?
                     .commit()?;
+                for rejection in outcome.rejections {
+                    writeln!(output, "{rejection}").map_err(|error| {
+                        format!("reference batch committed but rejection reporting failed: {error}")
+                    })?;
+                }
                 edits.clear();
                 names.clear();
                 closed = true;
@@ -253,10 +268,18 @@ fn run_stream(
         return Err("unused update-ref no-deref option".into());
     }
     if !explicit && !closed {
-        prepared
+        let outcome = prepared
             .map(Ok)
-            .unwrap_or_else(|| repo.prepare_reference_edits(&edits, message))?
+            .unwrap_or_else(|| repo.prepare_reference_batch(&edits, message, allow_failures))?
             .commit()?;
+        for rejection in outcome.rejections {
+            writeln!(output, "{rejection}").map_err(|error| {
+                format!("reference batch committed but rejection reporting failed: {error}")
+            })?;
+        }
+        output.flush().map_err(|error| {
+            format!("reference batch committed but response flush failed: {error}")
+        })?;
     }
     // An explicitly started uncommitted transaction is aborted on EOF. Dropping
     // its prepared guard releases the writer lock without persisting a decision.

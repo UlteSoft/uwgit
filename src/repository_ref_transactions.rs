@@ -21,6 +21,73 @@ pub struct ReferenceEdit {
     pub expected: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejectionReason {
+    Missing,
+    Exists,
+    IncorrectOld,
+    InvalidNew,
+    NameConflict,
+    CheckedOut,
+}
+
+impl std::fmt::Display for RejectionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "reference does not exist",
+            Self::Exists => "reference already exists",
+            Self::IncorrectOld => "incorrect old value provided",
+            Self::InvalidNew => "invalid new value provided",
+            Self::NameConflict => "refname conflict",
+            Self::CheckedOut => "reference is checked out in a worktree",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceRejection {
+    pub reference: String,
+    pub new: Option<String>,
+    pub old: Option<String>,
+    reason: RejectionReason,
+}
+
+impl std::fmt::Display for ReferenceRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        write!(
+            formatter,
+            "rejected {} {} {} {}",
+            self.reference,
+            self.new.as_deref().unwrap_or(ZERO),
+            self.old.as_deref().unwrap_or(ZERO),
+            self.reason
+        )
+    }
+}
+
+pub struct ReferenceCommitOutcome {
+    pub updates: Vec<Value>,
+    pub rejections: Vec<ReferenceRejection>,
+}
+
+struct ResolvedEdit {
+    change: ReferenceChange,
+    expected: Option<Option<String>>,
+    requested_new: Option<String>,
+}
+
+impl ResolvedEdit {
+    fn reject(&self, reason: RejectionReason) -> ReferenceRejection {
+        ReferenceRejection {
+            reference: self.change.reference.clone(),
+            new: self.requested_new.clone(),
+            old: self.expected.clone().flatten(),
+            reason,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReferenceState {
@@ -51,6 +118,7 @@ pub struct PreparedReferences<'a> {
     repo: &'a Repository,
     _lock: WriteLock,
     plan: ReferencePlan,
+    rejections: Vec<ReferenceRejection>,
 }
 
 fn reference_parts(reference: &str) -> RepositoryResult<(&str, &str)> {
@@ -65,6 +133,116 @@ fn reference_parts(reference: &str) -> RepositoryResult<(&str, &str)> {
         .ok_or("update-ref requires refs/heads/NAME or refs/tags/NAME")?;
     validate_ref_name(name)?;
     Ok((namespace, name))
+}
+
+fn resolve_reference_edit(
+    snapshot: &Snapshot,
+    edit: &ReferenceEdit,
+) -> RepositoryResult<ResolvedEdit> {
+    let (namespace, name) = reference_parts(&edit.reference)?;
+    let refs = if namespace == "refs" {
+        &snapshot.manifest.refs
+    } else {
+        &snapshot.manifest.tags
+    };
+    let old = refs.get(name).cloned();
+    let resolve = |value: &str| -> RepositoryResult<Option<String>> {
+        if value.is_empty() || (value.len() == 64 && value.bytes().all(|byte| byte == b'0')) {
+            return Ok(None);
+        }
+        // A syntactically valid full ID can name an absent or wrong-type object.
+        // Classify that at prepare, separately from an unparseable revision.
+        if valid_id(value) {
+            return Ok(Some(value.into()));
+        }
+        snapshot_revision(snapshot, value).map(Some)
+    };
+    let mut expected = edit.expected.as_deref().map(resolve).transpose()?;
+    let requested_new = match edit.kind {
+        ReferenceEditKind::Update | ReferenceEditKind::Create => resolve(
+            edit.new
+                .as_deref()
+                .ok_or("reference update needs a new value")?,
+        )?,
+        _ => None,
+    };
+    match edit.kind {
+        ReferenceEditKind::Create => {
+            if requested_new.is_none() {
+                return Err("create requires a nonzero new value".into());
+            }
+            expected = Some(None);
+        }
+        ReferenceEditKind::Delete if expected == Some(None) => {
+            return Err("delete old value must not be zero".into())
+        }
+        ReferenceEditKind::Verify if expected.is_none() => expected = Some(None),
+        _ => {}
+    }
+    let new = if matches!(edit.kind, ReferenceEditKind::Verify) {
+        old.clone()
+    } else {
+        requested_new.clone()
+    };
+    Ok(ResolvedEdit {
+        change: ReferenceChange {
+            reference: edit.reference.clone(),
+            old,
+            new,
+        },
+        expected,
+        requested_new,
+    })
+}
+
+fn conflicting_creations(
+    snapshot: &Snapshot,
+    edits: &[ResolvedEdit],
+    reasons: &[Option<RejectionReason>],
+) -> RepositoryResult<BTreeSet<usize>> {
+    let mut refs = snapshot.manifest.refs.clone();
+    let mut tags = snapshot.manifest.tags.clone();
+    validate_prefixes(&refs)?;
+    validate_prefixes(&tags)?;
+    let mut created = BTreeMap::new();
+    for (index, edit) in edits.iter().enumerate() {
+        if reasons[index].is_some() {
+            continue;
+        }
+        let (namespace, name) = reference_parts(&edit.change.reference)?;
+        let target = if namespace == "refs" {
+            &mut refs
+        } else {
+            &mut tags
+        };
+        if let Some(new) = &edit.change.new {
+            target.insert(name.into(), new.clone());
+            if edit.change.old.is_none() {
+                created.insert(edit.change.reference.as_str(), index);
+            }
+        } else {
+            target.remove(name);
+        }
+    }
+    let mut conflicts = BTreeSet::new();
+    for (namespace, refs) in [("heads", refs), ("tags", tags)] {
+        for name in refs.keys() {
+            for (offset, _) in name.match_indices('/') {
+                let ancestor = &name[..offset];
+                if !refs.contains_key(ancestor) {
+                    continue;
+                }
+                for conflicted in [name.as_str(), ancestor] {
+                    if let Some(index) =
+                        created.get(format!("refs/{namespace}/{conflicted}").as_str())
+                    {
+                        conflicts.insert(*index);
+                    }
+                }
+            }
+        }
+    }
+    Ok(conflicts)
 }
 
 fn optional_file(path: &Path) -> RepositoryResult<Option<Vec<u8>>> {
@@ -191,67 +369,54 @@ impl Repository {
         edits: &[ReferenceEdit],
         message: &str,
     ) -> RepositoryResult<PreparedReferences<'a>> {
+        self.prepare_reference_batch(edits, message, false)
+    }
+
+    pub fn prepare_reference_batch<'a>(
+        &'a self,
+        edits: &[ReferenceEdit],
+        message: &str,
+        allow_failures: bool,
+    ) -> RepositoryResult<PreparedReferences<'a>> {
         if edits.len() > MAX_REFERENCE_EDITS || message.is_empty() {
             return Err("reference transaction needs a message and at most 4096 edits".into());
         }
         let lock = self.lock()?;
         let snapshot = self.snapshot()?;
-        let mut changes = Vec::new();
+        // Metadata damage is fatal even if every requested branch is rejected.
+        linked_worktrees::has_entries(&self.common_metadata)?;
+        let mut names = BTreeSet::new();
+        let mut resolved = Vec::new();
         for edit in edits {
-            let (namespace, name) = reference_parts(&edit.reference)?;
-            let refs = if namespace == "refs" {
-                &snapshot.manifest.refs
-            } else {
-                &snapshot.manifest.tags
-            };
-            let old = refs.get(name).cloned();
-            let resolve = |value: &str| -> RepositoryResult<Option<String>> {
-                if value.is_empty() || (value.len() == 64 && value.bytes().all(|byte| byte == b'0'))
-                {
-                    return Ok(None);
-                }
-                snapshot_revision(&snapshot, value).map(Some)
-            };
-            let expected = edit.expected.as_deref().map(resolve).transpose()?;
-            let new = match edit.kind {
-                ReferenceEditKind::Update | ReferenceEditKind::Create => resolve(
-                    edit.new
-                        .as_deref()
-                        .ok_or("reference update needs a new value")?,
-                )?,
-                ReferenceEditKind::Delete => None,
-                ReferenceEditKind::Verify => old.clone(),
-            };
-            match edit.kind {
-                ReferenceEditKind::Create => {
-                    if new.is_none() || old.is_some() {
-                        return Err(
-                            "create requires a missing reference and nonzero new value".into()
-                        );
-                    }
-                }
-                ReferenceEditKind::Delete => {
-                    if expected == Some(None) {
-                        return Err("delete old value must not be zero".into());
-                    }
-                }
-                ReferenceEditKind::Verify if expected.is_none() && old.is_some() => {
-                    return Err("reference old-value lease does not match absence".into())
-                }
-                _ => {}
+            if !names.insert(&edit.reference) {
+                return Err("duplicate reference in transaction".into());
             }
-            if expected.as_ref().is_some_and(|expected| expected != &old) {
-                return Err(format!(
-                    "reference old-value lease does not match: {}",
-                    edit.reference
-                ));
-            }
-            changes.push(ReferenceChange {
-                reference: edit.reference.clone(),
-                old,
-                new,
-            });
+            resolved.push(resolve_reference_edit(&snapshot, edit)?);
         }
+        let mut reasons = Vec::new();
+        for edit in &resolved {
+            reasons.push(self.reference_rejection_reason(&snapshot, edit)?);
+        }
+        // Resolve final namespace conflicts after dropping failed leases and
+        // protected branches. Both mutually conflicting new names are rejected;
+        // an existing reference keeps its valid update and wins over a new name.
+        for index in conflicting_creations(&snapshot, &resolved, &reasons)? {
+            reasons[index] = Some(RejectionReason::NameConflict);
+        }
+        let mut changes = Vec::new();
+        let mut rejections = Vec::new();
+        for (edit, reason) in resolved.into_iter().zip(reasons) {
+            if let Some(reason) = reason {
+                let rejection = edit.reject(reason);
+                if !allow_failures {
+                    return Err(rejection.to_string());
+                }
+                rejections.push(rejection);
+            } else {
+                changes.push(edit.change);
+            }
+        }
+        rejections.sort_by(|left, right| left.reference.cmp(&right.reference));
         let plan = ReferencePlan {
             version: 1,
             message: message.into(),
@@ -269,7 +434,41 @@ impl Repository {
             repo: self,
             _lock: lock,
             plan,
+            rejections,
         })
+    }
+
+    fn reference_rejection_reason(
+        &self,
+        snapshot: &Snapshot,
+        edit: &ResolvedEdit,
+    ) -> RepositoryResult<Option<RejectionReason>> {
+        if let Some(expected) = &edit.expected {
+            if expected != &edit.change.old {
+                return Ok(Some(if edit.change.old.is_none() {
+                    RejectionReason::Missing
+                } else if expected.is_none() {
+                    RejectionReason::Exists
+                } else {
+                    RejectionReason::IncorrectOld
+                }));
+            }
+        }
+        if edit
+            .requested_new
+            .as_ref()
+            .is_some_and(|new| !matches!(snapshot.objects.get(new), Some(Object::Commit(_))))
+        {
+            return Ok(Some(RejectionReason::InvalidNew));
+        }
+        let (namespace, name) = reference_parts(&edit.change.reference)?;
+        if edit.change.old != edit.change.new
+            && namespace == "refs"
+            && (name == snapshot.manifest.head || self.branch_unavailable_reason(name)?.is_some())
+        {
+            return Ok(Some(RejectionReason::CheckedOut));
+        }
+        Ok(None)
     }
 
     fn validate_reference_plan(&self, plan: &ReferencePlan) -> RepositoryResult<ReferenceState> {
@@ -476,7 +675,7 @@ impl Repository {
 }
 
 impl PreparedReferences<'_> {
-    pub fn commit(self) -> RepositoryResult<Vec<Value>> {
+    pub fn commit(self) -> RepositoryResult<ReferenceCommitOutcome> {
         let after = self.plan.after()?;
         let reports = self.plan.changes.iter().map(|change| json!({"reference":change.reference,"old":change.old,"new":change.new,"updated":change.old != change.new})).collect();
         if self
@@ -485,12 +684,18 @@ impl PreparedReferences<'_> {
             .iter()
             .all(|change| change.old == change.new)
         {
-            return Ok(reports);
+            return Ok(ReferenceCommitOutcome {
+                updates: reports,
+                rejections: self.rejections,
+            });
         }
         self.repo.check_reference_preimages(&self.plan, &after)?;
         self.repo.atomic_write(&self.repo.common_metadata.join(JOURNAL), &self.plan.bytes()?).map_err(|error| format!("reference commit decision may be durable; inspect or retry a locked query to recover: {error}"))?;
         self.repo.apply_reference_plan(&self.plan, &after, || Ok(())).and_then(|()| self.repo.clear_reference_transaction()).map_err(|error| format!("reference transaction is committed and may be partially installed; a locked query will finish recovery: {error}"))?;
-        Ok(reports)
+        Ok(ReferenceCommitOutcome {
+            updates: reports,
+            rejections: self.rejections,
+        })
     }
 }
 
@@ -716,5 +921,72 @@ mod tests {
             .read_named_refs("tags", true)
             .unwrap()
             .contains_key("uncommitted"));
+    }
+
+    #[test]
+    fn interrupted_partial_batch_recovers_only_the_frozen_accepted_subset() {
+        // Upstream cleanup, one deletion, two writes, and the shared log.
+        for stop in 0..=5 {
+            let temp = Temp::new();
+            let (repo, original, _) = fixture(&temp);
+            let first = &original.before.refs["topic"];
+            let second = &original.before.refs["main"];
+            let mut missing = edit(ReferenceEditKind::Update, "refs/heads/missing", Some(first));
+            missing.expected = Some(second.clone());
+            let prepared = repo
+                .prepare_reference_batch(
+                    &[
+                        edit(ReferenceEditKind::Delete, "refs/heads/topic", None),
+                        edit(
+                            ReferenceEditKind::Create,
+                            "refs/heads/topic/child",
+                            Some(second),
+                        ),
+                        edit(
+                            ReferenceEditKind::Create,
+                            "refs/tags/release/partial",
+                            Some(first),
+                        ),
+                        edit(ReferenceEditKind::Update, "refs/heads/main", Some(first)),
+                        missing,
+                    ],
+                    "recover partial batch",
+                    true,
+                )
+                .unwrap();
+            assert_eq!(prepared.rejections.len(), 2);
+            assert_eq!(prepared.plan.changes.len(), 3);
+            let plan = prepared.plan.clone();
+            let after = plan.after().unwrap();
+            drop(prepared);
+            persist(&repo, &plan);
+            if stop > 0 {
+                let mut count = 0;
+                assert!(repo
+                    .apply_reference_plan(&plan, &after, || {
+                        count += 1;
+                        if count == stop {
+                            Err("injected interrupted partial publication".into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err());
+            }
+            assert_eq!(repo.branches().unwrap(), after.refs);
+            assert_eq!(repo.read_named_refs("tags", true).unwrap(), after.tags);
+            assert_eq!(repo.read_refs().unwrap().get("main"), Some(second));
+            assert!(!repo.read_refs().unwrap().contains_key("missing"));
+            let before = decode_reflog(plan.before.reflog.as_deref().unwrap()).unwrap();
+            let log = repo.read_reflog().unwrap();
+            assert_eq!(log.len(), before.len() + 3);
+            assert!(log[before.len()..].iter().all(|entry| !matches!(
+                entry.reference.as_str(),
+                "refs/heads/main" | "refs/heads/missing"
+            )));
+            persist(&repo, &plan);
+            repo.branches().unwrap();
+            assert_eq!(repo.read_reflog().unwrap(), log);
+        }
     }
 }

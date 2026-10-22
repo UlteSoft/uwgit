@@ -73,6 +73,16 @@ enum Command {
         stdin: bool,
         #[arg(short = 'z', requires = "stdin")]
         nul: bool,
+        /// Reject individual semantic failures and atomically publish survivors.
+        #[arg(
+            short = '0',
+            long,
+            requires = "stdin",
+            overrides_with = "no_batch_updates"
+        )]
+        batch_updates: bool,
+        #[arg(long, overrides_with = "batch_updates")]
+        no_batch_updates: bool,
         /// Native direct refs never dereference a symbolic link.
         #[arg(long)]
         no_deref: bool,
@@ -198,14 +208,22 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             message,
             stdin,
             nul,
+            batch_updates,
+            no_batch_updates: _,
             no_deref: _,
             create_reflog: _,
             reference,
             values,
         } => {
+            if batch_updates && !stdin {
+                return Err("--batch-updates can only be used with --stdin".into());
+            }
+            if nul && !stdin {
+                return Err("-z can only be used with --stdin".into());
+            }
             if stdin {
                 crate::porcelain::with_no_pending(&dir, |repo| {
-                    reference_input::run(repo, nul, &message)?;
+                    reference_input::run(repo, nul, batch_updates, &message)?;
                     Ok(String::new())
                 })?;
                 return Ok(QueryOutput::new(String::new(), 0));

@@ -342,6 +342,7 @@ impl Repository {
         };
         self.prepare_reference_edits(&[edit], message)?
             .commit()?
+            .updates
             .pop()
             .ok_or("missing reference update report".into())
     }

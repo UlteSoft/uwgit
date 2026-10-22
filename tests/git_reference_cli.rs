@@ -64,37 +64,50 @@ fn wasm(value: u8) -> Vec<u8> {
     [b"\0asm\x01\0\0\0".as_slice(), &[0, 3, 1, b'x', value]].concat()
 }
 
+fn reference_updates(
+    root: &Path,
+    native: bool,
+    records: &str,
+    nul: bool,
+    allow_failures: bool,
+) -> Output {
+    let mut command = if native {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
+        command.args(["update-ref", p(root), "--stdin"]);
+        command
+    } else {
+        let mut command = Command::new("git");
+        command.args(["-C", p(root), "update-ref", "--stdin"]);
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
+    };
+    if allow_failures {
+        command.arg("--batch-updates");
+    }
+    if nul {
+        command.arg("-z");
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(records.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn native_reference_transaction_leases_and_control_match_independent_git_fixtures() {
     fn input(root: &Path, native: bool, records: &str, nul: bool) -> Output {
-        let mut command = if native {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
-            command.args(["update-ref", p(root), "--stdin"]);
-            command
-        } else {
-            let mut command = Command::new("git");
-            command.args(["-C", p(root), "update-ref", "--stdin"]);
-            command
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null");
-            command
-        };
-        if nul {
-            command.arg("-z");
-        }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(records.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
+        reference_updates(root, native, records, nul, false)
     }
     let temp = Temp::new();
     let native = temp.path("native-refs");
@@ -221,6 +234,132 @@ fn native_reference_transaction_leases_and_control_match_independent_git_fixture
         } else {
             assert_eq!(success(git(root, &["show", "topic:a.wasm"])), wasm(2));
         }
+    }
+}
+
+#[test]
+fn native_partial_reference_batches_match_git_rejections_control_and_final_ref_values() {
+    let temp = Temp::new();
+    let native = temp.path("native-partial");
+    let reference = temp.path("git-partial");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    let (mut native_ids, mut git_ids) = (Vec::new(), Vec::new());
+    for value in [1, 2] {
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(value)).unwrap();
+        }
+        success(uw(&["add", p(&native), "a.wasm"]));
+        success(uw(&["commit", p(&native), "-m", &format!("value {value}")]));
+        native_ids.push(
+            String::from_utf8(success(uw(&["rev-parse", p(&native), "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+        success(git(&reference, &["add", "a.wasm"]));
+        success(git(
+            &reference,
+            &["commit", "-m", &format!("value {value}")],
+        ));
+        git_ids.push(
+            String::from_utf8(success(git(&reference, &["rev-parse", "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+    }
+    let tree: Value =
+        serde_json::from_slice(&success(uw(&["ls-tree", p(&native), "HEAD"]))).unwrap();
+    let native_wrong_type = tree["entries"][0]["object_id"].as_str().unwrap();
+    let git_wrong_type =
+        String::from_utf8(success(git(&reference, &["rev-parse", "HEAD^{tree}"]))).unwrap();
+    let cases=[
+        ("missing", "create refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\n",false,true),
+        ("wrong-old", "create refs/tags/accepted SECOND\nupdate refs/heads/topic FIRST FIRST\n",false,true),
+        ("existing", "create refs/tags/accepted SECOND\ncreate refs/heads/topic FIRST\n",false,true),
+        ("missing-object", "create refs/tags/accepted SECOND\ncreate refs/heads/bad ABSENT\n",false,true),
+        ("wrong-type", "create refs/tags/accepted SECOND\ncreate refs/heads/bad TYPE\n",false,true),
+        ("two-new", "create refs/heads/new/child FIRST\ncreate refs/heads/new SECOND\ncreate refs/tags/accepted SECOND\n",false,true),
+        ("existing-prefix", "create refs/heads/existing FIRST\nupdate refs/heads/existing/child SECOND FIRST\n",false,true),
+        ("delete", "delete refs/tags/obsolete FIRST\nupdate refs/heads/missing FIRST SECOND\n",false,true),
+        ("prepared-abort", "start\ncreate refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\nprepare\nabort\n",false,true),
+        ("prepared-eof", "create refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\nprepare\n",false,true),
+        ("start-adopts-eof", "create refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\nstart\n",false,true),
+        ("start-adopts-commit", "create refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\nstart\ncommit\n",false,true),
+        ("prepared-commit", "start\ncreate refs/tags/accepted SECOND\nupdate refs/heads/missing FIRST SECOND\nprepare\ncommit\n",false,true),
+        ("nul", "create refs/tags/accepted\0SECOND\0update refs/heads/missing\0FIRST\0SECOND\0",true,true),
+        ("invalid-revision", "create refs/tags/accepted SECOND\ncreate refs/heads/bad no-such-revision\n",false,false),
+        ("duplicate", "create refs/tags/accepted SECOND\ncreate refs/tags/accepted FIRST\n",false,false),
+        ("zero-create", "create refs/tags/accepted SECOND\ncreate refs/tags/zero ZERO\n",false,false),
+    ];
+    for (case, template, nul, expected_success) in cases {
+        let mut observations = Vec::new();
+        for (root, is_native, ids, width, wrong_type) in [
+            (&native, true, &native_ids, 64, native_wrong_type),
+            (&reference, false, &git_ids, 40, git_wrong_type.trim()),
+        ] {
+            let all_refs = if is_native {
+                success(uw(&["show-ref", p(root)]))
+            } else {
+                success(git(root, &["show-ref"]))
+            };
+            for line in String::from_utf8(all_refs).unwrap().lines() {
+                let name = line.split_once(' ').unwrap().1;
+                if name == "refs/heads/main" {
+                    continue;
+                }
+                if is_native {
+                    success(uw(&["update-ref", p(root), "-d", name]));
+                } else {
+                    success(git(root, &["update-ref", "-d", name]));
+                }
+            }
+            for (name, id) in [
+                ("refs/heads/topic", &ids[1]),
+                ("refs/heads/existing/child", &ids[0]),
+                ("refs/tags/obsolete", &ids[0]),
+            ] {
+                if is_native {
+                    success(uw(&["update-ref", p(root), name, id]));
+                } else {
+                    success(git(root, &["update-ref", name, id]));
+                }
+            }
+            let zero = "0".repeat(width);
+            let absent = "f".repeat(width);
+            let records = template
+                .replace("FIRST", &ids[0])
+                .replace("SECOND", &ids[1])
+                .replace("ZERO", &zero)
+                .replace("ABSENT", &absent)
+                .replace("TYPE", wrong_type);
+            let outcome = reference_updates(root, is_native, &records, nul, true);
+            assert_eq!(
+                outcome.status.success(),
+                expected_success,
+                "{case}, native={is_native}: {}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            let normalize = |value: Vec<u8>| {
+                String::from_utf8(value)
+                    .unwrap()
+                    .replace(&ids[0], "FIRST")
+                    .replace(&ids[1], "SECOND")
+                    .replace(wrong_type, "TYPE")
+                    .replace(&zero, "ZERO")
+                    .replace(&absent, "ABSENT")
+            };
+            let refs = if is_native {
+                success(uw(&["show-ref", p(root)]))
+            } else {
+                success(git(root, &["show-ref"]))
+            };
+            observations.push((normalize(outcome.stdout), normalize(refs)));
+            assert_eq!(fs::read(root.join("a.wasm")).unwrap(), wasm(2));
+        }
+        assert_eq!(observations[0], observations[1], "{case}");
     }
 }
 

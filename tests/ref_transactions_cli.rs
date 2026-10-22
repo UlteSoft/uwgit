@@ -57,6 +57,20 @@ fn batch(root: &Path, input: &str) -> Output {
         input.as_bytes(),
     )
 }
+fn partial(root: &Path, input: &str, nul: bool) -> Output {
+    let mut args = vec![
+        "update-ref",
+        p(root),
+        "--stdin",
+        "--batch-updates",
+        "-m",
+        "partial fixture",
+    ];
+    if nul {
+        args.push("-z");
+    }
+    execute(&args, input.as_bytes())
+}
 fn success(output: Output) -> Vec<u8> {
     assert!(
         output.status.success(),
@@ -349,4 +363,444 @@ fn linked_worktree_branch_protection_rejects_the_entire_batch() {
     .success());
     assert_eq!(image(&root), before);
     assert_eq!(image(&peer), peer_before);
+}
+
+#[test]
+fn partial_batches_publish_only_accepted_refs_and_preserve_original_wasm_work_and_index() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    ok(&["branch", p(&root), "topic", &first]);
+    ok(&["tag", p(&root), "obsolete", &first]);
+    let original = image(&root);
+    let records = format!("update refs/heads/topic {second} {first}\ncreate refs/tags/release topic\ndelete refs/tags/obsolete {first}\nupdate refs/heads/missing {first} {second}\nverify refs/heads/main {second}\n");
+    assert!(!batch(&root, &records).status.success());
+    assert_eq!(image(&root), original);
+    assert_eq!(
+        success(partial(&root, &records, false)),
+        format!("rejected refs/heads/missing {first} {second} reference does not exist\n")
+            .into_bytes()
+    );
+    assert_eq!(ok(&["rev-parse", p(&root), "topic"]), second);
+    assert_eq!(ok(&["rev-parse", p(&root), "release"]), first);
+    assert!(!root.join(".uwgit/tags/obsolete").exists());
+    for path in [".uwgit/index", "a.wasm", ".uwgit/HEAD"] {
+        assert_eq!(
+            fs::read(root.join(path)).unwrap(),
+            original
+                .iter()
+                .find(|(name, _)| name == Path::new(path))
+                .unwrap()
+                .1
+        );
+    }
+    let log = fs::read_to_string(root.join(".uwgit/reflog")).unwrap();
+    let changes = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|entry| entry["operation"] == "partial fixture")
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 3);
+    assert!(changes
+        .iter()
+        .all(|entry| entry["reference"] != "refs/heads/missing"));
+    assert!(!root.join(".uwgit/ref-transaction.json").exists());
+    ok(&["fsck", p(&root)]);
+}
+
+#[test]
+fn semantic_rejections_use_resolved_native_ids_and_stable_reasons() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    ok(&["branch", p(&root), "topic", &first]);
+    let tree: Value = serde_json::from_str(&ok(&["ls-tree", p(&root), "HEAD"])).unwrap();
+    let blob = tree["entries"][0]["object_id"].as_str().unwrap();
+    let zero = "0".repeat(64);
+    let absent = "f".repeat(64);
+    let records = format!("create refs/tags/accepted HEAD\nupdate refs/heads/topic {second} {second}\ncreate refs/heads/main HEAD\ncreate refs/heads/bad-type {blob}\ncreate refs/heads/absent-object {absent}\nverify refs/heads/topic-check\nverify refs/heads/main HEAD\n");
+    let expected = format!("rejected refs/heads/absent-object {absent} {zero} invalid new value provided\nrejected refs/heads/bad-type {blob} {zero} invalid new value provided\nrejected refs/heads/main {second} {zero} reference already exists\nrejected refs/heads/topic {second} {second} incorrect old value provided\n");
+    // Duplicate refs remain a framing error, including a create/verify pair.
+    let before = image(&root);
+    assert!(!partial(&root, &records, false).status.success());
+    assert_eq!(image(&root), before);
+    let records = records.replace(
+        "verify refs/heads/main HEAD\n",
+        "verify refs/tags/missing\n",
+    );
+    assert_eq!(
+        success(partial(&root, &records, false)),
+        expected.into_bytes()
+    );
+    assert_eq!(ok(&["rev-parse", p(&root), "accepted"]), second);
+    assert_eq!(ok(&["rev-parse", p(&root), "topic"]), first);
+}
+
+#[test]
+fn all_rejected_or_noop_batches_change_no_files_and_report_successful_processing() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    let zero = "0".repeat(64);
+    let before = image(&root);
+    assert_eq!(success(partial(&root, &format!("verify refs/heads/main\nupdate refs/heads/missing {first} {second}\n"), false)), format!("rejected refs/heads/main {zero} {zero} reference already exists\nrejected refs/heads/missing {first} {second} reference does not exist\n").into_bytes());
+    assert_eq!(image(&root), before);
+    assert!(success(partial(
+        &root,
+        &format!("verify refs/heads/main {second}\nverify refs/tags/absent\n"),
+        false
+    ))
+    .is_empty());
+    assert_eq!(image(&root), before);
+}
+
+#[test]
+fn batch_mode_keeps_syntax_revision_and_framing_failures_fatal_before_publication() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (_, second) = seed(&root);
+    let zero = "0".repeat(64);
+    for tail in [
+        format!("create refs/heads/bad/../name {second}\n"),
+        "create refs/tags/revision no-such-revision\n".into(),
+        format!("create refs/tags/zero {zero}\n"),
+        format!("delete refs/tags/zero {zero}\n"),
+        "symref-update HEAD refs/heads/new\n".into(),
+        format!("create refs/tags/accepted {second}\n"),
+        "option unknown\n".into(),
+        "prepare\nunknown-command\n".into(),
+    ] {
+        let before = image(&root);
+        assert!(
+            !partial(
+                &root,
+                &format!("create refs/tags/accepted {second}\n{tail}"),
+                false
+            )
+            .status
+            .success(),
+            "{tail}"
+        );
+        assert_eq!(image(&root), before, "{tail}");
+    }
+    let before = image(&root);
+    assert!(!execute(
+        &["update-ref", p(&root), "--stdin", "--batch-updates"],
+        &[0xff, b'\n']
+    )
+    .status
+    .success());
+    assert!(!partial(&root, "create refs/tags/incomplete\0", true)
+        .status
+        .success());
+    assert!(!execute(
+        &[
+            "update-ref",
+            p(&root),
+            "--batch-updates",
+            "refs/tags/x",
+            &second
+        ],
+        &[]
+    )
+    .status
+    .success());
+    assert!(
+        !execute(&["update-ref", p(&root), "-z", "refs/tags/x", &second], &[])
+            .status
+            .success()
+    );
+    assert_eq!(image(&root), before);
+}
+
+#[test]
+fn partial_prefix_conflicts_reject_all_new_competitors_and_respect_rejected_deletions() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    let zero = "0".repeat(64);
+    ok(&["branch", p(&root), "existing/child", &first]);
+    for reverse in [false, true] {
+        let new_refs = if reverse {
+            format!("create refs/heads/new/child {first}\ncreate refs/heads/new {second}\n")
+        } else {
+            format!("create refs/heads/new {second}\ncreate refs/heads/new/child {first}\n")
+        };
+        let records = format!("{new_refs}update refs/heads/existing/child {second} {first}\ncreate refs/heads/existing {first}\n");
+        let expected = format!("rejected refs/heads/existing {first} {zero} refname conflict\nrejected refs/heads/new {second} {zero} refname conflict\nrejected refs/heads/new/child {first} {zero} refname conflict\n");
+        if reverse {
+            ok(&[
+                "update-ref",
+                p(&root),
+                "refs/heads/existing/child",
+                &first,
+                &second,
+            ]);
+        }
+        assert_eq!(
+            success(partial(&root, &records, false)),
+            expected.into_bytes()
+        );
+        assert_eq!(ok(&["rev-parse", p(&root), "existing/child"]), second);
+    }
+    let expected = format!("rejected refs/heads/existing {first} {zero} refname conflict\nrejected refs/heads/existing/child {zero} {first} incorrect old value provided\n");
+    assert_eq!(success(partial(&root, &format!("create refs/tags/accepted {second}\ncreate refs/heads/existing {first}\ndelete refs/heads/existing/child {first}\n"), false)), expected.into_bytes());
+    assert!(success(partial(
+        &root,
+        &format!("create refs/heads/existing {first}\ndelete refs/heads/existing/child {second}\n"),
+        false
+    ))
+    .is_empty());
+    assert_eq!(ok(&["rev-parse", p(&root), "existing"]), first);
+}
+
+#[test]
+fn prepare_without_start_aborts_on_eof_in_both_modes_and_suppresses_rejections() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    for allow_failures in [false, true] {
+        for ending in ["prepare\n", "prepare\nabort\n"] {
+            let before = image(&root);
+            let rejected = if allow_failures {
+                format!("update refs/heads/missing {first} {second}\n")
+            } else {
+                String::new()
+            };
+            let records = format!("create refs/tags/accepted {second}\n{rejected}{ending}");
+            let output = success(if allow_failures {
+                partial(&root, &records, false)
+            } else {
+                batch(&root, &records)
+            });
+            assert_eq!(
+                output,
+                if ending.ends_with("abort\n") {
+                    b"prepare: ok\nabort: ok\n".as_slice()
+                } else {
+                    b"prepare: ok\n".as_slice()
+                }
+            );
+            assert_eq!(image(&root), before);
+        }
+    }
+}
+
+#[test]
+fn corruption_and_system_failures_are_never_downgraded_to_partial_rejections() {
+    for damage in ["registry", "object", "journal", "lock", "reflog"] {
+        let temp = Temp::new();
+        let root = temp.path("repo");
+        let (_, second) = seed(&root);
+        match damage {
+            "registry" => {
+                fs::write(root.join(".uwgit/worktrees.json"), b"corrupt registry").unwrap()
+            }
+            "object" => {
+                fs::write(root.join(".uwgit/objects").join(&second), b"corrupt object").unwrap()
+            }
+            "journal" => fs::create_dir(root.join(".uwgit/ref-transaction.json")).unwrap(),
+            "lock" => fs::write(root.join(".uwgit/write.lock"), b"external writer\n").unwrap(),
+            _ => {
+                fs::remove_file(root.join(".uwgit/reflog")).unwrap();
+                fs::create_dir(root.join(".uwgit/reflog")).unwrap();
+            }
+        }
+        let before = image(&root);
+        let output = partial(
+            &root,
+            &format!(
+                "create refs/tags/accepted {second}\ncreate refs/heads/invalid {}\n",
+                "f".repeat(64)
+            ),
+            false,
+        );
+        assert!(!output.status.success(), "{damage}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(image(&root), before, "{damage}");
+    }
+}
+
+#[test]
+fn partial_worktree_protection_rejects_occupied_refs_but_keeps_unrelated_successes() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let peer = temp.path("peer");
+    let (first, second) = seed(&root);
+    let zero = "0".repeat(64);
+    ok(&["branch", p(&root), "topic", &first]);
+    ok(&["worktree", p(&root), "add", p(&peer), "topic"]);
+    let peer_index = fs::read(peer.join(".uwgit/index")).unwrap();
+    let peer_bytes = fs::read(peer.join("a.wasm")).unwrap();
+    assert_eq!(success(partial(&root, &format!("create refs/tags/accepted {second}\nupdate refs/heads/topic {second} {first}\nupdate refs/heads/main {first} {second}\n"), false)), format!("rejected refs/heads/main {first} {second} reference is checked out in a worktree\nrejected refs/heads/topic {second} {first} reference is checked out in a worktree\n").into_bytes());
+    assert_eq!(ok(&["rev-parse", p(&peer), "HEAD"]), first);
+    assert_eq!(fs::read(peer.join(".uwgit/index")).unwrap(), peer_index);
+    assert_eq!(fs::read(peer.join("a.wasm")).unwrap(), peer_bytes);
+    assert_eq!(ok(&["rev-parse", p(&root), "accepted"]), second);
+    assert_eq!(
+        success(partial(
+            &peer,
+            &format!("delete refs/heads/main {second}\ncreate refs/tags/peer-accepted {first}\n"),
+            false
+        )),
+        format!(
+            "rejected refs/heads/main {zero} {second} reference is checked out in a worktree\n"
+        )
+        .into_bytes()
+    );
+}
+
+#[test]
+fn short_batch_flag_nul_rejections_and_last_option_wins_have_real_effects() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (first, second) = seed(&root);
+    let records = format!(
+        "create refs/tags/accepted\0{second}\0update refs/heads/missing\0{first}\0{second}\0"
+    );
+    assert_eq!(
+        success(execute(
+            &["update-ref", p(&root), "--stdin", "-0", "-z"],
+            records.as_bytes()
+        )),
+        format!("rejected refs/heads/missing {first} {second} reference does not exist\n")
+            .into_bytes()
+    );
+    let records =
+        format!("create refs/tags/second {second}\nupdate refs/heads/missing {first} {second}\n");
+    let before = image(&root);
+    assert!(!execute(
+        &[
+            "update-ref",
+            p(&root),
+            "--stdin",
+            "--batch-updates",
+            "--no-batch-updates"
+        ],
+        records.as_bytes()
+    )
+    .status
+    .success());
+    assert_eq!(image(&root), before);
+    success(execute(
+        &[
+            "update-ref",
+            p(&root),
+            "--stdin",
+            "--no-batch-updates",
+            "--batch-updates",
+        ],
+        records.as_bytes(),
+    ));
+    assert_eq!(ok(&["rev-parse", p(&root), "second"]), second);
+}
+
+#[test]
+fn partial_prepare_holds_the_shared_lock_and_reports_rejections_only_after_commit() {
+    struct Process(Option<std::process::Child>);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    for ending in ["commit", "abort", "eof"] {
+        let temp = Temp::new();
+        let root = temp.path("repo");
+        let (first, second) = seed(&root);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wasm-git"))
+            .args(["update-ref", p(&root), "--stdin", "--batch-updates"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut process = Process(Some(child));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        write!(input, "start\ncreate refs/tags/accepted {second}\nupdate refs/heads/missing {first} {second}\nprepare\n").unwrap();
+        input.flush().unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "start: ok"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "prepare: ok"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(root.join(".uwgit/write.lock").is_file());
+        assert!(!root.join(".uwgit/tags/accepted").exists());
+        assert!(!execute(&["show-ref", p(&root)], &[]).status.success());
+        if ending != "eof" {
+            writeln!(input, "{ending}").unwrap();
+            input.flush().unwrap();
+        }
+        if ending == "commit" {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                format!("rejected refs/heads/missing {first} {second} reference does not exist")
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "commit: ok"
+            );
+        } else if ending == "abort" {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "abort: ok"
+            );
+        }
+        drop(input);
+        let output = process.0.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.join(".uwgit/write.lock").exists());
+        assert!(!root.join(".uwgit/ref-transaction.json").exists());
+        assert_eq!(
+            root.join(".uwgit/tags/accepted").exists(),
+            ending == "commit"
+        );
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_err());
+    }
+}
+
+#[test]
+fn start_can_adopt_queued_updates_and_requires_an_explicit_commit() {
+    let temp = Temp::new();
+    let root = temp.path("repo");
+    let (_, second) = seed(&root);
+    for allow_failures in [false, true] {
+        let before = image(&root);
+        let records = format!("create refs/tags/adopted {second}\nstart\n");
+        let output = success(if allow_failures {
+            partial(&root, &records, false)
+        } else {
+            batch(&root, &records)
+        });
+        assert_eq!(output, b"start: ok\n");
+        assert_eq!(image(&root), before);
+    }
+    assert_eq!(
+        success(partial(
+            &root,
+            &format!("create refs/tags/adopted {second}\nstart\nprepare\ncommit\n"),
+            false
+        )),
+        b"start: ok\nprepare: ok\ncommit: ok\n"
+    );
+    assert_eq!(ok(&["rev-parse", p(&root), "adopted"]), second);
 }

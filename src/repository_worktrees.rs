@@ -165,12 +165,24 @@ impl Repository {
     }
 
     pub fn assert_branch_available(&self, branch: &str) -> RepositoryResult<()> {
+        match self.branch_unavailable_reason(branch)? {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+
+    // Reservation is a semantic refusal; malformed metadata and filesystem
+    // failures remain errors, including in partial reference-update mode.
+    pub(super) fn branch_unavailable_reason(
+        &self,
+        branch: &str,
+    ) -> RepositoryResult<Option<String>> {
         if valid_id(branch) {
-            return Ok(());
+            return Ok(None);
         }
         let records = registry(&self.common_metadata)?;
         if records.entries.is_empty() && self.common_metadata == self.metadata {
-            return Ok(());
+            return Ok(None);
         }
         let here = canonical(&self.root)?;
         let primary = canonical(&self.common_metadata)?
@@ -180,20 +192,20 @@ impl Repository {
         if here != primary
             && parse_ref_file(&read_regular(&self.common_metadata.join("HEAD"))?, false)? == branch
         {
-            return Err(format!(
+            return Ok(Some(format!(
                 "branch {branch} is checked out in primary worktree {}",
                 primary.display()
-            ));
+            )));
         }
         for record in records.entries.values() {
             if Path::new(&record.path) != here && record.branch == branch {
-                return Err(format!(
+                return Ok(Some(format!(
                     "branch {branch} is reserved by worktree {}",
                     record.path
-                ));
+                )));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn register_selected_branch(&self, branch: &str) -> RepositoryResult<()> {
