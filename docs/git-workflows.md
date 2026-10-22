@@ -252,7 +252,7 @@ quit 只移除操作记录，不发布中间进度。pending 不随 clone、bund
 
 revision 支持完整 ID、至少四位唯一提交前缀、HEAD、分支、标签及 ~N/^N 组合。
 refs/heads/NAME、refs/tags/NAME 可消歧；fetch 后支持 origin/main 和 refs/remotes/origin/main。
-本地分支与标签是受限平面 ASCII 名称，不支持带斜杠的嵌套名称。
+本地分支与标签是受限 ASCII 名称，支持 `feature/x` 等正常层级；空组件、`.`、`..`、`.lock` 组件及 `refs/` 前缀不能作为分支名。多工作树占用保护与新底层入口见[原生命令手册](native-commands.md)。
 名称为 1–128 字节，首字符为字母或数字；HEAD、完整对象 ID 和 `.lock` 后缀属于保留名称。
 
 五个只读入口的输出、过滤、格式、统计 roots 和不兼容选项详见[查询契约与验证](queries.md)。本地对象查询使用一个已验证快照；损坏的 index/pending 或工作文件不参与已提交对象的读取。

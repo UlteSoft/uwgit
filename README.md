@@ -141,10 +141,12 @@ merge/cherry-pick/revert 可用 `--record-conflict` 录制单目标冲突，再�
 `ls-tree`、`show-ref`、`for-each-ref` 和 `count-objects` 可查询实际已提交树、引用与唯一对象统计；`ls-remote` 通过 HTTP/SSH 查询远端广告并明确标注对象尚未验证。格式、筛选、退出码与选项子集见[只读查询契约](docs/queries.md)。
 `describe` 可按实际标签祖先生成可回读的修订名；`archive` 可将选定已提交文件的原字节导出为确定的 ustar，旧单模块需显式命名。元数据策略与选项边界见[描述与归档契约](docs/describe-archive.md)。
 `bisect` 可冻结 good/bad 端点并保存测试判断，在完整 DAG 或第一父历史中选择候选；仅支持不切换工作区的流程，skip 歧义明确报告。用法与范围见[历史二分契约](docs/bisect.md)。
-尚未提供签名、压缩 pack 或垃圾回收；自动合并也不证明行为符合开发者意图。
+已增加显式原生对象 GC；尚未提供签名或压缩 pack；自动合并也不证明行为符合开发者意图。
 摘要用于内容完整性，不证明作者身份；本地拥有写权限的人仍可重写引用或删除整个仓库。
 崩溃遗留的 `.uwgit/write.lock` 或 `.uwgit/index.lock` 需确认没有写进程后手动移除。
 完整性检查和 bundle 当前需要将对象载入内存，尚未针对超大仓库做性能承诺。
+
+原生对象 plumbing、多工作树、可传输注释、字节 blame、系列差异、外部合并工具及清理维护见[原生命令手册](docs/native-commands.md)。这些入口使用 uwgit 自己的 Wasm 对象和协议。merge/pull 支持 `--no-ff`；merge 的 `--squash` 只准备完整暂存树，保留 HEAD，随后显式提交单父结果。
 
 ## 验证
 

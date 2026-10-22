@@ -12,6 +12,7 @@ colored = "2"
 similar = "2"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
+ignore = "=0.4.33"
 
 [dev-dependencies]
 wat = "=1.249.0"

@@ -1,9 +1,7 @@
 use std::process::Command;
 
 fn wasm_git_bin() -> std::path::PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_wasm-git")
-        .expect("CARGO_BIN_EXE_wasm-git must be set by cargo")
-        .into()
+    env!("CARGO_BIN_EXE_wasm-git").into()
 }
 
 fn fixture_path(name: &str) -> String {

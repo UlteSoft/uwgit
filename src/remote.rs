@@ -91,20 +91,7 @@ fn name(value: &str) -> RepositoryResult<()> {
 }
 
 fn branch_name(value: &str) -> RepositoryResult<()> {
-    // Repository branches use the same deliberately flat namespace.
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        || !value.as_bytes()[0].is_ascii_alphanumeric()
-        || value == "HEAD"
-        || valid_id(value)
-        || value.ends_with(".lock")
-    {
-        return Err("invalid remote branch name".into());
-    }
-    Ok(())
+    crate::repository::validate_ref_name(value).map_err(|_| "invalid remote branch name".into())
 }
 
 fn valid_id(value: &str) -> bool {
@@ -283,13 +270,13 @@ impl Drop for ConfigLock {
 }
 
 fn config_dir(repo: &Repository) -> RepositoryResult<PathBuf> {
-    let path = repo.root.join(".uwgit/remotes");
+    let path = repo.common_metadata().join("remotes");
     directory(&path)?;
     Ok(path)
 }
 
 fn config_lock(repo: &Repository) -> RepositoryResult<ConfigLock> {
-    let path = repo.root.join(".uwgit/remote.lock");
+    let path = repo.common_metadata().join("remote.lock");
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -343,7 +330,7 @@ fn tracking_spec(specification: &str) -> RepositoryResult<(&str, &str)> {
 }
 
 fn existing_config_dir(repo: &Repository) -> RepositoryResult<Option<PathBuf>> {
-    let path = repo.root.join(".uwgit/remotes");
+    let path = repo.common_metadata().join("remotes");
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("inspect remote configuration directory: {error}")),
@@ -600,7 +587,7 @@ pub fn upstream_status(repo: &Repository, local: &str) -> RepositoryResult<Optio
 
 fn atomic_json<T: Serialize>(repo: &Repository, path: &Path, value: &T) -> RepositoryResult<()> {
     let bytes = serde_json::to_vec(value).map_err(|e| format!("encode remote metadata: {e}"))?;
-    let temp = repo.root.join(".uwgit/tmp").join(unique("remote"));
+    let temp = repo.common_metadata().join("tmp").join(unique("remote"));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1268,14 +1255,28 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
     if ff_only_flags.len() > 1 {
         return Err("pull --ff-only cannot be repeated".into());
     }
+    let no_ff_flags = if args.first().is_some_and(|command| command == "pull") {
+        crate::command_args::option_indices(args, "--no-ff")
+    } else {
+        Vec::new()
+    };
+    if no_ff_flags.len() > 1 {
+        return Err("pull --no-ff cannot be repeated".into());
+    }
+    if !no_ff_flags.is_empty() && !ff_only_flags.is_empty() {
+        return Err("pull --no-ff and --ff-only are mutually exclusive".into());
+    }
+    let no_ff = !no_ff_flags.is_empty();
     let ff_only = !ff_only_flags.is_empty();
     let allow_http = !transport_flags.is_empty();
     let args: Vec<&str> = args
         .iter()
         .enumerate()
         .filter_map(|(index, arg)| {
-            (!transport_flags.contains(&index) && !ff_only_flags.contains(&index))
-                .then_some(arg.as_str())
+            (!transport_flags.contains(&index)
+                && !ff_only_flags.contains(&index)
+                && !no_ff_flags.contains(&index))
+            .then_some(arg.as_str())
         })
         .collect();
     match args.as_slice() {
@@ -1440,6 +1441,8 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             let expected_head = before.branches.get(&before.head).map(String::as_str);
             let outcome = if ff_only {
                 repo.merge_ff_only_on_branch(tip, message, &before.head, expected_head)?
+            } else if no_ff {
+                repo.merge_no_ff_on_branch(tip, message, &before.head, expected_head)?
             } else {
                 repo.merge_on_branch(tip, message, &before.head, expected_head)?
             };

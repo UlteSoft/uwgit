@@ -6,19 +6,27 @@ mod checkout;
 mod command_args;
 mod describe_commands;
 mod diff;
+mod diff_plumbing;
 mod export_dependencies;
 mod fingerprint;
 mod history_commands;
+mod history_query_commands;
 pub mod ir;
+mod maintenance_commands;
 mod matcher;
+mod merge_base_commands;
 mod normalize;
+mod notes_commands;
+mod object_batch;
 mod operation_commands;
 mod output;
 pub mod parse;
+mod plumbing_commands;
 mod porcelain;
 mod protocol;
 mod query_commands;
 mod rebase_commands;
+mod ref_commands;
 mod remote;
 mod report;
 mod repository;
@@ -26,6 +34,7 @@ mod resolve;
 mod server;
 mod tree_output;
 mod tree_resolution;
+mod worktree_commands;
 
 use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
@@ -136,6 +145,34 @@ struct TraceArgs {
     max_bytes: usize,
 }
 
+#[derive(Debug, Parser)]
+struct BlameArgs {
+    repo_dir: String,
+    revision: String,
+    #[arg(long)]
+    file: Option<String>,
+    #[arg(long, conflicts_with = "path")]
+    range: Option<String>,
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long)]
+    first_parent: bool,
+    #[arg(long, default_value_t = 256)]
+    max_edges: usize,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_bytes: usize,
+}
+
+#[derive(clap::Parser)]
+struct SquashArgs {
+    repo_dir: String,
+    target: String,
+    #[arg(long, required = true)]
+    squash: bool,
+    #[arg(short = 'm', long = "message", allow_hyphen_values = true)]
+    message: Option<String>,
+}
+
 struct Input {
     bytes: Vec<u8>,
     origin: Value,
@@ -153,8 +190,41 @@ fn main() {
         print_usage();
         std::process::exit(1);
     }
-    if query_commands::handles(&args[1]) || args[1] == "bisect" {
-        let output = if args[1] == "bisect" {
+    if args[1] == "cat-file" && object_batch::requested(&args[1..]) {
+        if let Err(error) = object_batch::run(&args[1..]) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if query_commands::handles(&args[1])
+        || plumbing_commands::handles(&args[1])
+        || maintenance_commands::handles(&args[1])
+        || args[1] == "worktree"
+        || args[1] == "notes"
+        || history_query_commands::handles(&args[1])
+        || ref_commands::handles(&args[1])
+        || diff_plumbing::handles(&args[1])
+        || args[1] == "merge-base"
+        || args[1] == "bisect"
+    {
+        let output = if args[1] == "merge-base" {
+            merge_base_commands::run(&args[1..])
+        } else if diff_plumbing::handles(&args[1]) {
+            diff_plumbing::run(&args[1..])
+        } else if ref_commands::handles(&args[1]) {
+            ref_commands::run(&args[1..])
+        } else if history_query_commands::handles(&args[1]) {
+            history_query_commands::run(&args[1..])
+        } else if args[1] == "notes" {
+            notes_commands::run(&args[1..])
+        } else if args[1] == "worktree" {
+            worktree_commands::run(&args[1..])
+        } else if maintenance_commands::handles(&args[1]) {
+            maintenance_commands::run(&args[1..])
+        } else if plumbing_commands::handles(&args[1]) {
+            plumbing_commands::run(&args[1..])
+        } else if args[1] == "bisect" {
             bisect_commands::bisect_query(&args[1..])
         } else {
             query_commands::run(&args[1..])
@@ -176,17 +246,27 @@ fn main() {
             }
             Err(error) => {
                 eprintln!("error: {error}");
-                std::process::exit(1);
+                std::process::exit(if args[1] == "merge-base" { 2 } else { 1 });
             }
         }
         return;
     }
     let result = match args[1].as_str() {
+        "version" | "--version" | "-v" if args.len() == 2 => Ok(format!("wasm-git {}", env!("CARGO_PKG_VERSION"))),
+        "version" if args.len() == 3 && args[2] == "--build-options" => serde_json::to_string_pretty(&json!({"version":env!("CARGO_PKG_VERSION"),"backend":"native_uwgit","original_wasm_bytes":true,"pointer_width":usize::BITS,"object_hash":"sha256"})).map_err(|error|error.to_string()),
         "inspect" => cmd_inspect(&args[2..]),
         "diff" => cmd_diff(&args[2..]),
         "patch" => cmd_patch(&args[2..]),
         "apply" => cmd_apply(&args[2..]),
         "trace" => cmd_trace(&args[2..]),
+        "blame" => cmd_blame(&args[2..]),
+        "merge" if !command_args::option_indices(&args[1..],"--squash").is_empty() => {
+            match SquashArgs::try_parse_from(&args[1..]) {
+                Ok(parsed)=>porcelain::squash_merge(&parsed.repo_dir,&parsed.target,parsed.message.as_deref()),
+                Err(error) if error.kind()==clap::error::ErrorKind::DisplayHelp=>Ok(error.to_string()),
+                Err(error)=>Err(error.to_string()),
+            }
+        }
         "checkout" => checkout::run(&args[1..]),
         "show"
             if args
@@ -222,8 +302,7 @@ fn main() {
         "merge" if args.len() >= 3 && !command_args::help_requested(&args[1..]) => {
             porcelain::with_clean_history(&args[2], |_| repository::run(&args[1..]))
         }
-        "init" | "commit" | "log" | "show" | "clone" | "bundle" | "unbundle" | "fsck" | "merge"
-        | "merge-base" => repository::run(&args[1..]),
+        "init" | "commit" | "log" | "show" | "clone" | "bundle" | "unbundle" | "fsck" | "merge" => repository::run(&args[1..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(String::new())
@@ -646,6 +725,44 @@ fn trace_path_span(module: &audit::AuditModule, path: &str) -> Result<audit::Spa
     }
 }
 
+fn cmd_blame(args: &[String]) -> Result<String, String> {
+    let parsed = match BlameArgs::try_parse_from(
+        std::iter::once("wasm-git blame").chain(args.iter().map(String::as_str)),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            return Ok(error.to_string())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let (history, absent) = if let Some(file) = &parsed.file {
+        let selected =
+            repository::read_file_history(Path::new(&parsed.repo_dir), &parsed.revision, file)?;
+        (selected.history, selected.absent)
+    } else {
+        (
+            repository::read_history(Path::new(&parsed.repo_dir), &parsed.revision)?,
+            Default::default(),
+        )
+    };
+    let bytes = &history.blobs[&history.commits[&history.tip].wasm];
+    let query = if let Some(range) = &parsed.range {
+        parse_trace_range(range)?
+    } else {
+        trace_path_span(
+            &audit::inspect(bytes)?,
+            parsed.path.as_deref().unwrap_or("module"),
+        )?
+    };
+    let limits = wasm_git::trace::TraceLimits {
+        max_edges: parsed.max_edges,
+        max_compared_bytes: parsed.max_bytes,
+        ..Default::default()
+    };
+    let report = wasm_git::blame::blame(&history, &absent, query, parsed.first_parent, limits)?;
+    serde_json::to_string_pretty(&json!({"schema_version":1,"repository_verified":true,"file":parsed.file,"selection":{"range":parsed.range,"path":parsed.path},"blame":report})).map_err(|error| error.to_string())
+}
+
 fn cmd_trace(args: &[String]) -> Result<String, String> {
     let parsed = match TraceArgs::try_parse_from(
         std::iter::once("wasm-git trace").chain(args.iter().map(String::as_str)),
@@ -727,6 +844,28 @@ fn cmd_trace(args: &[String]) -> Result<String, String> {
 
 fn print_usage() {
     eprintln!("usage: wasm-git <command> [<args>]\n");
+    eprintln!("  version [--build-options]");
+    eprintln!(
+        "  blame <DIR> <REV> [--file PATH] [--range START:END|--path REGION] [--first-parent]"
+    );
+    eprintln!("  hash-object <DIR> [-w] [-t wasm|tree|commit] (--stdin|FILE) | mktree <DIR> [-z]");
+    eprintln!("  write-tree <DIR> | read-tree <DIR> <REV|--empty> | commit-tree <DIR> <TREE> [-p PARENT]... -m MESSAGE");
+    eprintln!("  update-ref <DIR> [-d] [-m MESSAGE] <REF> [NEW] [OLD] | rev-list <DIR> [OPTIONS] [REVISIONS...]");
+    eprintln!("  merge-base <DIR> [-a] [--octopus|--independent|--is-ancestor|--fork-point] <REVISIONS...> [--text|--json]");
+    eprintln!(
+        "  symbolic-ref <DIR> [--short] HEAD [refs/heads/BRANCH] | check-ref-format [--branch] REF"
+    );
+    eprintln!("  diff-files <DIR> | diff-index <DIR> <REV> [--cached] | diff-tree <DIR> <OLD> <NEW> [OPTIONS]");
+    eprintln!("  cat-file <DIR> --batch|--batch-check|--batch-command [--buffer] [-z|-Z]");
+    eprintln!(
+        "  clean <DIR> -n|-f [-d] [-x|-X] [-e PATTERN] [-- PATH...] | gc <DIR> [--prune=now] [-n]"
+    );
+    eprintln!("  maintenance <DIR> run [--task verify|gc] | worktree <DIR> add|list|remove|move|lock|unlock|prune|repair [OPTIONS]");
+    eprintln!("  notes <DIR> [--ref NAMESPACE] list|show|add|append|copy|remove [OPTIONS]");
+    eprintln!("  shortlog <DIR> [REV] [--group path|subject] [-s] [-n] | range-diff <DIR> <BASE..TIP> <BASE..TIP>");
+    eprintln!(
+        "  mergetool <DIR> --output NEW_DIR [--tool PROGRAM --stage] [--delete PATH] [-- PATH...]"
+    );
     eprintln!(
         "  inspect <FILE|REV> [--repo DIR] [--file PATH] [--json] [--standard core1|core2|core3|all-known]"
     );

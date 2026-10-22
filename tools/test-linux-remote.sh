@@ -44,6 +44,7 @@ export PATH="$CARGO_HOME/bin:$PATH"
 [[ -x $CARGO_HOME/bin/cargo ]] || { echo "Install Rust with rustfmt and clippy in $root/toolchain before running." >&2; exit 2; }
 tar -xf "$incoming" -C "$run/source"
 rm "$incoming"
+python3 "$run/source/tools/source-manifest.py" verify "$run/source" > "$run/evidence/source-input-verification.json"
 {
     cat /proc/sys/kernel/random/boot_id
     cat /proc/self/cgroup
@@ -73,6 +74,8 @@ cargo fmt --check > "$run/evidence/fmt.log" 2>&1
 fmt_status=$?
 python3 tools/test-example-inputs.py > "$run/evidence/sdk-input-tests.log" 2>&1
 sdk_input_status=$?
+python3 tools/test-source-manifest.py > "$run/evidence/source-transfer-tests.log" 2>&1
+source_transfer_status=$?
 cargo clippy --locked --all-targets -- -D warnings > "$run/evidence/clippy.log" 2>&1
 clippy_status=$?
 cargo test --locked "${regular_targets[@]}" -- "${regular_filters[@]}" --nocapture > "$run/evidence/tests.log" 2>&1
@@ -133,11 +136,12 @@ for counter in oom oom_kill oom_group_kill; do
     after=$(awk -v counter="$counter" '$1 == counter {print $2}' "$run/evidence/memory.events.after")
     [[ -n $before && $before == "$after" ]] || resource_status=1
 done
-printf '{"fmt":%s,"sdk_inputs":%s,"clippy":%s,"tests":%s,"doctests_requested":%s,"doctests":%s,"spec_requested":%s,"spec":%s,"fuzz_requested":%s,"fuzz":%s,"skip_fuzz":%s,"corpus_mode":"%s","resources":%s,"expected_cgroup_swap_max":"%s"}\n' "$fmt_status" "$sdk_input_status" "$clippy_status" "$test_status" "$run_doctest" "$doctest_status" "$run_spec" "$spec_status" "$run_fuzz" "$fuzz_status" "$skip_fuzz" "$corpus_mode" "$resource_status" "$expected_swap_max" > "$run/evidence/status.json"
+printf '{"fmt":%s,"sdk_inputs":%s,"source_transfer":%s,"clippy":%s,"tests":%s,"doctests_requested":%s,"doctests":%s,"spec_requested":%s,"spec":%s,"fuzz_requested":%s,"fuzz":%s,"skip_fuzz":%s,"corpus_mode":"%s","resources":%s,"expected_cgroup_swap_max":"%s"}\n' "$fmt_status" "$sdk_input_status" "$source_transfer_status" "$clippy_status" "$test_status" "$run_doctest" "$doctest_status" "$run_spec" "$spec_status" "$run_fuzz" "$fuzz_status" "$skip_fuzz" "$corpus_mode" "$resource_status" "$expected_swap_max" > "$run/evidence/status.json"
 cat "$run/evidence/status.json"
 printf 'Evidence: %s\n' "$run/evidence"
 cat "$run/evidence/fmt.log" "$run/evidence/clippy.log"
 tail -5 "$run/evidence/sdk-input-tests.log"
+tail -5 "$run/evidence/source-transfer-tests.log"
 tail -45 "$run/evidence/tests.log"
 if [[ $run_doctest == 1 ]]; then tail -20 "$run/evidence/doctests.log"; fi
 if [[ $run_spec == 1 ]]; then
@@ -146,4 +150,4 @@ if [[ $run_spec == 1 ]]; then
     done
 fi
 if [[ $run_fuzz == 1 && -f $run/evidence/fuzz.log ]]; then tail -20 "$run/evidence/fuzz.log"; fi
-[[ $fmt_status == 0 && $sdk_input_status == 0 && $clippy_status == 0 && $test_status == 0 && $doctest_status == 0 && $spec_status == 0 && $fuzz_status == 0 && $resource_status == 0 ]]
+[[ $fmt_status == 0 && $sdk_input_status == 0 && $source_transfer_status == 0 && $clippy_status == 0 && $test_status == 0 && $doctest_status == 0 && $spec_status == 0 && $fuzz_status == 0 && $resource_status == 0 ]]

@@ -13,6 +13,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "worktree_tools.rs"]
+mod worktree_tools;
+pub use worktree_tools::clean;
+pub use worktree_tools::mergetool;
+pub use worktree_tools::squash_merge;
+
 const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
@@ -686,12 +692,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         "rev-parse" if args.len() == 3 => resolve_revision(&state.repo, &args[2]),
         "cat-file" if args.len() == 3 => json_text(&state.repo.read_commit(&args[2])?),
         "cat-file" if args.len() == 4 && matches!(args[2].as_str(), "-t" | "-s" | "-p") => {
-            let id = if args[3].len() == 64 && args[3].bytes().all(|b| b.is_ascii_hexdigit()) {
-                args[3].clone()
-            } else {
-                state.repo.resolve(&args[3])?
-            };
-            let (kind, bytes) = state.repo.cat_object(&id)?;
+            let (_, kind, bytes) = state.repo.resolve_object(&args[3])?;
             match args[2].as_str() {
                 "-t" => Ok(kind),
                 "-s" => Ok(bytes.len().to_string()),
@@ -714,6 +715,137 @@ pub fn run(args: &[String]) -> Result<String, String> {
         "reflog" if args.len() == 2 => json_text(&state.repo.reflog()?),
         _ => Err(USAGE.into()),
     }
+}
+
+/// Plumbing publishes immutable tree objects without moving HEAD or index.
+pub fn write_tree(root: &str) -> Result<String, String> {
+    let state = State::open(root)?;
+    let _lock = state.lock()?;
+    let index = state
+        .index()?
+        .ok_or("write-tree requires an existing index")?;
+    state.repo.create_files_tree(&index.files)
+}
+
+pub fn encode_worktree_index(files: &Files, legacy_path: Option<&str>) -> Result<Vec<u8>, String> {
+    index_bytes(&Index {
+        format: 2,
+        files: files.clone(),
+        legacy_path: legacy_path.map(str::to_owned),
+    })
+}
+
+pub fn remove_linked_worktree(source: &str, target: &str, force: bool) -> Result<String, String> {
+    let state = State::open(target)?;
+    let _lock = state.lock()?;
+    require_no_pending(&state.repo)?;
+    if state.repo.root.join(".git").symlink_metadata().is_ok() {
+        return Err(
+            "worktree root also contains native Git metadata; remove refuses it even with --force"
+                .into(),
+        );
+    }
+    let source = Repository::open(source)?;
+    if fs::canonicalize(source.common_metadata()).map_err(|error| error.to_string())?
+        != fs::canonicalize(state.repo.common_metadata()).map_err(|error| error.to_string())?
+    {
+        return Err("worktree belongs to a different repository".into());
+    }
+    let index = state.index()?.ok_or("linked worktree has no index")?;
+    if !force {
+        clean_index(&state)?;
+        if !state.stashes()?.entries.is_empty() {
+            return Err("worktree contains local stash entries; use --force explicitly".into());
+        }
+    }
+    let mut directories = vec![state.repo.root.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let full = entry.path();
+            if full == state.metadata {
+                continue;
+            }
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_symlink() || (!kind.is_dir() && !kind.is_file()) {
+                return Err("worktree remove refuses symbolic links or special files".into());
+            }
+            if kind.is_dir() {
+                if full.join(".uwgit").exists() || full.join(".git").exists() {
+                    return Err("worktree contains a nested repository".into());
+                }
+                directories.push(full);
+            } else if !force {
+                let path = full
+                    .strip_prefix(&state.repo.root)
+                    .map_err(|_| "worktree file escaped root")?
+                    .to_str()
+                    .ok_or("worktree removal requires UTF-8 paths")?;
+                if !index.files.contains_key(path) {
+                    return Err(format!(
+                        "worktree contains untracked file {path:?}; use --force explicitly"
+                    ));
+                }
+            }
+        }
+    }
+    json_text(&source.remove_linked_worktree(&state.repo.root)?)
+}
+
+pub fn move_linked_worktree(source: &str, target: &str, new_path: &str) -> Result<String, String> {
+    let state = State::open(target)?;
+    let mut lock = state.lock()?;
+    let source = Repository::open(source)?;
+    if fs::canonicalize(source.common_metadata()).map_err(|error| error.to_string())?
+        != fs::canonicalize(state.repo.common_metadata()).map_err(|error| error.to_string())?
+    {
+        return Err("worktree belongs to a different repository".into());
+    }
+    let result = source.move_linked_worktree(&state.repo.root, Path::new(new_path));
+    if !state.repo.root.exists() {
+        if let Ok(moved) = fs::canonicalize(new_path) {
+            lock.0 = moved.join(".uwgit/index.lock");
+        }
+    }
+    json_text(&result?)
+}
+
+/// Replace only the index with a complete immutable tree. Existing work bytes
+/// and pending conflict state remain available for explicit review.
+pub fn read_tree(root: &str, revision: Option<&str>) -> Result<String, String> {
+    let state = State::open(root)?;
+    let _lock = state.lock()?;
+    let index = if let Some(revision) = revision {
+        let snapshot = state.repo.archive_files(revision)?;
+        if snapshot.legacy.is_some() {
+            return Err(
+                "read-tree requires a named tree; use restore with an explicit legacy path".into(),
+            );
+        }
+        Index {
+            format: 2,
+            files: snapshot.files,
+            legacy_path: snapshot.legacy_path,
+        }
+    } else {
+        Index::empty()
+    };
+    state.save_index(&index)?;
+    json_text(
+        &json!({"status":"read_tree","paths":index.files.keys().collect::<Vec<_>>(),"worktree_updated":false,"head_updated":false}),
+    )
+}
+
+pub fn garbage_collect(root: &str, prune: bool) -> Result<String, String> {
+    let state = State::open(root)?;
+    let _lock = state.lock()?;
+    let roots: Vec<_> = state
+        .stashes()?
+        .entries
+        .into_iter()
+        .map(|stash| stash.base)
+        .collect();
+    json_text(&state.repo.garbage_collect(&roots, prune)?)
 }
 
 /// Ordinary history writes cannot accidentally replace a recorded resolution.
@@ -1681,6 +1813,33 @@ pub fn diff_snapshot(root: &str, cached: bool) -> Result<Vec<FileDiffSnapshot>, 
             old_origin: json!({"kind":old_kind,"path":p,"commit":if cached{head}else{None}}),
             new_origin: json!({"kind":new_kind,"path":p}),
             path: p,
+        })
+        .collect())
+}
+
+pub fn diff_index_snapshot(
+    root: &str,
+    revision: &str,
+    cached: bool,
+) -> Result<Vec<FileDiffSnapshot>, String> {
+    let state = State::open(root)?;
+    let _lock = state.lock()?;
+    let index = state.starting_index(None)?;
+    let old = state.revision_index(revision, index.legacy_path.as_deref())?;
+    let new = if cached {
+        files_worktree(&index.files)
+    } else {
+        state.snapshot_worktree(index.files.keys().cloned())?
+    };
+    let paths: BTreeSet<_> = old.files.keys().chain(new.keys()).cloned().collect();
+    Ok(paths
+        .into_iter()
+        .map(|path| FileDiffSnapshot {
+            old: old.files.get(&path).cloned(),
+            new: new.get(&path).cloned().flatten(),
+            old_origin: json!({"kind":"commit","revision":revision,"path":path}),
+            new_origin: json!({"kind":if cached {"index"} else {"worktree"},"path":path}),
+            path,
         })
         .collect())
 }

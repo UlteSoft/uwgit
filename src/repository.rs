@@ -7,7 +7,8 @@
 //! Mutations and consistent snapshots use `.uwgit/write.lock`; a crashed writer's
 //! lock requires manual inspection and removal before another writer proceeds.
 //!
-//! The object format has no signatures, compression, or garbage collection.
+//! The object format has no signatures or pack compression. Explicit GC
+//! preserves recovery roots and only prunes after a verified full-store plan.
 //! Network authentication belongs to the separate transport layer.
 //! Object verification currently reads the
 //! complete store into memory. Hashes establish integrity, not an author's identity.
@@ -20,6 +21,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "repository_worktrees.rs"]
+mod linked_worktrees;
+#[path = "repository_notes.rs"]
+mod notes_storage;
+pub use notes_storage::NotesRequest;
+#[path = "repository_history_tools.rs"]
+mod history_tools;
+#[path = "repository_merge_tool.rs"]
+mod merge_tool_storage;
+#[path = "repository_plumbing.rs"]
+mod plumbing_storage;
+pub use plumbing_storage::MergeBaseMode;
 
 pub type RepositoryResult<T> = Result<T, String>;
 
@@ -343,6 +357,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct Repository {
     pub root: PathBuf,
     metadata: PathBuf,
+    common_metadata: PathBuf,
 }
 
 /// Field order is part of the version-one canonical commit encoding.
@@ -749,7 +764,11 @@ impl Repository {
         // Write the format marker last; incomplete initialization cannot be opened.
         write_new_file(&metadata.join("format"), FORMAT)?;
         sync_directory(&metadata)?;
-        Ok(Self { root, metadata })
+        Ok(Self {
+            root,
+            common_metadata: metadata.clone(),
+            metadata,
+        })
     }
 
     pub fn open(root: impl AsRef<Path>) -> RepositoryResult<Self> {
@@ -757,13 +776,21 @@ impl Repository {
         require_directory(&root)?;
         let metadata = root.join(".uwgit");
         require_directory(&metadata)?;
+        let common_metadata = linked_worktrees::open_common(&root, &metadata)?;
         for child in ["objects", "refs", "tmp"] {
-            require_directory(&metadata.join(child))?;
+            require_directory(&common_metadata.join(child))?;
         }
-        if read_regular(&metadata.join("format"))? != FORMAT {
+        require_directory(&metadata.join("tmp"))?;
+        if read_regular(&metadata.join("format"))? != FORMAT
+            || read_regular(&common_metadata.join("format"))? != FORMAT
+        {
             return Err("unsupported or incomplete uwgit repository format".into());
         }
-        let repo = Self { root, metadata };
+        let repo = Self {
+            root,
+            metadata,
+            common_metadata,
+        };
         repo.current_branch()?;
         Ok(repo)
     }
@@ -846,6 +873,7 @@ impl Repository {
             expected_branch,
             expected_head,
             false,
+            false,
         )
     }
 
@@ -864,6 +892,27 @@ impl Repository {
             expected_branch,
             expected_head,
             true,
+            false,
+        )
+    }
+
+    pub fn merge_no_ff_on_branch(
+        &self,
+        target: &str,
+        message: &str,
+        expected_branch: &str,
+        expected_head: Option<&str>,
+    ) -> RepositoryResult<RepositoryMergeOutcome> {
+        if expected_head.is_none() {
+            return Err("--no-ff requires a committed HEAD".into());
+        }
+        self.merge_with_policy_on_branch(
+            target,
+            message,
+            expected_branch,
+            expected_head,
+            false,
+            true,
         )
     }
 
@@ -874,6 +923,7 @@ impl Repository {
         expected_branch: &str,
         expected_head: Option<&str>,
         ff_only: bool,
+        no_ff: bool,
     ) -> RepositoryResult<RepositoryMergeOutcome> {
         validate_ref_name(expected_branch)?;
         let _lock = self.lock()?;
@@ -917,7 +967,7 @@ impl Repository {
             outcome.commit = Some(ours);
             return Ok(outcome);
         }
-        if is_ancestor(&ours, &target, &snapshot.objects)? {
+        if !no_ff && is_ancestor(&ours, &target, &snapshot.objects)? {
             crate::porcelain::assert_worktree_revision_safe(
                 self,
                 &snapshot_files(&snapshot, &target)?,
@@ -1408,6 +1458,8 @@ impl Repository {
             return Ok(());
         }
         let old = snapshot.manifest.refs.get(&snapshot.manifest.head).cloned();
+        self.assert_branch_available(name)?;
+        self.register_selected_branch(name)?;
         self.atomic_write(&self.metadata.join("HEAD"), format!("{name}\n").as_bytes())?;
         self.record_reflog(
             "HEAD",
@@ -2668,6 +2720,8 @@ impl Repository {
         validate_ref_name(new)?;
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
+        self.assert_branch_available(old)?;
+        self.assert_branch_available(new)?;
         if old == new {
             return Err("old and new branch names are identical".into());
         }
@@ -2700,6 +2754,7 @@ impl Repository {
                 .map_err(|error| format!("replacement branch {new} is present and original branch {old} is retained; moving its upstream association did not complete durably: {error}"))?;
         }
         if snapshot.manifest.head == old {
+            self.register_selected_branch(new)?;
             self.atomic_write(&self.metadata.join("HEAD"), format!("{new}\n").as_bytes())
                 .map_err(|error| format!("rename branch {old} -> {new}: replacement branch and any upstream move were published, but HEAD publication is uncertain; the original branch has not been removed: {error}"))?;
             self.record_reflog(
@@ -3136,7 +3191,12 @@ impl Repository {
     }
 
     fn lock_named(&self, name: &str) -> RepositoryResult<WriteLock> {
-        let path = self.metadata.join(name);
+        let directory = if name == "write.lock" {
+            &self.common_metadata
+        } else {
+            &self.metadata
+        };
+        let path = directory.join(name);
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -3324,7 +3384,7 @@ impl Repository {
         &self,
         branches: &BTreeMap<String, String>,
     ) -> RepositoryResult<BTreeMap<String, Upstream>> {
-        let path = self.metadata.join("upstreams.json");
+        let path = self.common_metadata.join("upstreams.json");
         let metadata = match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(BTreeMap::new());
@@ -3378,7 +3438,7 @@ impl Repository {
     /// A failed atomic write can have reached rename or directory sync. Never
     /// describe such an I/O outcome as a rolled-back association change.
     fn publish_upstreams(&self, bytes: &[u8], operation: &str) -> RepositoryResult<()> {
-        self.atomic_write(&self.metadata.join("upstreams.json"), bytes)
+        self.atomic_write(&self.common_metadata.join("upstreams.json"), bytes)
             .map_err(|error| format!("{operation}: upstream metadata publication may have occurred: {error}; inspect .uwgit/upstreams.json before retrying"))
     }
 
@@ -3394,7 +3454,7 @@ impl Repository {
             url: String,
             state: RepositoryState,
         }
-        let path = self.metadata.join("remotes");
+        let path = self.common_metadata.join("remotes");
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(e) => return Err(io_error("inspect remote tracking", &path, e)),
@@ -3450,28 +3510,44 @@ impl Repository {
         optional: bool,
     ) -> RepositoryResult<BTreeMap<String, String>> {
         let mut refs = BTreeMap::new();
-        let path = self.metadata.join(namespace);
+        let path = self.common_metadata.join(namespace);
         match fs::symlink_metadata(&path) {
             Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(refs),
             Err(e) => return Err(io_error("inspect refs directory", &path, e)),
             Ok(_) => require_directory(&path)?,
         }
-        for entry in fs::read_dir(&path).map_err(|e| io_error("read refs", &path, e))? {
-            let entry = entry.map_err(|e| format!("read reference entry: {e}"))?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "non-UTF-8 reference name".to_string())?;
-            validate_ref_name(&name)?;
-            let id = parse_ref_file(&read_regular(&entry.path())?, true)?;
-            refs.insert(name, id);
+        let mut pending = vec![(String::new(), path)];
+        while let Some((prefix, directory)) = pending.pop() {
+            require_directory(&directory)?;
+            for entry in
+                fs::read_dir(&directory).map_err(|e| io_error("read refs", &directory, e))?
+            {
+                let entry = entry.map_err(|e| format!("read reference entry: {e}"))?;
+                let component = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "non-UTF-8 reference name")?;
+                let name = if prefix.is_empty() {
+                    component
+                } else {
+                    format!("{prefix}/{component}")
+                };
+                validate_ref_name(&name)?;
+                let kind = entry.file_type().map_err(|e| e.to_string())?;
+                if kind.is_dir() {
+                    pending.push((name, entry.path()));
+                } else {
+                    let id = parse_ref_file(&read_regular(&entry.path())?, true)?;
+                    refs.insert(name, id);
+                }
+            }
         }
         Ok(refs)
     }
 
     fn read_ref_optional(&self, name: &str) -> RepositoryResult<Option<String>> {
         validate_ref_name(name)?;
-        let path = self.metadata.join("refs").join(name);
+        let path = self.common_metadata.join("refs").join(name);
         match fs::symlink_metadata(&path) {
             Ok(_) => Ok(Some(parse_ref_file(&read_regular(&path)?, true)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3492,16 +3568,33 @@ impl Repository {
     ) -> RepositoryResult<()> {
         validate_ref_name(name)?;
         require_id(id)?;
+        if namespace == "refs" {
+            self.assert_branch_available(name)?;
+        }
         self.read_reflog()?;
-        let directory = self.metadata.join(namespace);
+        let directory = self.common_metadata.join(namespace);
         match fs::symlink_metadata(&directory) {
             Err(e) if namespace == "tags" && e.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&directory)
                     .map_err(|e| io_error("create tag directory", &directory, e))?;
-                sync_directory(&self.metadata)?;
+                sync_directory(&self.common_metadata)?;
             }
             Err(e) => return Err(io_error("inspect reference directory", &directory, e)),
             Ok(_) => require_directory(&directory)?,
+        }
+        let mut parent = directory.clone();
+        let components: Vec<_> = name.split('/').collect();
+        for component in &components[..components.len() - 1] {
+            parent.push(component);
+            match fs::create_dir(&parent) {
+                Ok(()) => {
+                    sync_directory(parent.parent().ok_or("reference directory has no parent")?)?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    require_directory(&parent)?
+                }
+                Err(error) => return Err(io_error("create reference directory", &parent, error)),
+            }
         }
         let path = directory.join(name);
         let old = match fs::symlink_metadata(&path) {
@@ -3527,8 +3620,11 @@ impl Repository {
         id: &str,
         operation: &str,
     ) -> RepositoryResult<()> {
+        if namespace == "refs" {
+            self.assert_branch_available(name)?;
+        }
         self.read_reflog()?;
-        let path = self.metadata.join(namespace).join(name);
+        let path = self.common_metadata.join(namespace).join(name);
         if parse_ref_file(&read_regular(&path)?, true)? != id {
             return Err(format!("reference {name} changed before deletion"));
         }
@@ -3552,6 +3648,28 @@ impl Repository {
             fs::remove_file(&path).map_err(|e| io_error("delete reference", &path, e))?;
             sync_directory(path.parent().ok_or("reference has no parent")?)
                 .map_err(|error| format!("reference {name} was deleted but its directory could not be synced: {error}; deletion durability is uncertain"))?;
+            let namespace_root = self.common_metadata.join(namespace);
+            let mut parent = path
+                .parent()
+                .ok_or("reference has no parent")?
+                .to_path_buf();
+            while parent != namespace_root {
+                match fs::remove_dir(&parent) {
+                    Ok(()) => {
+                        parent = parent
+                            .parent()
+                            .ok_or("reference cleanup escaped namespace")?
+                            .to_path_buf();
+                        sync_directory(&parent)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                    Err(error) => {
+                        return Err(format!(
+                        "reference {name} was deleted, but empty-directory cleanup failed: {error}"
+                    ))
+                    }
+                }
+            }
             let reference = format!(
                 "refs/{}/{name}",
                 if namespace == "tags" { "tags" } else { "heads" }
@@ -3564,7 +3682,7 @@ impl Repository {
     }
 
     fn read_reflog(&self) -> RepositoryResult<Vec<ReflogEntry>> {
-        let path = self.metadata.join("reflog");
+        let path = self.common_metadata.join("reflog");
         let bytes = match fs::symlink_metadata(&path) {
             Ok(_) => read_regular(&path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3633,7 +3751,7 @@ impl Repository {
                     .map_err(|e| format!("encode reflog entry: {e}"))?;
                 bytes.push(b'\n');
             }
-            self.atomic_write(&self.metadata.join("reflog"), &bytes)
+            self.atomic_write(&self.common_metadata.join("reflog"), &bytes)
         })();
         result.map_err(|error| format!("reference {reference} was published, but reflog recording failed: {error}; inspect the ref before retrying"))
     }
@@ -3652,7 +3770,12 @@ impl Repository {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_error("inspect destination", destination, e)),
         }
-        let temp = self.metadata.join("tmp").join(unique_name("ref"));
+        let staging = if destination.starts_with(&self.common_metadata) {
+            &self.common_metadata
+        } else {
+            &self.metadata
+        };
+        let temp = staging.join("tmp").join(unique_name("ref"));
         write_new_file(&temp, bytes)?;
         let result = fs::rename(&temp, destination)
             .map_err(|e| io_error("publish reference", destination, e));
@@ -3677,7 +3800,7 @@ impl Repository {
     fn install_encoded_object(&self, id: &str, bytes: &[u8]) -> RepositoryResult<()> {
         require_id(id)?;
         decode_object(id, bytes)?;
-        let destination = self.metadata.join("objects").join(id);
+        let destination = self.common_metadata.join("objects").join(id);
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
                 if read_regular(&destination)? != bytes {
@@ -3688,7 +3811,7 @@ impl Repository {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_error("inspect object", &destination, e)),
         }
-        let temp = self.metadata.join("tmp").join(unique_name("object"));
+        let temp = self.common_metadata.join("tmp").join(unique_name("object"));
         write_new_file(&temp, bytes)?;
         // hard_link publishes a complete object and never replaces an existing
         // object, unlike rename. Both directories are in this repository.
@@ -3705,12 +3828,12 @@ impl Repository {
         };
         let _ = fs::remove_file(&temp);
         result?;
-        sync_directory(&self.metadata.join("objects"))
+        sync_directory(&self.common_metadata.join("objects"))
     }
 
     fn read_object(&self, id: &str) -> RepositoryResult<Object> {
         require_id(id)?;
-        let bytes = read_regular(&self.metadata.join("objects").join(id))?;
+        let bytes = read_regular(&self.common_metadata.join("objects").join(id))?;
         decode_object(id, &bytes)
     }
 
@@ -3755,7 +3878,7 @@ impl Repository {
         };
         let mut encoded = BTreeMap::new();
         let mut objects = BTreeMap::new();
-        let path = self.metadata.join("objects");
+        let path = self.common_metadata.join("objects");
         for entry in fs::read_dir(&path).map_err(|e| io_error("list objects", &path, e))? {
             let entry = entry.map_err(|e| format!("read object entry: {e}"))?;
             let id = entry
@@ -4493,19 +4616,22 @@ fn encode_upstreams(branches: &BTreeMap<String, Upstream>) -> RepositoryResult<V
     Ok(bytes)
 }
 
-fn validate_ref_name(name: &str) -> RepositoryResult<()> {
+pub(crate) fn validate_ref_name(name: &str) -> RepositoryResult<()> {
     if name.is_empty()
         || name.len() > 128
         || name == "HEAD"
+        || name.starts_with("refs/")
         || valid_id(name)
         || !name.as_bytes()[0].is_ascii_alphanumeric()
         || !name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        || name.ends_with(".lock")
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".." || part.ends_with(".lock"))
     {
         return Err(format!(
-            "invalid branch name {name:?}: use 1-128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit; HEAD, object IDs and .lock suffixes are reserved"
+            "invalid branch name {name:?}: use 1-128 ASCII letters, digits, '.', '_', '-', or '/' with nonempty normal path components, starting with a letter or digit; HEAD, object IDs and .lock suffixes are reserved"
         ));
     }
     Ok(())
@@ -5488,10 +5614,6 @@ fn snapshot_base_revision(snapshot: &Snapshot, revision: &str) -> RepositoryResu
         if let Some(id) = snapshot.tracking.get(name) {
             candidates.push(id.clone());
         }
-    } else if revision.contains('/') {
-        if let Some(id) = snapshot.tracking.get(revision) {
-            candidates.push(id.clone());
-        }
     } else if valid_id(revision) {
         candidates.push(revision.into());
     } else {
@@ -5500,6 +5622,9 @@ fn snapshot_base_revision(snapshot: &Snapshot, revision: &str) -> RepositoryResu
             candidates.push(id.clone());
         }
         if let Some(id) = snapshot.manifest.tags.get(revision) {
+            candidates.push(id.clone());
+        }
+        if let Some(id) = snapshot.tracking.get(revision) {
             candidates.push(id.clone());
         }
         if (4..64).contains(&revision.len())
@@ -5547,12 +5672,15 @@ fn description_commit_prefix(revision: &str) -> Option<String> {
     let (label, distance) = head.rsplit_once('-')?;
     if label.is_empty()
         || label.len() > 128
-        || distance.is_empty()
-        || !distance.bytes().all(|byte| byte.is_ascii_digit())
         || !label.as_bytes()[0].is_ascii_alphanumeric()
         || !label
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+        || label
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || distance.is_empty()
+        || !distance.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
@@ -6114,6 +6242,17 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
     } else {
         Vec::new()
     };
+    let no_ff = if command == "merge" {
+        crate::command_args::option_indices(args, "--no-ff")
+    } else {
+        Vec::new()
+    };
+    if !ff_only.is_empty() && !no_ff.is_empty() {
+        return Err("merge --ff-only and --no-ff are mutually exclusive".into());
+    }
+    if no_ff.len() > 1 {
+        return Err("merge --no-ff may be supplied only once".into());
+    }
     match command {
         "init" if args.len() == 2 => {
             let repo = Repository::init(&args[1])?;
@@ -6125,8 +6264,8 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             let id = repo.commit(&bytes, &args[4])?;
             Ok(format!("{} {id}", repo.current_branch()?))
         }
-        "merge" if !ff_only.is_empty() => {
-            if ff_only.len() != 1 {
+        "merge" if !ff_only.is_empty() || !no_ff.is_empty() => {
+            if ff_only.len() > 1 {
                 return Err("merge --ff-only may be supplied only once".into());
             }
             if ["--resolved", "--resolved-index", "--expect-head", "--expect-branch"]
@@ -6138,10 +6277,10 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             let normalized: Vec<_> = args
                 .iter()
                 .enumerate()
-                .filter_map(|(index, value)| (index != ff_only[0]).then_some(value.as_str()))
+                .filter_map(|(index, value)| (!ff_only.contains(&index) && !no_ff.contains(&index)).then_some(value.as_str()))
                 .collect();
             let (root, target, message) = match normalized.as_slice() {
-                [_, root, target] => (*root, *target, ""),
+                [_, root, target] if no_ff.is_empty() => (*root, *target, ""),
                 [_, root, target, message_flag, message]
                     if matches!(*message_flag, "-m" | "--message") =>
                 {
@@ -6151,12 +6290,8 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             };
             let repo = Repository::open(root)?;
             let state = repo.state()?;
-            let outcome = repo.merge_ff_only_on_branch(
-                target,
-                message,
-                &state.head,
-                state.branches.get(&state.head).map(String::as_str),
-            )?;
+            let outcome = if no_ff.is_empty() { repo.merge_ff_only_on_branch(target,message,&state.head,state.branches.get(&state.head).map(String::as_str))? }
+            else { repo.merge_no_ff_on_branch(target,message,&state.head,state.branches.get(&state.head).map(String::as_str))? };
             serde_json::to_string_pretty(&outcome)
                 .map_err(|e| format!("encode merge outcome: {e}"))
         }
@@ -7938,7 +8073,7 @@ mod tests {
             format!("label--g{tip}"),
             format!("label-g{tip}"),
             "label-1-g".into(),
-            format!("bad/label-1-g{tip}"),
+            format!("bad/../label-1-g{tip}"),
             format!("{}-1-g{tip}", "t".repeat(129)),
             format!("label-1-g{}", &tip[..3]),
         ] {
@@ -10210,7 +10345,7 @@ mod tests {
             ("main", "bad.remote", "main", root.as_str()),
             ("main", "../origin", "main", root.as_str()),
             ("main", "origin", "HEAD", root.as_str()),
-            ("main", "origin", "topic/nested", root.as_str()),
+            ("main", "origin", "topic/../nested", root.as_str()),
             ("main", "origin", "topic.lock", root.as_str()),
             ("main", "origin", "main", "HEAD"),
         ] {
@@ -11042,7 +11177,7 @@ mod tests {
         for bad in [
             "../outside",
             "/tmp/escape",
-            "a/b",
+            "a/../b",
             ".",
             "..",
             "HEAD",

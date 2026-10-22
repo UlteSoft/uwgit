@@ -44,7 +44,7 @@ JSON 的 `status` 区分 `testing`、`found`、`ambiguous_skipped`、`inactive` 
 
 会话不进入 commit、bundle、clone 或远端广告，也不改变原有对象格式。status、next、log 不发布会话修改。除 reset 外，操作都使用一次 writer 锁中的完整已验证对象快照，不读取 index、pending 或工作文件；不相关的脏状态不影响已提交历史。reset 只移除常规会话文件并同步目录，可清理损坏 JSON，不读取或认证对象，因此报告 `object_verification: not_requested`；其他操作报告完整快照验证。链接、目录及其他特殊会话文件明确拒绝，不作为待清理常规文件处理。
 
-现有 count-objects 仍按引用、tracking 与 reflog 端点统计可达性，不把本地 bisect 会话列为额外 root；unreachable 不是允许删除的证明，垃圾回收仍未实现。
+现有 count-objects 仍按引用、tracking 与 reflog 端点统计可达性，不把本地 bisect 会话列为额外 root；unreachable 不是允许删除的证明，显式 GC 的保守恢复 root 策略见[维护契约](native-commands.md)。
 
 start/mark 的原子发布与 reset 的目录同步沿用仓库已有边界：发布、删除或结果写出后的 I/O 错误可能发生在元数据已改变之后，应先查询实际会话再重试。不会为了恢复会话而修改历史、暂存或工作字节。已跳过的事件保留在日志中；报告的 skip 只列当前范围内仍未分类的跳过项，不把已被后续判断排除的项目继续算作未知。
 

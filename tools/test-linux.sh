@@ -31,6 +31,9 @@ staging=$(mktemp -d /tmp/uwgit-source.XXXXXXXX)
 trap 'rm -rf "$staging"' EXIT
 COPYFILE_DISABLE=1 tar --no-xattrs --exclude='._*' -cf "$staging/source.tar" -C "$repo_dir" \
     Cargo.toml Cargo.lock src tests tools vendor fuzz/Cargo.toml fuzz/Cargo.lock fuzz/generate_seeds.rs fuzz/fuzz_targets
+python3 "$repo_dir/tools/source-manifest.py" create "$staging/source.tar" "$staging/source-inputs.json"
+COPYFILE_DISABLE=1 tar --no-xattrs -rf "$staging/source.tar" -C "$staging" source-inputs.json
 incoming="/tmp/uwgit-source-$(id -u)-$$.tar"
 scp -q "$staging/source.tar" "$remote_host:$incoming"
 ssh "$remote_host" "docker exec -i '$container' chroot /host /bin/bash -s -- '$remote_root' '$incoming' '$run_spec' '$run_fuzz' '$skip_fuzz' '$corpus_mode' '$run_doctest' '$expected_swap_max'" < "$repo_dir/tools/test-linux-remote.sh"
+python3 "$repo_dir/tools/source-manifest.py" compare "$staging/source-inputs.json" "$repo_dir"

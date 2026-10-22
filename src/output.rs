@@ -143,6 +143,27 @@ pub fn write_export_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     write_new_file(&parent.join(filename), bytes)
 }
 
+pub fn create_export_directory(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .ok_or("export directory must name a new directory")?;
+    let parent = fs::canonicalize(parent_directory(path))
+        .map_err(|error| io_error("resolve export parent", parent_directory(path), error))?;
+    if name.to_string_lossy().eq_ignore_ascii_case(".uwgit")
+        || parent.components().any(|part| {
+            part.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".uwgit")
+        })
+    {
+        return Err("export directory must be outside repository metadata".into());
+    }
+    let destination = parent.join(name);
+    fs::create_dir(&destination)
+        .map_err(|error| io_error("create export directory", &destination, error))?;
+    Ok(destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
