@@ -89,63 +89,7 @@ impl Repository {
     pub fn resolve_object(&self, revision: &str) -> RepositoryResult<(String, String, Vec<u8>)> {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
-        let id = if let Some((reference, path)) = revision.split_once(':') {
-            validate_tree_path(path)?;
-            let commit = snapshot_revision(&snapshot, reference)?;
-            let Some(Object::Commit(commit)) = snapshot.objects.get(&commit) else {
-                return Err("object path revision is not a commit".into());
-            };
-            let Some(tree) = &commit.tree else {
-                return Err("legacy commit has no named tree".into());
-            };
-            let Some(Object::Tree(tree)) = snapshot.objects.get(tree) else {
-                return Err("missing object path tree".into());
-            };
-            tree.entries
-                .get(path)
-                .ok_or("object path is absent from revision")?
-                .clone()
-        } else if let Some(reference) = revision.strip_suffix("^{tree}") {
-            let commit = snapshot_revision(&snapshot, reference)?;
-            let Some(Object::Commit(commit)) = snapshot.objects.get(&commit) else {
-                return Err("expected commit".into());
-            };
-            commit
-                .tree
-                .clone()
-                .ok_or("legacy commit has no tree object")?
-        } else if valid_id(revision) && snapshot.objects.contains_key(revision) {
-            revision.into()
-        } else if revision == "HEAD"
-            || revision == "@"
-            || revision.contains("@{")
-            || snapshot.manifest.refs.contains_key(revision)
-            || snapshot.manifest.tags.contains_key(revision)
-            || snapshot.tracking.contains_key(revision)
-            || revision.contains('~')
-            || revision.contains('^')
-            || revision.starts_with("refs/")
-        {
-            snapshot_revision(&snapshot, revision)?
-        } else {
-            if !(4..64).contains(&revision.len())
-                || !revision
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err("unknown object revision".into());
-            }
-            let ids: Vec<_> = snapshot
-                .objects
-                .keys()
-                .filter(|id| id.starts_with(revision))
-                .collect();
-            match ids.as_slice() {
-                [id] => (*id).clone(),
-                [] => return Err("unknown object prefix".into()),
-                _ => return Err("ambiguous object prefix".into()),
-            }
-        };
+        let id = snapshot_object_id(&snapshot, revision)?;
         let object = query_object(&snapshot, &id)?;
         let bytes = snapshot.encoded.get(&id).ok_or("missing encoded object")?;
         Ok((id, object.kind, bytes[OBJECT_HEADER_LENGTH..].to_vec()))
@@ -719,4 +663,67 @@ fn collect_commits(
         );
     }
     Ok(())
+}
+
+/// Resolve existing object syntax in the caller's already verified snapshot.
+pub(super) fn snapshot_object_id(snapshot: &Snapshot, revision: &str) -> RepositoryResult<String> {
+    let id = if let Some((reference, path)) = revision.split_once(':') {
+        validate_tree_path(path)?;
+        let commit = snapshot_revision(snapshot, reference)?;
+        let Some(Object::Commit(commit)) = snapshot.objects.get(&commit) else {
+            return Err("object path revision is not a commit".into());
+        };
+        let Some(tree) = &commit.tree else {
+            return Err("legacy commit has no named tree".into());
+        };
+        let Some(Object::Tree(tree)) = snapshot.objects.get(tree) else {
+            return Err("missing object path tree".into());
+        };
+        tree.entries
+            .get(path)
+            .ok_or("object path is absent from revision")?
+            .clone()
+    } else if let Some(reference) = revision.strip_suffix("^{tree}") {
+        let commit = snapshot_revision(snapshot, reference)?;
+        let Some(Object::Commit(commit)) = snapshot.objects.get(&commit) else {
+            return Err("expected commit".into());
+        };
+        commit
+            .tree
+            .clone()
+            .ok_or("legacy commit has no tree object")?
+    } else if valid_id(revision) && snapshot.objects.contains_key(revision) {
+        revision.into()
+    } else if revision == "HEAD"
+        || revision == "@"
+        || revision.contains("@{")
+        || snapshot.manifest.refs.contains_key(revision)
+        || snapshot.manifest.tags.contains_key(revision)
+        || snapshot.tracking.contains_key(revision)
+        || revision.contains('~')
+        || revision.contains('^')
+        || revision.starts_with("refs/")
+    {
+        snapshot_revision(snapshot, revision)?
+    } else {
+        if !(4..64).contains(&revision.len())
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("unknown object revision".into());
+        }
+        let ids: Vec<_> = snapshot
+            .objects
+            .keys()
+            .filter(|id| id.starts_with(revision))
+            .collect();
+        match ids.as_slice() {
+            [id] => (*id).clone(),
+            [] => return Err("unknown object prefix".into()),
+            _ => return Err("ambiguous object prefix".into()),
+        }
+    };
+    query_object(snapshot, &id)?;
+    Ok(id)
 }

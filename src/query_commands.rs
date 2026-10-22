@@ -1,7 +1,10 @@
 //! Read-only views bound to one verified repository snapshot per query.
-use crate::repository::{QueryRef, QueryRefs, Repository, RepositoryResult};
+use crate::repository::{QueryRef, QueryRefs, ReferenceFilter, Repository, RepositoryResult};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+#[path = "branch_listing.rs"]
+mod branch_listing;
+pub use branch_listing::requested as branch_listing_requested;
 
 pub struct QueryOutput {
     pub stdout: String,
@@ -26,7 +29,8 @@ impl QueryOutput {
 
 const TREE_USAGE: &str = "usage: wasm-git ls-tree DIR REV [-r] [--json | --name-only | --object-only] [-z] [-- PATH...]\nThe stored tree is flat: -r includes the same complete paths. JSON reports actual object IDs and payload/envelope sizes; no directory objects or modes are invented. Text modes require a named tree. Paths select an exact file, a directory prefix, or '.'; every selector must match. -z requires a text mode and emits raw UTF-8/NUL without an extra newline.";
 const SHOW_USAGE: &str = "usage: wasm-git show-ref DIR [--head] [--heads|--branches] [--tags] [--verify] [--quiet|-q | --hash | --json] [PATTERN...]\nDefault output: ID SPACE full-ref LF. Patterns are literal component-boundary suffixes. --head adds the committed HEAD regardless of non-verify filters. --verify requires exact full refs or HEAD and fails atomically with exit 1 if any are missing. No match exits 1; --quiet suppresses output. Unborn HEAD has no invented ID.";
-const EACH_USAGE: &str = "usage: wasm-git for-each-ref DIR [--json | --format STR] [--sort KEY]... [--count N] [PATTERN...]\nPatterns are full-ref literal prefixes at slash boundaries, or full-ref globs using only '*' and '?'. Sort keys: refname, objectname, objectsize (payload bytes); '-' reverses order and the last key is primary. Count 0 means unlimited. Format atoms: refname, objectname, objecttype, objectsize, HEAD, upstream. %% and %00..%7f are supported; one LF is appended per row. Other atoms/modifiers/escapes are rejected. HEAD is not a ref row.";
+const EACH_USAGE: &str = "usage: wasm-git for-each-ref DIR [--json | --format STR] [--sort KEY]... [--count N] [--contains [REV]] [--no-contains [REV]] [--merged [REV]] [--no-merged [REV]] [--points-at OBJECT] [--exclude PATTERN]... [--ignore-case] [--omit-empty] [PATTERN...]\nGraph filters use one native snapshot and default to HEAD. Repeated positive predicates are ORed within a family; negative predicates exclude every match. Points-at accepts native object syntax. Patterns are slash-boundary full-ref prefixes; '*'/'?' stay within one component, and a whole '**' component is recursive. Format/sort atoms: refname, upstream (short/lstrip/strip/rstrip), objectname, objecttype, objectsize (numeric payload bytes), HEAD. Last sort is primary; '-' reverses. Count is unsigned 64-bit; 0 means unlimited. Native ambiguous short names stay fully qualified. %% and %00..%7f are supported. --omit-empty suppresses empty formatted rows; no HEAD row is invented.";
+
 const COUNT_USAGE: &str = "usage: wasm-git count-objects DIR [-v|--verbose] [-H|--human-readable]\nJSON counts unique loose SHA-256 objects and logical payload/envelope bytes, not allocated filesystem blocks or compressed Git packs. -v includes per-kind counts; -H adds human-readable byte sizes. Reachability includes local refs, fetched tracking branches and reflog endpoints; pending/index and remote-only cached tags are excluded. Unreachable does not imply safe deletion.";
 
 pub fn handles(command: &str) -> bool {
@@ -44,6 +48,9 @@ pub fn handles(command: &str) -> bool {
 
 pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
     let command = args.first().map_or("", String::as_str);
+    if command == "branch" {
+        return branch_listing::run(args);
+    }
     if command == "describe" {
         return crate::describe_commands::describe_query(args);
     }
@@ -373,17 +380,59 @@ pub fn tail_ref_match(reference: &str, pattern: &str) -> RepositoryResult<bool> 
 }
 
 #[derive(Clone, Copy)]
+enum NameModifier {
+    Full,
+    Short,
+    Left(i64),
+    Right(i64),
+}
+#[derive(Clone, Copy)]
 enum Atom {
-    Refname,
+    Refname(NameModifier),
     Objectname,
     Objecttype,
     Objectsize,
     Head,
-    Upstream,
+    Upstream(NameModifier),
 }
 enum Fragment {
     Literal(String),
     Atom(Atom),
+}
+
+fn name_modifier(value: Option<&str>) -> RepositoryResult<NameModifier> {
+    let Some(value) = value else {
+        return Ok(NameModifier::Full);
+    };
+    if value == "short" {
+        return Ok(NameModifier::Short);
+    }
+    let (key, count) = value
+        .split_once('=')
+        .ok_or("unknown reference name modifier")?;
+    let count = count
+        .parse::<i64>()
+        .map_err(|_| "reference strip count must be a signed 64-bit integer")?;
+    match key {
+        "strip" | "lstrip" => Ok(NameModifier::Left(count)),
+        "rstrip" => Ok(NameModifier::Right(count)),
+        _ => Err("unknown reference name modifier".into()),
+    }
+}
+
+fn parse_atom(value: &str) -> RepositoryResult<Atom> {
+    let (name, modifier) = value
+        .split_once(':')
+        .map_or((value, None), |(name, modifier)| (name, Some(modifier)));
+    match (name, modifier) {
+        ("refname", modifier) => Ok(Atom::Refname(name_modifier(modifier)?)),
+        ("upstream", modifier) => Ok(Atom::Upstream(name_modifier(modifier)?)),
+        ("objectname", None) => Ok(Atom::Objectname),
+        ("objecttype", None) => Ok(Atom::Objecttype),
+        ("objectsize", None) => Ok(Atom::Objectsize),
+        ("HEAD", None) => Ok(Atom::Head),
+        _ => Err(format!("unsupported query format atom: {value:?}")),
+    }
 }
 
 fn compile_format(format: &str) -> RepositoryResult<Vec<Fragment>> {
@@ -401,15 +450,7 @@ fn compile_format(format: &str) -> RepositoryResult<Vec<Fragment>> {
             rest = tail;
         } else if let Some(tail) = rest.strip_prefix('(') {
             let end = tail.find(')').ok_or("unterminated query format atom")?;
-            let atom = match &tail[..end] {
-                "refname" => Atom::Refname,
-                "objectname" => Atom::Objectname,
-                "objecttype" => Atom::Objecttype,
-                "objectsize" => Atom::Objectsize,
-                "HEAD" => Atom::Head,
-                "upstream" => Atom::Upstream,
-                name => return Err(format!("unsupported query format atom: {name:?}")),
-            };
+            let atom = parse_atom(&tail[..end])?;
             fragments.push(Fragment::Literal(std::mem::take(&mut literal)));
             fragments.push(Fragment::Atom(atom));
             rest = &tail[end + 1..];
@@ -434,28 +475,214 @@ fn compile_format(format: &str) -> RepositoryResult<Vec<Fragment>> {
     Ok(fragments)
 }
 
-fn render_format(fragments: &[Fragment], row: &QueryRef, output: &mut String) {
+fn render_name(name: &str, modifier: NameModifier, report: &QueryRefs) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    let (left, count) = match modifier {
+        NameModifier::Full => return name.into(),
+        NameModifier::Short => {
+            return report
+                .short_names
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.into())
+        }
+        NameModifier::Left(count) => (true, count),
+        NameModifier::Right(count) => (false, count),
+    };
+    let parts: Vec<_> = name.split('/').collect();
+    // Bound the unsigned magnitude before converting to usize. Even i64::MIN
+    // has identical, non-panicking semantics on actual 32-bit hosts.
+    let count_usize = count.unsigned_abs().min(parts.len() as u64) as usize;
+    let remaining = if count < 0 {
+        count_usize
+    } else {
+        parts.len() - count_usize
+    };
+    if left {
+        parts[parts.len() - remaining..].join("/")
+    } else {
+        parts[..remaining].join("/")
+    }
+}
+
+fn atom_value(atom: Atom, row: &QueryRef, report: &QueryRefs) -> String {
+    match atom {
+        Atom::Refname(modifier) => render_name(&row.name, modifier, report),
+        Atom::Objectname => row.id.clone(),
+        Atom::Objecttype => row.kind.clone(),
+        Atom::Objectsize => row.byte_len.to_string(),
+        Atom::Head => if row.current { "*" } else { " " }.into(),
+        Atom::Upstream(modifier) => row
+            .upstream
+            .as_ref()
+            .map(|upstream| {
+                render_name(
+                    &format!("refs/remotes/{}/{}", upstream.remote, upstream.branch),
+                    modifier,
+                    report,
+                )
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn render_format(fragments: &[Fragment], row: &QueryRef, report: &QueryRefs, output: &mut String) {
     for fragment in fragments {
         match fragment {
             Fragment::Literal(text) => output.push_str(text),
-            Fragment::Atom(atom) => match atom {
-                Atom::Refname => output.push_str(&row.name),
-                Atom::Objectname => output.push_str(&row.id),
-                Atom::Objecttype => output.push_str(&row.kind),
-                Atom::Objectsize => output.push_str(&row.byte_len.to_string()),
-                Atom::Head => output.push(if row.current { '*' } else { ' ' }),
-                Atom::Upstream => {
-                    if let Some(upstream) = &row.upstream {
-                        output.push_str(&format!(
-                            "refs/remotes/{}/{}",
-                            upstream.remote, upstream.branch
-                        ));
-                    }
-                }
-            },
+            Fragment::Atom(atom) => output.push_str(&atom_value(*atom, row, report)),
         }
     }
-    output.push('\n');
+}
+
+fn sort_rows(rows: &mut [QueryRef], sorts: &[(Atom, bool)], ignore_case: bool, report: &QueryRefs) {
+    let default = [(Atom::Refname(NameModifier::Full), false)];
+    let sorts = if sorts.is_empty() {
+        &default[..]
+    } else {
+        sorts
+    };
+    for (key, descending) in sorts {
+        rows.sort_by(|a, b| {
+            let order = if matches!(key, Atom::Objectsize) {
+                a.byte_len.cmp(&b.byte_len)
+            } else {
+                let (a, b) = (atom_value(*key, a, report), atom_value(*key, b, report));
+                if ignore_case {
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+                } else {
+                    a.cmp(&b)
+                }
+            };
+            if *descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+    }
+}
+
+struct RefPattern {
+    literal: String,
+    matcher: Option<globset::GlobMatcher>,
+    ignore_case: bool,
+}
+
+impl RefPattern {
+    fn new(pattern: &str, ignore_case: bool) -> RepositoryResult<Self> {
+        validate_ref_pattern(pattern)?;
+        let literal = if ignore_case {
+            pattern.to_ascii_lowercase()
+        } else {
+            pattern.into()
+        };
+        let matcher = if literal.contains(['*', '?']) {
+            let parts = literal
+                .split('/')
+                .map(|part| {
+                    if part.len() >= 2 && part.bytes().all(|byte| byte == b'*') {
+                        return "**".to_owned();
+                    }
+                    let mut text = String::new();
+                    let mut star = false;
+                    for ch in part.chars() {
+                        if ch != '*' || !star {
+                            if matches!(ch, '{' | '}') {
+                                text.push('\\');
+                            }
+                            text.push(ch);
+                        }
+                        star = ch == '*';
+                    }
+                    text
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            Some(
+                globset::GlobBuilder::new(&parts)
+                    .literal_separator(true)
+                    .backslash_escape(true)
+                    .build()
+                    .map_err(|error| format!("invalid reference pattern {pattern:?}: {error}"))?
+                    .compile_matcher(),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            literal,
+            matcher,
+            ignore_case,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let folded;
+        let name = if self.ignore_case {
+            folded = name.to_ascii_lowercase();
+            folded.as_str()
+        } else {
+            name
+        };
+        if let Some(matcher) = &self.matcher {
+            return matcher.is_match(name);
+        }
+        name == self.literal
+            || (self.literal.ends_with('/') && name.starts_with(&self.literal))
+            || name
+                .strip_prefix(&self.literal)
+                .is_some_and(|tail| tail.starts_with('/'))
+    }
+}
+
+fn option_value<'a>(
+    args: &'a [String],
+    cursor: &mut usize,
+    arg: &'a str,
+) -> RepositoryResult<&'a str> {
+    if let Some((_, value)) = arg.split_once('=') {
+        return Ok(value);
+    }
+    *cursor += 1;
+    args.get(*cursor)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{arg} requires a value"))
+}
+
+fn graph_option(
+    filter: &mut ReferenceFilter,
+    args: &[String],
+    cursor: &mut usize,
+) -> RepositoryResult<bool> {
+    let arg = &args[*cursor];
+    let key = arg.split_once('=').map_or(arg.as_str(), |(key, _)| key);
+    let values = match key {
+        "--contains" => &mut filter.contains,
+        "--no-contains" => &mut filter.no_contains,
+        "--merged" => &mut filter.merged,
+        "--no-merged" => &mut filter.no_merged,
+        "--points-at" => &mut filter.points_at,
+        _ => return Ok(false),
+    };
+    let value = if key == "--points-at" || arg.contains('=') {
+        option_value(args, cursor, arg)?
+    } else if args
+        .get(*cursor + 1)
+        .is_some_and(|value| !value.starts_with('-'))
+    {
+        *cursor += 1;
+        args[*cursor].as_str()
+    } else {
+        "HEAD"
+    };
+    if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+        return Err(format!("{key} requires a nonempty bounded revision"));
+    }
+    values.push(value.into());
+    Ok(true)
 }
 
 fn for_each_ref(args: &[String]) -> RepositoryResult<QueryOutput> {
@@ -465,44 +692,40 @@ fn for_each_ref(args: &[String]) -> RepositoryResult<QueryOutput> {
     let mut json_mode = false;
     let mut format = None;
     let mut sorts = Vec::new();
-    let mut count = 0_usize;
+    let mut count = 0_u64;
+    let mut filter = ReferenceFilter::default();
+    let (mut ignore_case, mut omit_empty) = (false, false);
+    let mut excludes = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if options && arg == "--" {
             options = false;
-            index += 1;
-            continue;
-        }
-        if options && arg.starts_with('-') {
-            if arg == "--json" {
+        } else if options && arg.starts_with('-') {
+            let key = arg.split_once('=').map_or(arg.as_str(), |(key, _)| key);
+            if graph_option(&mut filter, args, &mut index)? {
+                // Repeatable graph predicates are combined inside one snapshot.
+            } else if matches!(arg.as_str(), "--json" | "--ignore-case" | "--omit-empty") {
                 once(&mut seen, arg)?;
-                json_mode = true;
-            } else {
-                let (key, attached) = arg
-                    .split_once('=')
-                    .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
-                if !matches!(key, "--format" | "--sort" | "--count") {
-                    return Err(unknown(arg));
+                match arg.as_str() {
+                    "--json" => json_mode = true,
+                    "--ignore-case" => ignore_case = true,
+                    _ => omit_empty = true,
                 }
-                if key != "--sort" {
+            } else if matches!(key, "--format" | "--sort" | "--count" | "--exclude") {
+                if !matches!(key, "--sort" | "--exclude") {
                     once(&mut seen, key)?;
                 }
-                let value = if let Some(value) = attached {
-                    value
-                } else {
-                    index += 1;
-                    args.get(index)
-                        .ok_or_else(|| format!("{key} requires a value"))?
-                };
+                let value = option_value(args, &mut index, arg)?;
                 match key {
                     "--format" => format = Some(compile_format(value)?),
-                    "--sort" => {
-                        let key = value.strip_prefix('-').unwrap_or(value);
-                        if !matches!(key, "refname" | "objectname" | "objectsize") {
-                            return Err(format!("unsupported reference sort key: {value:?}"));
-                        }
-                        sorts.push((key.to_owned(), value.starts_with('-')));
+                    "--sort" => sorts.push((
+                        parse_atom(value.strip_prefix('-').unwrap_or(value))?,
+                        value.starts_with('-'),
+                    )),
+                    "--exclude" => {
+                        validate_ref_pattern(value)?;
+                        excludes.push(value.to_owned());
                     }
                     "--count" => {
                         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -514,6 +737,8 @@ fn for_each_ref(args: &[String]) -> RepositoryResult<QueryOutput> {
                     }
                     _ => unreachable!(),
                 }
+            } else {
+                return Err(unknown(arg));
             }
         } else {
             positional.push(arg);
@@ -523,60 +748,47 @@ fn for_each_ref(args: &[String]) -> RepositoryResult<QueryOutput> {
     if positional.is_empty() {
         return Err(EACH_USAGE.into());
     }
-    if json_mode && format.is_some() {
-        return Err("--json and --format are mutually exclusive".into());
+    if json_mode && (format.is_some() || omit_empty) {
+        return Err("--json cannot combine with --format or --omit-empty".into());
     }
-    let patterns = &positional[1..];
-    for pattern in patterns {
-        validate_ref_pattern(pattern)?;
-    }
-    let report = Repository::open(positional[0])?.query_refs()?;
+    let patterns = positional[1..]
+        .iter()
+        .map(|pattern| RefPattern::new(pattern, ignore_case))
+        .collect::<RepositoryResult<Vec<_>>>()?;
+    let excludes = excludes
+        .iter()
+        .map(|pattern| RefPattern::new(pattern, ignore_case))
+        .collect::<RepositoryResult<Vec<_>>>()?;
+    let (report, selected) = Repository::open(positional[0])?.query_refs_selected(&filter)?;
     let mut rows: Vec<_> = report
         .refs
         .iter()
         .filter(|row| {
-            patterns.is_empty()
-                || patterns.iter().any(|pattern| {
-                    if pattern.contains(['*', '?']) {
-                        glob_match(&row.name, pattern)
-                    } else {
-                        row.name == pattern.as_str()
-                            || (pattern.ends_with('/') && row.name.starts_with(pattern.as_str()))
-                            || row
-                                .name
-                                .strip_prefix(pattern.as_str())
-                                .is_some_and(|tail| tail.starts_with('/'))
-                    }
-                })
+            selected.contains(&row.name)
+                && (patterns.is_empty()
+                    || patterns.iter().any(|pattern| pattern.matches(&row.name)))
+                && !excludes.iter().any(|pattern| pattern.matches(&row.name))
         })
         .cloned()
         .collect();
-    for (key, descending) in sorts {
-        rows.sort_by(|left, right| {
-            let order = match key.as_str() {
-                "objectname" => left.id.cmp(&right.id),
-                "objectsize" => left.byte_len.cmp(&right.byte_len),
-                _ => left.name.cmp(&right.name),
-            };
-            if descending {
-                order.reverse()
-            } else {
-                order
-            }
-        });
-    }
+    sort_rows(&mut rows, &sorts, ignore_case, &report);
     if count > 0 {
-        rows.truncate(count);
+        rows.truncate(count.min(rows.len() as u64) as usize);
     }
     if json_mode {
         return QueryOutput::json(query_json(&report, &rows));
     }
     let mut output = String::new();
     for row in rows {
+        let mut line = String::new();
         if let Some(format) = &format {
-            render_format(format, &row, &mut output);
+            render_format(format, &row, &report, &mut line);
         } else {
-            output.push_str(&format!("{} {}\t{}\n", row.id, row.kind, row.name));
+            line = format!("{} {}\t{}", row.id, row.kind, row.name);
+        }
+        if !omit_empty || !line.is_empty() {
+            output.push_str(&line);
+            output.push('\n');
         }
     }
     Ok(QueryOutput::new(output, 0))

@@ -665,7 +665,7 @@ fn ref_formats_sort_order_counts_and_ascii_escapes_match_declared_subset() {
     for option in [
         "--format=%(unknown)",
         "--format=%ff",
-        "--format=%(refname:short)",
+        "--format=%(refname:unknown)",
         "--sort=authordate",
         "--count=-1",
     ] {
@@ -917,5 +917,253 @@ fn corrupt_authoritative_metadata_objects_and_writer_locks_fail_without_repairs(
         vec!["count-objects", t.root(), "extra"],
     ] {
         t.reject(&args);
+    }
+}
+
+#[test]
+fn explicit_branch_queries_ignore_bad_index_pending_and_an_unrelated_index_lock() {
+    let h = History::new();
+    let t = &h.t;
+    let expected = t.text(&["branch", t.root(), "--contains=HEAD", "--format=%(refname)"]);
+    for (path, bytes) in [
+        (".uwgit/index", b"broken index\0".as_slice()),
+        (".uwgit/pending.json", b"{broken pending".as_slice()),
+        (
+            ".uwgit/index.lock",
+            b"held by another index writer".as_slice(),
+        ),
+        ("a.wasm", b"unfinished editor text".as_slice()),
+    ] {
+        t.write(path, bytes);
+    }
+    assert_eq!(
+        t.text(&["branch", t.root(), "--contains=HEAD", "--format=%(refname)"]),
+        expected
+    );
+    assert_eq!(t.text(&["branch", t.root(), "--show-current"]), "main\n");
+    assert_eq!(
+        t.text(&[
+            "for-each-ref",
+            t.root(),
+            "--contains=HEAD",
+            "--exclude=refs/tags",
+            "--format=%(refname)"
+        ]),
+        expected
+    );
+}
+
+#[test]
+fn native_branch_scopes_tracking_filters_and_upstream_name_modifiers_use_real_refs() {
+    let h = History::new();
+    h.tracking();
+    let t = &h.t;
+    let report = t.json(&[
+        "branch",
+        t.root(),
+        "--list",
+        "-a",
+        "--contains",
+        &h.first,
+        "--json",
+    ]);
+    let names = report["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "refs/heads/feature",
+            "refs/heads/main",
+            "refs/heads/mainline",
+            "refs/remotes/origin/main"
+        ]
+    );
+    assert_eq!(
+        t.text(&[
+            "branch",
+            t.root(),
+            "--list",
+            "-r",
+            "--format=%(refname)",
+            "origin/*"
+        ]),
+        "refs/remotes/origin/main\n"
+    );
+    assert_eq!(
+        t.text(&[
+            "branch",
+            t.root(),
+            "--list",
+            "-a",
+            "--format=%(refname)",
+            "remotes/*"
+        ]),
+        ""
+    );
+    assert_eq!(
+        t.text(&[
+            "branch",
+            t.root(),
+            "--list",
+            "-a",
+            "--format=%(refname)",
+            "origin/*"
+        ]),
+        "refs/remotes/origin/main\n"
+    );
+    let format = "--format=%(upstream:short)|%(upstream:lstrip=2)|%(upstream:rstrip=-2)";
+    assert_eq!(
+        t.text(&["for-each-ref", t.root(), format, "refs/heads/main"]),
+        "origin/main|origin/main|refs/remotes\n"
+    );
+    ok(&["branch", t.root(), "origin/main", "HEAD"]);
+    fs::remove_file(t.path(".uwgit/remotes/origin.tracking.json")).unwrap();
+    // A gone configured target must not shorten to an unrelated local branch.
+    assert_eq!(
+        t.text(&[
+            "for-each-ref",
+            t.root(),
+            "--format=%(upstream:short)",
+            "refs/heads/main"
+        ]),
+        "refs/remotes/origin/main\n"
+    );
+    let refs = t.json(&["branch", t.root(), "--list", "-r", "--json"]);
+    assert_eq!(refs["refs"], json!([]));
+}
+
+#[test]
+fn points_at_accepts_native_wasm_paths_tree_peels_and_all_kind_prefixes() {
+    let h = History::new();
+    let t = &h.t;
+    for object in [
+        h.tree.clone(),
+        h.entries["a.wasm"].clone(),
+        "HEAD^{tree}".into(),
+        "HEAD:a.wasm".into(),
+        h.entries["a.wasm"][..12].into(),
+    ] {
+        for command in ["branch", "for-each-ref"] {
+            assert_eq!(
+                t.text(&[
+                    command,
+                    t.root(),
+                    "--points-at",
+                    &object,
+                    "--format=%(refname)"
+                ]),
+                ""
+            );
+        }
+    }
+    for command in ["branch", "for-each-ref"] {
+        t.reject(&[command, t.root(), "--contains", &h.entries["a.wasm"]]);
+        t.reject(&[command, t.root(), "--points-at=HEAD:missing.wasm"]);
+    }
+}
+
+#[test]
+fn reference_strip_extremes_are_bounded_equally_on_32_and_64_bit_hosts() {
+    let h = History::new();
+    let t = &h.t;
+    assert_eq!(
+        t.text(&["for-each-ref", t.root(), "--count=4294967296"]),
+        t.text(&["for-each-ref", t.root()])
+    );
+    assert_eq!(
+        t.text(&["for-each-ref", t.root(), "--count=18446744073709551615"]),
+        t.text(&["for-each-ref", t.root()])
+    );
+    let format="--format=%(refname:lstrip=-9223372036854775808)|%(refname:rstrip=-2147483648)|%(refname:lstrip=2147483648)|%(refname:rstrip=9223372036854775807)";
+    assert_eq!(
+        t.text(&["for-each-ref", t.root(), format, "refs/heads/main"]),
+        "refs/heads/main|refs/heads/main||\n"
+    );
+    for command in ["branch", "for-each-ref"] {
+        assert_eq!(
+            t.text(&[command, t.root(), "--format=", "--omit-empty"]),
+            ""
+        );
+        t.reject(&[command, t.root(), "--json", "--omit-empty"]);
+        t.reject(&[command, t.root(), "--json", "--format="]);
+        t.reject(&[command, t.root(), "--sort=refname:invalid"]);
+        t.reject(&[
+            command,
+            t.root(),
+            "--format=%(refname:lstrip=-9223372036854775809)",
+        ]);
+    }
+}
+
+#[test]
+fn branch_and_reference_option_operands_keep_literal_flag_spellings() {
+    let h = History::new();
+    let t = &h.t;
+    for (command, count) in [("branch", 3), ("for-each-ref", 5)] {
+        assert_eq!(
+            t.text(&[command, t.root(), "--format", "--help"]),
+            "--help\n".repeat(count)
+        );
+        assert!(t
+            .text(&[command, t.root(), "--contains", "--help"])
+            .contains(command));
+        assert_eq!(
+            t.text(&[command, t.root(), "--format=%(refname)", "--", "--help"]),
+            ""
+        );
+        t.reject(&[command, t.root(), "--points-at", "--help"]);
+    }
+    let normal = t.text(&["for-each-ref", t.root()]);
+    assert_eq!(
+        t.text(&["for-each-ref", t.root(), "--exclude", "--help"]),
+        normal
+    );
+    t.reject(&["branch", t.root(), "--show-current", "--contains=HEAD"]);
+    t.reject(&["branch", t.root(), "--list", "-a", "-r"]);
+    t.reject(&[
+        "branch",
+        t.root(),
+        "--format=%(refname)",
+        "-m",
+        "cannot-be-mutated",
+    ]);
+}
+
+#[test]
+fn explicit_branch_and_filtered_reference_queries_never_hide_repository_corruption() {
+    let h = History::new();
+    let t = &h.t;
+    for (path, bytes) in [
+        (".uwgit/write.lock", b"other writer".as_slice()),
+        (".uwgit/upstreams.json", b"{broken upstream".as_slice()),
+    ] {
+        t.write(path, bytes);
+        for command in ["branch", "for-each-ref"] {
+            t.reject(&[
+                command,
+                t.root(),
+                "--contains=HEAD",
+                "--format=%(refname)",
+                "no-match",
+            ]);
+        }
+        fs::remove_file(t.path(path)).unwrap();
+    }
+    t.write(
+        &format!(".uwgit/objects/{}", h.tip),
+        b"corrupt commit object",
+    );
+    for command in ["branch", "for-each-ref"] {
+        t.reject(&[
+            command,
+            t.root(),
+            "--contains=HEAD",
+            "--format=%(refname)",
+            "no-match",
+        ]);
     }
 }

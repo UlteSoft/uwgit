@@ -137,6 +137,363 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+
+fn query_graph() -> Fixture {
+    let mut f = Fixture::new();
+    f.graph();
+    for (name, label) in [
+        ("Base", "root"),
+        ("alpha", "x"),
+        ("beta", "y"),
+        ("release/Left", "left"),
+        ("release/right", "right"),
+        ("main", "later"),
+        ("unrelated", "other"),
+    ] {
+        if name == "main" {
+            // Native update-ref protects the checked-out branch, including an
+            // unborn one. Establish its tip through the supported HEAD reset.
+            text(f.uw(&["reset", "--soft", f.id(label)]));
+            text(f.git(&["update-ref", "refs/heads/main", &f.nodes[label].1]));
+        } else {
+            f.publish(name, label);
+        }
+    }
+    for (name, label) in [("base", "root"), ("release", "later")] {
+        let name = format!("refs/tags/{name}");
+        text(f.uw(&["update-ref", &name, f.id(label)]));
+        text(f.git(&["update-ref", &name, &f.nodes[label].1]));
+    }
+    f
+}
+
+fn query_text(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn native_reference_selection_matches_independent_git_dag_filters_for_both_commands() {
+    let f = query_graph();
+    let before = metadata(&f.native);
+    let filters = [
+        vec!["--contains", "alpha"],
+        vec!["--no-contains", "beta"],
+        vec!["--merged", "main"],
+        vec!["--no-merged", "release/Left"],
+        vec!["--contains", "alpha", "--contains", "beta"],
+        vec!["--contains", "Base", "--contains", "unrelated"],
+        vec!["--no-contains", "alpha", "--no-contains", "beta"],
+        vec!["--merged", "alpha", "--merged", "beta"],
+        vec!["--no-merged", "alpha", "--no-merged", "beta"],
+        vec!["--contains", "alpha", "--no-contains", "beta"],
+        vec!["--merged", "main", "--no-merged", "beta"],
+        vec!["--points-at", "main"],
+        vec!["--points-at", "Base", "--points-at", "beta"],
+        vec!["--contains=refs/tags/base", "--points-at=main"],
+        vec!["--contains"],
+        vec!["--no-contains"],
+        vec!["--merged"],
+        vec!["--no-merged"],
+        vec!["--contains=main^2"],
+        vec![
+            "--contains=main^",
+            "--contains=unrelated",
+            "--no-merged=beta",
+        ],
+    ];
+    for command in ["for-each-ref", "branch"] {
+        for filter in &filters {
+            let mut args = vec![command, "--format=%(refname)"];
+            args.extend_from_slice(filter);
+            // main has only one parent; a malformed ancestor must fail even
+            // when subsequent output selection would otherwise be empty.
+            if filter == &["--contains=main^2"] {
+                assert!(!f.uw(&args).status.success());
+                assert!(!f.git(&args).status.success());
+            } else {
+                assert_eq!(
+                    query_text(f.uw(&args)),
+                    query_text(f.git(&args)),
+                    "{args:?}"
+                );
+            }
+            assert_eq!(metadata(&f.native), before);
+        }
+    }
+}
+
+#[test]
+fn graph_filters_have_fixed_native_expectations_including_both_merge_parents() {
+    let f = query_graph();
+    for (filter, names) in [
+        (
+            vec!["--contains", "alpha"],
+            vec!["alpha", "main", "release/Left", "release/right"],
+        ),
+        (
+            vec!["--no-contains", "alpha"],
+            vec!["Base", "beta", "unrelated"],
+        ),
+        (
+            vec!["--merged", "release/Left"],
+            vec!["Base", "alpha", "beta", "release/Left"],
+        ),
+        (
+            vec!["--no-merged", "release/Left"],
+            vec!["main", "release/right", "unrelated"],
+        ),
+        (
+            vec!["--merged", "release/Left", "--no-merged", "release/right"],
+            vec!["release/Left"],
+        ),
+        (
+            vec!["--contains", "alpha", "--no-contains", "beta"],
+            vec!["alpha"],
+        ),
+        (
+            vec!["--contains", "Base", "--contains", "unrelated"],
+            vec![
+                "Base",
+                "alpha",
+                "beta",
+                "main",
+                "release/Left",
+                "release/right",
+                "unrelated",
+            ],
+        ),
+    ] {
+        let mut args = vec!["branch", "--list", "--format=%(refname:lstrip=2)"];
+        args.extend(filter);
+        let expected = names
+            .iter()
+            .map(|name| format!("{name}\n"))
+            .collect::<String>();
+        assert_eq!(query_text(f.uw(&args)), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn graph_query_name_formats_case_sort_exclusions_and_omitted_empty_match_git() {
+    let f = query_graph();
+    f.publish("Alpha", "y");
+    f.publish("topic/deep/leaf", "later");
+    for command in ["for-each-ref", "branch"] {
+        let queries = [
+            vec!["--format=%(HEAD)|%(refname:short)|%(refname:lstrip=1)|%(refname:rstrip=1)"],
+            vec!["--format=%(refname:lstrip=-2)|%(refname:rstrip=-2)|%(refname:strip=2)"],
+            vec!["--format=%(refname:lstrip=100)|%(refname:rstrip=-100)"],
+            vec!["--format=%(refname)", "--ignore-case", "--sort=refname"],
+            vec!["--format=%(refname)", "--sort=-refname"],
+            vec![
+                "--format=%(refname)",
+                "--sort=refname:lstrip=2",
+                "--sort=HEAD",
+            ],
+            vec!["--format=", "--omit-empty"],
+            vec!["--format=%(upstream)", "--omit-empty"],
+            vec!["--format=%%:%00:%09:%0a:%(refname)"],
+        ];
+        for query in queries {
+            let mut args = vec![command];
+            args.extend(query);
+            assert_eq!(
+                query_text(f.uw(&args)),
+                query_text(f.git(&args)),
+                "{args:?}"
+            );
+        }
+    }
+    for query in [
+        vec!["--exclude=refs/tags"],
+        vec!["--exclude=refs/heads/release/*", "--exclude=refs/tags/base"],
+        vec![
+            "--ignore-case",
+            "--exclude=REFS/HEADS/ALPHA",
+            "refs/HEADS/*",
+        ],
+        vec!["--count=2", "--contains=Base", "--sort=-refname"],
+        vec!["refs/heads/*"],
+        vec!["refs/heads/**"],
+        vec!["refs/heads/**/leaf"],
+        vec!["refs/heads/release**"],
+        vec!["refs/heads/release/**"],
+        vec!["refs/heads/release*/*"],
+        vec!["refs/heads/*/*/*"],
+        vec!["refs/heads/{alpha,beta}"],
+    ] {
+        let mut args = vec!["for-each-ref", "--format=%(refname)"];
+        args.extend(query);
+        assert_eq!(
+            query_text(f.uw(&args)),
+            query_text(f.git(&args)),
+            "{args:?}"
+        );
+    }
+    for query in [
+        vec!["--list", "release/*"],
+        vec!["--list", "--ignore-case", "ALPHA"],
+        vec!["--list", "--", "topic/*", "unrelated"],
+        vec!["--contains=Base", "release/*"],
+    ] {
+        let mut args = vec!["branch", "--format=%(refname)"];
+        args.extend(query);
+        assert_eq!(
+            query_text(f.uw(&args)),
+            query_text(f.git(&args)),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn native_query_short_names_stay_qualified_when_other_refs_or_objects_are_ambiguous() {
+    let f = query_graph();
+    text(f.uw(&["tag", "alpha", "main"]));
+    // A stored commit prefix also competes with a branch even if that commit
+    // has no visible ref. Name filtering must not erase either ambiguity.
+    let prefix = &f.id("other")[..8];
+    text(f.uw(&["branch", prefix, "main"]));
+    for name in ["alpha", prefix] {
+        let full = format!("refs/heads/{name}");
+        assert_eq!(
+            query_text(f.uw(&["for-each-ref", "--format=%(refname:short)", &full])),
+            format!("{full}\n")
+        );
+        assert_eq!(
+            query_text(f.uw(&["branch", "--list", "--format=%(refname:short)", name])),
+            format!("{full}\n")
+        );
+    }
+}
+
+#[test]
+fn branch_query_defaults_detached_unborn_heads_and_bad_operands_are_read_only() {
+    let f = Fixture::new();
+    assert_eq!(query_text(f.uw(&["branch", "--show-current"])), "main\n");
+    assert_eq!(query_text(f.uw(&["branch", "--list"])), "");
+    let failed = f.uw(&["for-each-ref", "--contains", "--format=%(refname)"]);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let f = query_graph();
+    text(f.uw(&["switch", "--detach", "main"]));
+    assert_eq!(query_text(f.uw(&["branch", "--show-current"])), "");
+    let before = metadata(&f.native);
+    assert!(!query_text(f.uw(&["branch", "--list", "--format=%(HEAD)"])).contains('*'));
+    for command in ["branch", "for-each-ref"] {
+        for bad in [
+            "--contains=missing",
+            "--points-at=missing",
+            "--contains=",
+            "--sort=authordate",
+            "--format=%(author)",
+            "--format=%(refname:lstrip=9223372036854775808)",
+        ] {
+            let out = f.uw(&[command, bad]);
+            assert!(!out.status.success(), "{command} {bad}");
+            assert!(out.stdout.is_empty());
+            assert_eq!(metadata(&f.native), before);
+        }
+        let args = [
+            command,
+            "--format=%(refname)",
+            "--contains=missing",
+            "no-match",
+        ];
+        assert!(!f.uw(&args).status.success());
+    }
+    assert_eq!(metadata(&f.native), before);
+}
+
+#[test]
+fn native_point_queries_accept_real_noncommit_objects_without_inventing_matching_refs() {
+    let f = query_graph();
+    for (native, tree) in [(true, &f.native_tree), (false, &f.git_tree)] {
+        for command in ["branch", "for-each-ref"] {
+            let args = [command, "--points-at", tree, "--format=%(refname)"];
+            assert_eq!(
+                query_text(if native { f.uw(&args) } else { f.git(&args) }),
+                ""
+            );
+        }
+    }
+    assert_eq!(
+        query_text(f.uw(&["for-each-ref", "--points-at=HEAD^{tree}"])),
+        ""
+    );
+    assert_eq!(
+        query_text(f.uw(&["for-each-ref", "--points-at", &f.native_tree[..12]])),
+        ""
+    );
+    let out = f.uw(&["for-each-ref", "--merged", &f.native_tree]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn native_remote_branch_views_match_git_namespace_and_displayed_name_filters() {
+    let f = query_graph();
+    let url = "ssh://test@localhost/tmp/ref-query.git";
+    text(f.uw(&["remote", "add", "origin", url]));
+    fs::write(f.native.join(".uwgit/remotes/origin.tracking.json"),serde_json::to_vec(&serde_json::json!({"version":1,"remote":"origin","url":url,"state":{"format":1,"head":"main","branches":{"main":f.id("right")},"tags":{}}})).unwrap()).unwrap();
+    text(f.git(&["remote", "add", "origin", url]));
+    text(f.git(&[
+        "update-ref",
+        "refs/remotes/origin/main",
+        &f.nodes["right"].1,
+    ]));
+    let before = metadata(&f.native);
+    for query in [
+        vec!["-r"],
+        vec!["-a"],
+        vec!["-r", "--list", "origin/*"],
+        vec!["-a", "--list", "remotes/*"],
+        vec!["-a", "--list", "origin/*"],
+        vec!["-a", "--contains=alpha"],
+        vec!["-r", "--no-merged=main"],
+    ] {
+        let mut args = vec!["branch", "--format=%(refname)"];
+        args.extend(query);
+        assert_eq!(
+            query_text(f.uw(&args)),
+            query_text(f.git(&args)),
+            "{args:?}"
+        );
+        assert_eq!(metadata(&f.native), before);
+    }
+}
+
+#[test]
+fn default_head_graph_filters_and_current_branch_use_the_calling_linked_worktree() {
+    let f = query_graph();
+    text(f.uw(&["branch", "linked-topic", "alpha"]));
+    let linked = f.root.join("linked");
+    text(f.uw(&["worktree", "add", p(&linked), "linked-topic"]));
+    let before = metadata(&f.native);
+    let linked_before = metadata(&linked);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
+        cmd.args([args[0], p(&linked)]).args(&args[1..]);
+        query_text(cmd.output().unwrap())
+    };
+    assert_eq!(run(&["branch", "--show-current"]), "linked-topic\n");
+    assert_eq!(query_text(f.uw(&["branch", "--show-current"])), "main\n");
+    assert_eq!(
+        run(&["branch", "--contains", "--format=%(refname:lstrip=2)"]),
+        "alpha\nlinked-topic\nmain\nrelease/Left\nrelease/right\n"
+    );
+    assert_eq!(
+        query_text(f.uw(&["branch", "--contains", "--format=%(refname:lstrip=2)"])),
+        "main\n"
+    );
+    assert_eq!(metadata(&f.native), before);
+    assert_eq!(metadata(&linked), linked_before);
+}
 fn metadata(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(dir).unwrap() {

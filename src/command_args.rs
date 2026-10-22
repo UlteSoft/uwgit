@@ -17,10 +17,25 @@ fn takes_value(command: &str, option: &str) -> bool {
         "cat-file" => option == "--output",
         "switch" => option == "-c",
         "checkout" => matches!(option, "-b" | "--file"),
-        "branch" => matches!(option, "-m" | "-d" | "-D" | "-u" | "--set-upstream-to"),
+        "branch" => matches!(
+            option,
+            "-m" | "-M"
+                | "-c"
+                | "-C"
+                | "-d"
+                | "-D"
+                | "-u"
+                | "--set-upstream-to"
+                | "--format"
+                | "--sort"
+                | "--points-at"
+        ),
         "tag" => option == "-d",
         "push" => option == "--force-with-lease",
-        "for-each-ref" => matches!(option, "--format" | "--sort" | "--count"),
+        "for-each-ref" => matches!(
+            option,
+            "--format" | "--sort" | "--count" | "--exclude" | "--points-at"
+        ),
         "describe" => matches!(option, "--abbrev" | "--match" | "--exclude"),
         "archive" => matches!(
             option,
@@ -69,7 +84,7 @@ fn arguments(args: &[String]) -> impl Iterator<Item = Argument<'_>> {
         })
 }
 
-fn option_arguments(args: &[String]) -> impl Iterator<Item = (usize, &str)> {
+pub(crate) fn option_arguments(args: &[String]) -> impl Iterator<Item = (usize, &str)> {
     arguments(args).filter_map(|arg| match arg {
         Argument::Option(index, value) => Some((index, value)),
         Argument::Separator(_) => None,

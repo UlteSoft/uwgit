@@ -199,6 +199,7 @@ fn main() {
         return;
     }
     if query_commands::handles(&args[1])
+        || query_commands::branch_listing_requested(&args[1..])
         || plumbing_commands::handles(&args[1])
         || porcelain::index_command_handles(&args[1])
         || maintenance_commands::handles(&args[1])
@@ -916,6 +917,7 @@ fn print_usage() {
     eprintln!("  merge-index <DIR> --all|-- PATHSPEC... [--dry-run] | restore <DIR> --ours|--theirs|--merge|-m|--ignore-unmerged -- PATHSPEC...");
     eprintln!("  ls-tree <DIR> <REV> [-r] [--json|--name-only|--object-only] [-z] [-- PATH...]");
     eprintln!("  show-ref <DIR> [--head] [--heads|--tags] [--verify] [--quiet|--hash|--json] [PATTERN...]");
+    eprintln!("  branch <DIR> --list [-r|-a] [--contains [REV]] [--merged [REV]] [--points-at OBJECT] [--format STR|--json] [PATTERN...] | branch <DIR> --show-current");
     eprintln!(
         "  for-each-ref <DIR> [--json|--format STR] [--sort KEY]... [--count N] [PATTERN...]"
     );

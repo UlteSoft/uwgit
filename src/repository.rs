@@ -37,6 +37,9 @@ pub use plumbing_storage::MergeBaseMode;
 #[path = "repository_ref_transactions.rs"]
 mod ref_transactions;
 pub use ref_transactions::{ReferenceEdit, ReferenceEditKind, ReferenceExpectation};
+#[path = "repository_ref_queries.rs"]
+mod ref_queries;
+pub use ref_queries::ReferenceFilter;
 #[path = "repository_head.rs"]
 mod head_storage;
 #[path = "repository_revisions.rs"]
@@ -428,6 +431,10 @@ pub struct QueryRefs {
     pub head_tip: Option<String>,
     pub head_object: Option<QueryObject>,
     pub refs: Vec<QueryRef>,
+    /// Native, unambiguous spellings computed against the whole snapshot,
+    /// including refs omitted from the eventual output and stored commit IDs.
+    #[serde(skip)]
+    pub short_names: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1738,50 +1745,8 @@ impl Repository {
     /// Query local refs, including fetched branch tips and local upstream
     /// metadata, without consulting the index, worktree or pending journal.
     pub fn query_refs(&self) -> RepositoryResult<QueryRefs> {
-        let _lock = self.lock()?;
-        let snapshot = self.snapshot()?;
-        let mut refs = Vec::new();
-        for (name, id) in &snapshot.manifest.refs {
-            let object = query_object(&snapshot, id)?;
-            refs.push(QueryRef {
-                name: format!("refs/heads/{name}"),
-                id: id.clone(),
-                kind: object.kind,
-                byte_len: object.byte_len,
-                stored_byte_len: object.stored_byte_len,
-                current: name == &snapshot.manifest.head,
-                upstream: snapshot.upstreams.get(name).cloned(),
-            });
-        }
-        for (prefix, names) in [
-            ("refs/tags", &snapshot.manifest.tags),
-            ("refs/remotes", &snapshot.tracking),
-        ] {
-            for (name, id) in names {
-                let object = query_object(&snapshot, id)?;
-                refs.push(QueryRef {
-                    name: format!("{prefix}/{name}"),
-                    id: id.clone(),
-                    kind: object.kind,
-                    byte_len: object.byte_len,
-                    stored_byte_len: object.stored_byte_len,
-                    current: false,
-                    upstream: None,
-                });
-            }
-        }
-        refs.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(QueryRefs {
-            schema_version: 1,
-            head: snapshot.manifest.head.clone(),
-            head_tip: snapshot.manifest.tip().cloned(),
-            head_object: snapshot
-                .manifest
-                .tip()
-                .map(|id| query_object(&snapshot, id))
-                .transpose()?,
-            refs,
-        })
+        self.query_refs_selected(&ReferenceFilter::default())
+            .map(|(report, _)| report)
     }
 
     /// Resolve normal commit revision syntax, or an exact stored tree ID.
