@@ -88,7 +88,7 @@ wasm-git checkout-index DIR --stage=all --all -z
 `uwgit-index-PID-SEQUENCE.wasm`；`--stage=all` 隐含 temp，只导出未解决项。
 输出为 `TEMP<TAB>PATH`，all 形式为 `BASE_TEMP OURS_TEMP THEIRS_TEMP<TAB>PATH`；
 缺席侧用 `.`，`-z` 将记录分隔符改为 NUL。映射到的导出文件由调用者使用后移除；失败会清理本次已创建文件。
-原工作文件和 index 保持原字节。此阶段没有 stat cache，`-u/--index`、skip-worktree 相关标志尚未实现并会明确拒绝。
+原工作文件和 index 保持原字节。本模型没有 stat cache，`-u/--index` 仍拒绝。默认尊重 skip-worktree，显式 `--ignore-skip-worktree-bits` 可物化；详见[索引标志](index-flags.md)。
 
 ## 直接更新
 
@@ -146,3 +146,6 @@ clean 将未解决路径视为受控文件，不能当作 untracked 删除。
 仍使用原有冻结 pending 记录，尚未自动将合并中间结果写入该索引扩展；其完整树审阅和显式续作合同保持。
 索引 flags、intent-to-add、稀疏 index、ls-files 的 directory/abbrev/EOL/resolve-undo 等剩余选项仍见[能力矩阵](git-command-coverage.md)。
 接口参考 [Git ls-files](https://git-scm.com/docs/git-ls-files) 与 [Git checkout-index](https://git-scm.com/docs/git-checkout-index)，对象及数据持久化继续使用 uwgit。
+
+索引 version 4、assume/skip/图像有效性标志、intent-to-add 与 commit -a 见[原生索引标志](index-flags.md)。
+多目标 pick/revert 自动建立上述 stages，且带可恢复的工作区检查点，见[多目标 replay](replay-queue.md)。

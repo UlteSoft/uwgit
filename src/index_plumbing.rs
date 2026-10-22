@@ -35,6 +35,8 @@ enum Action {
     },
     UpdateIndex {
         dir: String,
+        #[command(flatten)]
+        flags: index_flags::Options,
         #[arg(long)]
         add: bool,
         #[arg(long, conflicts_with_all = ["force_remove","index_info","cacheinfo"])]
@@ -69,6 +71,8 @@ enum Action {
         all: bool,
         #[arg(short = 'f', long)]
         force: bool,
+        #[arg(long)]
+        ignore_skip_worktree_bits: bool,
         #[arg(short = 'q', long)]
         quiet: bool,
         #[arg(short = 'n', long)]
@@ -241,17 +245,21 @@ fn set_entry(
     if mode == "0" {
         index.files.remove(path);
         index.conflicts.remove(path);
+        index.intents.remove(path);
+        index.flags.remove(path);
         return Ok(());
     }
     if mode != "100644" {
         return Err("native index accepts regular Wasm entries and stages 0..3".into());
     }
     let bytes = wasm_object(&state.repo, id)?;
+    index.intents.remove(path);
+    index.flags.remove(path);
     if stage == 0 {
         index.conflicts.remove(path);
         index.files.insert(path.into(), bytes);
     } else {
-        index.format = 3;
+        index.format = index.format.max(3);
         index.files.remove(path);
         let entry = index.conflicts.entry(path.into()).or_default();
         match stage {
@@ -414,6 +422,7 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
         Action::CheckoutIndex {
             all,
             force,
+            ignore_skip_worktree_bits,
             quiet,
             no_create,
             prefix,
@@ -444,6 +453,15 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
             let mut seen = BTreeSet::new();
             for path in paths {
                 validate_tree_path(&path)?;
+                if index.skipped(&path) && !ignore_skip_worktree_bits {
+                    continue;
+                }
+                if index.intents.contains(&path) {
+                    if quiet {
+                        continue;
+                    }
+                    return Err(format!("intent-to-add has no stored image: {path}"));
+                }
                 if !seen.insert(path.clone()) {
                     continue;
                 }
@@ -524,15 +542,13 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
             revisions,
             ..
         } => {
-            let target = read_trees(&state, &revisions, merge, prefix.as_deref(), empty)?;
+            let mut target = read_trees(&state, &revisions, merge, prefix.as_deref(), empty)?;
+            let old = state.index()?.unwrap_or_else(Index::empty);
+            if !empty {
+                index_flags::inherit(&mut target, &old);
+            }
             let changes = if update {
-                let old = state.index()?.unwrap_or_else(Index::empty);
-                let owned: BTreeSet<_> = old
-                    .files
-                    .keys()
-                    .chain(old.conflicts.keys())
-                    .cloned()
-                    .collect();
+                let owned = controlled_paths(&old);
                 let mut work = files_worktree(&target.files);
                 work.extend(
                     target
@@ -552,6 +568,13 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                     });
                     let desired = work.get(path).and_then(Option::as_ref);
                     let actual = current.get(path).and_then(Option::as_ref);
+                    if target.skipped(path) && actual.is_none() {
+                        work.insert(path.clone(), None);
+                        continue;
+                    }
+                    if old.skipped(path) && actual.is_none() {
+                        continue;
+                    }
                     if desired == expected {
                         work.insert(path.clone(), actual.cloned());
                     } else if actual != expected {
@@ -575,6 +598,7 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
             )
         }
         Action::UpdateIndex {
+            flags,
             add,
             remove,
             force_remove,
@@ -590,6 +614,21 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                 return Err("-z requires --stdin or --index-info".into());
             }
             let mut index = state.index()?.unwrap_or_else(Index::empty);
+            if flags.enabled() {
+                if add || remove || force_remove || index_info || !cacheinfo.is_empty() {
+                    return Err("index flags/refresh cannot combine content update modes".into());
+                }
+                if stdin {
+                    paths = input(nul)?;
+                }
+                let checked = flags.update(&state, &mut index, paths)?;
+                if !dry_run {
+                    state.save_index(&index)?;
+                }
+                return QueryOutput::json(
+                    json!({"status":"index_flags_updated","dry_run":dry_run,"verified_images":checked,"worktree_updated":false,"head_updated":false}),
+                );
+            }
             if index_info {
                 for record in input(nul)? {
                     let (header, path) = record
@@ -641,11 +680,13 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                     if force_remove {
                         index.files.remove(&path);
                         index.conflicts.remove(&path);
+                        index.intents.remove(&path);
                         continue;
                     }
                     if !add
                         && !index.files.contains_key(&path)
                         && !index.conflicts.contains_key(&path)
+                        && !index.intents.contains(&path)
                     {
                         return Err("new paths require --add".into());
                     }
@@ -654,15 +695,19 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                             validate_wasm(&bytes)?;
                             index.files.insert(path.clone(), bytes);
                             index.conflicts.remove(&path);
+                            index.intents.remove(&path);
+                            index.flags.remove(&path);
                         }
                         None if remove => {
                             index.files.remove(&path);
                             index.conflicts.remove(&path);
+                            index.intents.remove(&path);
                         }
                         None => return Err(format!("missing index input path: {path:?}")),
                     }
                 }
             }
+            index.tidy();
             validate_index(&index)?;
             if !dry_run {
                 state.save_index(&index)?;

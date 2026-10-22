@@ -338,12 +338,15 @@ pub fn mergetool(
         let index = index.as_mut().ok_or("missing resolution index")?;
         for (path, bytes) in resolutions {
             index.conflicts.remove(&path);
+            index.intents.remove(&path);
+            index.flags.remove(&path);
             if let Some(bytes) = bytes {
                 index.files.insert(path, bytes);
             } else {
                 index.files.remove(&path);
             }
         }
+        index.tidy();
         validate_index(index)?;
         state.repo.with_merge_tool_lease(&inputs.pending, || {
             if regular(&state.metadata.join("index"))? != original_index {
@@ -354,7 +357,7 @@ pub fn mergetool(
             state.save_index(index)
         })?;
     }
-    let report = json!({"schema_version":1,"pending_id":inputs.pending.id,"operation":inputs.pending.operation,"base":inputs.base,"ours":inputs.ours,"theirs":inputs.theirs,"output":directory,"files":entries,"index_updated":stage,"worktree_updated":false,"pending_continued":false,"complete_tree_review_still_required":true});
+    let report = json!({"schema_version":1,"pending_id":inputs.pending.id,"operation":inputs.pending.operation,"base":inputs.base,"ours":inputs.ours,"ours_kind":inputs.ours_kind,"theirs":inputs.theirs,"output":directory,"files":entries,"index_updated":stage,"worktree_updated":false,"pending_continued":false,"complete_tree_review_still_required":true});
     crate::output::write_export_file(
         &directory.join("manifest.json"),
         json_text(&report)?.as_bytes(),
@@ -380,18 +383,24 @@ pub fn squash_merge(root: &str, target: &str, message: Option<&str>) -> Result<S
         .repo
         .squash_plan(target, index.legacy_path.as_deref())?;
     if let Some(files) = &planned.files {
-        let replacement = Index {
+        let mut replacement = Index {
             format: 2,
             files: files.clone(),
             legacy_path: planned.legacy_path.clone(),
             conflicts: BTreeMap::new(),
+            flags: BTreeMap::new(),
+            intents: BTreeSet::new(),
         };
+        let empty = Index::empty();
+        let original = tracked.as_ref().unwrap_or(&empty);
+        index_flags::inherit(&mut replacement, original);
         validate_index(&replacement)?;
         let owned = tracked
             .as_ref()
             .map(|index| keys(&index.files))
             .unwrap_or_default();
-        let changes = plan(&state, &owned, &files_worktree(files))?;
+        let work = index_flags::transition_worktree(&state, original, &replacement, false)?;
+        let changes = plan(&state, &owned, &work)?;
         state.repo.with_head_lease(&planned.branch,&planned.head,||{
             if regular(&state.metadata.join("index"))?!=before{return Err("index changed during squash preflight".into());}
             apply_plan(&state,&changes).map_err(|error|format!("squash work files may have been partly updated; HEAD preserved: {error}"))?;

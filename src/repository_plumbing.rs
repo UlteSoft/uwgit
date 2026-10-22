@@ -387,6 +387,16 @@ impl Repository {
     ) -> RepositoryResult<Vec<CommitInfo>> {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
+        Self::revision_list_snapshot(&snapshot, includes, excludes, all, first_parent)
+    }
+
+    pub(super) fn revision_list_snapshot(
+        snapshot: &Snapshot,
+        includes: &[String],
+        excludes: &[String],
+        all: bool,
+        first_parent: bool,
+    ) -> RepositoryResult<Vec<CommitInfo>> {
         let mut expanded = Vec::new();
         let mut excludes = excludes.to_vec();
         for revision in includes {
@@ -394,7 +404,7 @@ impl Repository {
                 .strip_suffix("^@")
                 .or_else(|| revision.strip_suffix("^!"))
             {
-                let id = snapshot_revision(&snapshot, base)?;
+                let id = snapshot_revision(snapshot, base)?;
                 let Some(Object::Commit(commit)) = snapshot.objects.get(&id) else {
                     return Err("revision set requires a commit".into());
                 };
@@ -417,8 +427,8 @@ impl Repository {
                 if number == 0 {
                     return Err("parent exclusion must be positive".into());
                 }
-                expanded.push(snapshot_revision(&snapshot, base)?);
-                excludes.push(snapshot_revision(&snapshot, &format!("{base}^{number}"))?);
+                expanded.push(snapshot_revision(snapshot, base)?);
+                excludes.push(snapshot_revision(snapshot, &format!("{base}^{number}"))?);
                 continue;
             }
             if let Some((left, right)) = revision.split_once("...") {
@@ -426,11 +436,23 @@ impl Repository {
                     return Err("invalid symmetric revision range".into());
                 }
                 let left =
-                    snapshot_revision(&snapshot, if left.is_empty() { "HEAD" } else { left })?;
+                    snapshot_revision(snapshot, if left.is_empty() { "HEAD" } else { left })?;
                 let right =
-                    snapshot_revision(&snapshot, if right.is_empty() { "HEAD" } else { right })?;
+                    snapshot_revision(snapshot, if right.is_empty() { "HEAD" } else { right })?;
                 excludes.extend(best_merge_bases(&left, &right, &snapshot.objects)?);
                 expanded.extend([left, right]);
+            } else if let Some((left, right)) = revision.split_once("..") {
+                if left.contains("..") || right.contains("..") {
+                    return Err("invalid revision range".into());
+                }
+                excludes.push(snapshot_revision(
+                    snapshot,
+                    if left.is_empty() { "HEAD" } else { left },
+                )?);
+                expanded.push(snapshot_revision(
+                    snapshot,
+                    if right.is_empty() { "HEAD" } else { right },
+                )?);
             } else {
                 expanded.push(revision.clone());
             }
@@ -438,7 +460,7 @@ impl Repository {
         if !all && !includes.is_empty() && expanded.is_empty() {
             return Ok(Vec::new());
         }
-        walk_snapshot(&snapshot, &expanded, &excludes, all, first_parent)
+        walk_snapshot(snapshot, &expanded, &excludes, all, first_parent)
     }
 
     /// All graph calculations and reflog identities come from one verified

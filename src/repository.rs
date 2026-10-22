@@ -41,6 +41,11 @@ mod revision_syntax;
 pub(crate) use head_storage::is_detached_identity;
 pub(crate) use head_storage::validate_head_identity;
 use head_storage::{check_pending_head, head_tip};
+#[path = "repository_sequencer.rs"]
+mod sequencer_storage;
+pub use sequencer_storage::{
+    ReplayCheckpoint, ReplayImages, ReplayJournal, ReplayOptions, ReplayRequest,
+};
 
 pub type RepositoryResult<T> = Result<T, String>;
 
@@ -80,6 +85,8 @@ pub struct PendingOperation {
     pub prepared: Option<PendingPrepared>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase: Option<PendingRebase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayJournal>,
 }
 
 /// A frozen linear replay. Its original branch remains at `head` until every
@@ -2157,6 +2164,7 @@ impl Repository {
             legacy_path: request.legacy_path,
             prepared: None,
             rebase: None,
+            replay: None,
         };
         validate_pending_snapshot(&snapshot, &pending)?;
         let bytes = encode_pending(&pending)?;
@@ -2175,6 +2183,9 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         let mut pending = self.checked_pending(&snapshot, expected)?;
+        if pending.replay.is_some() {
+            return Err("use the saved multi-target replay continuation API".into());
+        }
         if pending.rebase.is_some() {
             return Err("use the rebase continuation API for its saved linear replay".into());
         }
@@ -2318,6 +2329,7 @@ impl Repository {
             baseline_index: request.baseline_index,
             legacy_path: request.legacy_path,
             prepared: None,
+            replay: None,
             rebase: Some(PendingRebase {
                 upstream: request.upstream,
                 onto: request.onto.clone(),
@@ -4028,7 +4040,7 @@ fn check_upstream_tip(
 }
 
 fn encode_pending(pending: &PendingOperation) -> RepositoryResult<Vec<u8>> {
-    if pending.version != 1 {
+    if !matches!(pending.version, 1 | 2) || (pending.version == 2) != pending.replay.is_some() {
         return Err("unsupported pending operation version".into());
     }
     for id in [&pending.id, &pending.head, &pending.target] {
@@ -4096,6 +4108,9 @@ fn encode_pending(pending: &PendingOperation) -> RepositoryResult<Vec<u8>> {
         {
             return Err("invalid final rebase preparation action".into());
         }
+    }
+    if pending.replay.is_some() {
+        sequencer_storage::validate_shape(pending)?;
     }
     if pending
         .baseline_index
@@ -4174,6 +4189,9 @@ fn pending_revisions(
     snapshot: &Snapshot,
     pending: &PendingOperation,
 ) -> RepositoryResult<[RevisionFiles; 3]> {
+    if pending.replay.is_some() {
+        return sequencer_storage::revisions(snapshot, pending);
+    }
     let ours = snapshot_files(snapshot, &pending.head)?;
     let selected = snapshot_files(snapshot, &pending.target)?;
     if pending.operation == "merge" {
@@ -4209,6 +4227,9 @@ fn validate_pending_snapshot(
     pending: &PendingOperation,
 ) -> RepositoryResult<()> {
     encode_pending(pending)?;
+    if pending.replay.is_some() {
+        return sequencer_storage::validate_snapshot(snapshot, pending);
+    }
     if pending.rebase.is_some() {
         return validate_pending_rebase(snapshot, pending);
     }
@@ -7655,6 +7676,7 @@ mod tests {
                 commit: report["commit"].as_str().unwrap().into(),
                 index_sha256: format!("{:x}", Sha256::digest(b"")),
             }),
+            replay: None,
             rebase: Some(PendingRebase {
                 upstream: upstream.clone(),
                 onto: upstream.clone(),

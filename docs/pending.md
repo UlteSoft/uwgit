@@ -1,6 +1,6 @@
 # 单目标冲突续作与中断恢复
 
-默认冲突行为保持不变：JSON 报告、退出 2，不发布半成品或建立操作状态。
+本页描述旧单目标接口。未选择新队列选项的单目标默认冲突保持 stateless；多目标、范围及 `--sequence` 使用[多目标 replay](replay-queue.md)，自动记录 stages 和工作区检查点。
 
 ## 操作契约
 
@@ -48,6 +48,5 @@ pending 存在而 index 损坏时，status 明确给出 index_error 和不可用
 `.uwgit/pending.json` 为本地规范 version 1 JSON，包含原 index 备份的编码总量限制为 64 MiB。
 重复键、非规范编码、未知字段、非法绑定、非普通文件和 symlink 明确拒绝；pending 不进入对象、bundle、clone、HTTP 或 SSH 的仓库状态。
 
-这些命令与 Git 的控制语义作过对照，但并非完整 Git sequencer。
-目前没有 unmerged index stages、自动 `--ours/--theirs`、多目标队列、rebase continue/abort/skip、交互式 rebase 或 detached/orphan HEAD。
+这些命令与 Git 的控制语义作过对照。后续已加入[索引 stages](index-stages.md)、[多目标 replay](replay-queue.md)、[线性 rebase 续作](rebase-pending.md)和 [HEAD 状态](head-and-pathspec.md)。交互式 rebase 与全部 Git 选项仍未完成。
 参考 [Git merge](https://git-scm.com/docs/git-merge)、[Git cherry-pick](https://git-scm.com/docs/git-cherry-pick)、[Git revert](https://git-scm.com/docs/git-revert)、[Git rebase](https://git-scm.com/docs/git-rebase)；准确命令边界仍见[能力矩阵](git-command-coverage.md)。

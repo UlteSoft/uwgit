@@ -30,4 +30,4 @@ pending version 1 新增可省略的 rebase 子记录，旧单目标记录的原
 
 这些是固定构造的中断状态与 I/O 边界检查，不是随机杀进程或断电测试。多文件工作区 I/O 失败不保证整体回滚，错误明确指出可能完成的步骤。pending 不进入对象格式、bundle 或 HTTP/SSH 状态；完整对象包可能包含已安装的未引用进度对象，不能把“状态不传输”解释成“这些对象绝不传输”。
 
-尚不支持 interactive/todo 编辑、merge 拓扑保留、root replay、patch-equivalence 自动去重、unmerged index stages、detached/orphan HEAD，亦不新增 pick/revert 多目标范围。准确能力见[命令矩阵](git-command-coverage.md)。
+此 rebase 接口尚不支持 interactive/todo 编辑、merge 拓扑保留、root replay、patch-equivalence 自动去重或自动生成冲突 stages。通用[索引 stages](index-stages.md)、[HEAD 状态](head-and-pathspec.md)和[多目标 pick/revert](replay-queue.md)已由其他接口提供。准确能力见[命令矩阵](git-command-coverage.md)。

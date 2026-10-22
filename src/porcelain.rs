@@ -21,12 +21,18 @@ pub use worktree_tools::squash_merge;
 #[path = "index_plumbing.rs"]
 mod index_plumbing;
 pub use index_plumbing::{index_command, index_command_handles};
+#[path = "index_flags.rs"]
+mod index_flags;
+#[path = "porcelain_replay.rs"]
+mod replay_worktree;
+pub use replay_worktree::{replay_control, replay_start};
 
 const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
 const STAGED_MAGIC: &[u8; 9] = b"UWGITIDX\x03";
+const FLAGS_MAGIC: &[u8; 9] = b"UWGITIDX\x04";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
-const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [--] PATHSPEC...; status DIR; commit DIR [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
+const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [-N|--intent-to-add] [--sparse] [--] PATHSPEC...; status DIR; commit DIR [-a|--all] [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--ignore-skip-worktree-bits] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 type Files = BTreeMap<String, Vec<u8>>;
 type Worktree = BTreeMap<String, Option<Vec<u8>>>;
@@ -39,6 +45,28 @@ struct Index {
     legacy_path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     conflicts: BTreeMap<String, ConflictStages>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    flags: BTreeMap<String, IndexFlags>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    intents: BTreeSet<String>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexFlags {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    assume_unchanged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    skip_worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fsmonitor_valid: Option<String>,
+}
+impl IndexFlags {
+    fn hidden(&self) -> bool {
+        self.assume_unchanged || self.skip_worktree
+    }
+    fn empty(&self) -> bool {
+        !self.hidden() && self.fsmonitor_valid.is_none()
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,12 +86,27 @@ impl ConflictStages {
     }
 }
 impl Index {
+    fn hidden(&self, path: &str) -> bool {
+        self.flags.get(path).is_some_and(IndexFlags::hidden)
+    }
+    fn skipped(&self, path: &str) -> bool {
+        self.flags.get(path).is_some_and(|flag| flag.skip_worktree)
+    }
+    fn tidy(&mut self) {
+        self.intents
+            .retain(|path| !self.files.contains_key(path) && !self.conflicts.contains_key(path));
+        self.flags.retain(|path, flag| {
+            (self.files.contains_key(path) || self.intents.contains(path)) && !flag.empty()
+        });
+    }
     fn empty() -> Self {
         Self {
             format: 2,
             files: BTreeMap::new(),
             legacy_path: None,
             conflicts: BTreeMap::new(),
+            flags: BTreeMap::new(),
+            intents: BTreeSet::new(),
         }
     }
 }
@@ -165,10 +208,41 @@ fn validate_files(files: &Files) -> Result<(), String> {
     Ok(())
 }
 fn validate_index(index: &Index) -> Result<(), String> {
-    if !matches!(index.format, 2 | 3) || (index.format == 2 && !index.conflicts.is_empty()) {
+    if !matches!(index.format, 2..=4)
+        || (index.format == 2 && !index.conflicts.is_empty())
+        || (index.format != 4 && (!index.flags.is_empty() || !index.intents.is_empty()))
+    {
         return Err("unsupported index format".into());
     }
     validate_files(&index.files)?;
+    for path in &index.intents {
+        validate_tree_path(path)?;
+        if index.files.contains_key(path) || index.conflicts.contains_key(path) {
+            return Err("intent-to-add cannot overlap a stored index image".into());
+        }
+    }
+    for (path, flag) in &index.flags {
+        validate_tree_path(path)?;
+        if flag.empty() || (!index.files.contains_key(path) && !index.intents.contains(path)) {
+            return Err("index flags require a resolved entry or intent-to-add path".into());
+        }
+        if flag.fsmonitor_valid.as_ref().is_some_and(|id| {
+            id.len() != 64
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err("invalid native fsmonitor image digest".into());
+        }
+        if flag.fsmonitor_valid.as_ref().is_some_and(|id| {
+            index
+                .files
+                .get(path)
+                .is_none_or(|bytes| index_flags::digest(bytes) != *id)
+        }) {
+            return Err("native fsmonitor digest must identify its stored index image".into());
+        }
+    }
     for (path, stages) in &index.conflicts {
         validate_tree_path(path)?;
         if index.files.contains_key(path)
@@ -188,6 +262,7 @@ fn validate_index(index: &Index) -> Result<(), String> {
         let paths: BTreeSet<_> = index
             .files
             .keys()
+            .chain(index.intents.iter())
             .chain(
                 index
                     .conflicts
@@ -214,11 +289,16 @@ fn validate_index(index: &Index) -> Result<(), String> {
 }
 fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
     let mut normalized = index.clone();
-    if !normalized.conflicts.is_empty() {
+    normalized.tidy();
+    if !normalized.flags.is_empty() || !normalized.intents.is_empty() {
+        normalized.format = 4;
+    } else if !normalized.conflicts.is_empty() && normalized.format < 3 {
         normalized.format = 3;
     }
     validate_index(&normalized)?;
-    let mut bytes = if normalized.format == 3 {
+    let mut bytes = if normalized.format == 4 {
+        FLAGS_MAGIC
+    } else if normalized.format == 3 {
         STAGED_MAGIC
     } else {
         MAGIC
@@ -228,6 +308,14 @@ fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 fn decode_index(bytes: &[u8]) -> Result<Index, String> {
+    if let Some(payload) = bytes.strip_prefix(FLAGS_MAGIC) {
+        let index: Index = decode_canonical(payload)?;
+        if index.format != 4 {
+            return Err("flag index magic/format mismatch".into());
+        }
+        validate_index(&index)?;
+        return Ok(index);
+    }
     if let Some(payload) = bytes.strip_prefix(STAGED_MAGIC) {
         let index: Index = decode_canonical(payload)?;
         if index.format != 3 {
@@ -265,6 +353,8 @@ fn decode_index(bytes: &[u8]) -> Result<Index, String> {
         files: BTreeMap::from([(path.clone(), bytes[split..].to_vec())]),
         legacy_path: Some(path),
         conflicts: BTreeMap::new(),
+        flags: BTreeMap::new(),
+        intents: BTreeSet::new(),
     };
     validate_index(&index)?;
     Ok(index)
@@ -277,11 +367,139 @@ fn require_resolved_index(index: &Index) -> Result<(), String> {
         Err("index has unresolved native Wasm stages; resolve them with add/rm or update-index before publishing a tree".into())
     }
 }
+
+pub fn replay_baseline_files(
+    raw: Option<&[u8]>,
+    head: &RevisionFiles,
+    anchor: Option<&str>,
+    allow_staged: bool,
+) -> Result<Files, String> {
+    let files = if let Some(raw) = raw {
+        let index = decode_index(raw)?;
+        require_resolved_index(&index)?;
+        if !index.intents.is_empty() {
+            return Err(
+                "replay requires complete images; stage or remove intent-to-add paths first".into(),
+            );
+        }
+        if index.legacy_path.as_deref() != anchor {
+            return Err("replay baseline changed its path anchor".into());
+        }
+        index.files
+    } else {
+        head.files.clone()
+    };
+    if !allow_staged && files != head.files {
+        return Err("committing replay requires the complete unchanged HEAD index".into());
+    }
+    validate_files(&files)?;
+    Ok(files)
+}
+pub fn validate_replay_initial_worktree(
+    raw: Option<&[u8]>,
+    work: &Worktree,
+    allow_dirty: bool,
+) -> Result<(), String> {
+    let index = raw
+        .map(decode_index)
+        .transpose()?
+        .unwrap_or_else(Index::empty);
+    if work.keys().cloned().collect::<BTreeSet<_>>() != controlled_paths(&index) {
+        return Err("replay baseline work scope differs from its original index".into());
+    }
+    if !allow_dirty {
+        for (path, image) in work {
+            if image.as_ref() != index.files.get(path) && !(image.is_none() && index.skipped(path))
+            {
+                return Err("committing replay baseline contains dirty work bytes".into());
+            }
+        }
+    }
+    Ok(())
+}
+pub fn validate_replay_checkpoint(
+    checkpoint: &crate::repository::ReplayCheckpoint,
+    images: &crate::repository::ReplayImages,
+    anchor: Option<&str>,
+) -> Result<(), String> {
+    let after = decode_index(&checkpoint.index_after)?;
+    let conflicts: BTreeMap<_, _> = images
+        .conflicts
+        .iter()
+        .map(|(path, sides)| {
+            (
+                path.clone(),
+                ConflictStages {
+                    base: sides[0].clone(),
+                    ours: sides[1].clone(),
+                    theirs: sides[2].clone(),
+                },
+            )
+        })
+        .collect();
+    if after.files != images.files
+        || after.conflicts != conflicts
+        || !after.intents.is_empty()
+        || after.legacy_path.as_deref() != anchor
+    {
+        return Err("replay checkpoint differs from its exact native images".into());
+    }
+    let before = checkpoint
+        .index_before
+        .as_deref()
+        .map(decode_index)
+        .transpose();
+    let before = match before {
+        Ok(index) => index.unwrap_or_else(Index::empty),
+        Err(_) if checkpoint.action == "skip" => Index::empty(),
+        Err(e) => return Err(e),
+    };
+    let scope: BTreeSet<_> = checkpoint
+        .owned_before
+        .iter()
+        .cloned()
+        .chain(controlled_paths(&after))
+        .collect();
+    if checkpoint
+        .work_after
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != scope
+    {
+        return Err("replay checkpoint changed its controlled work scope".into());
+    }
+    for (path, value) in &checkpoint.work_after {
+        let expected = after.files.get(path).or_else(|| {
+            after
+                .conflicts
+                .get(path)
+                .and_then(|side| side.ours.as_ref())
+        });
+        let original = checkpoint.work_before.get(path).and_then(Option::as_ref);
+        let old = before.files.get(path).or_else(|| {
+            before
+                .conflicts
+                .get(path)
+                .and_then(|side| side.ours.as_ref())
+        });
+        let preserved =
+            checkpoint.action != "skip" && old == expected && value.as_ref() == original;
+        let sparse = after.skipped(path) && value.is_none() && original.is_none();
+        if value.as_ref() != expected && !preserved && !sparse {
+            return Err(format!(
+                "replay checkpoint work image is unrelated to its result: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
 fn controlled_paths(index: &Index) -> BTreeSet<String> {
     index
         .files
         .keys()
         .chain(index.conflicts.keys())
+        .chain(index.intents.iter())
         .cloned()
         .collect()
 }
@@ -589,6 +807,8 @@ impl State {
             files,
             legacy_path,
             conflicts: BTreeMap::new(),
+            flags: BTreeMap::new(),
+            intents: BTreeSet::new(),
         };
         validate_index(&index)?;
         Ok(index)
@@ -691,6 +911,8 @@ impl State {
                                 files: BTreeMap::from([(p.clone(), e.index.bytes)]),
                                 legacy_path: Some(p.clone()),
                                 conflicts: BTreeMap::new(),
+                                flags: BTreeMap::new(),
+                                intents: BTreeSet::new(),
                             },
                             worktree: BTreeMap::from([(p, e.worktree)]),
                         }
@@ -707,6 +929,9 @@ impl State {
         for e in &value.entries {
             validate_index(&e.index)?;
             require_resolved_index(&e.index)?;
+            if !e.index.intents.is_empty() {
+                return Err("stash index contains intent-to-add without a saved image".into());
+            }
             if e.base.len() != 64
                 || !e
                     .base
@@ -855,6 +1080,8 @@ pub fn encode_worktree_index(files: &Files, legacy_path: Option<&str>) -> Result
         files: files.clone(),
         legacy_path: legacy_path.map(str::to_owned),
         conflicts: BTreeMap::new(),
+        flags: BTreeMap::new(),
+        intents: BTreeSet::new(),
     })
 }
 
@@ -950,6 +1177,8 @@ pub fn read_tree(root: &str, revision: Option<&str>) -> Result<String, String> {
             files: snapshot.files,
             legacy_path: snapshot.legacy_path,
             conflicts: BTreeMap::new(),
+            flags: BTreeMap::new(),
+            intents: BTreeSet::new(),
         }
     } else {
         Index::empty()
@@ -1033,6 +1262,7 @@ fn path_operands(args: &[String]) -> Vec<String> {
 fn add(state: &State, paths: &[String]) -> Result<String, String> {
     let (mut all, mut update, mut force, mut dry_run, mut literal) =
         (false, false, false, false, false);
+    let (mut intent, mut sparse) = (false, false);
     let mut selectors = Vec::new();
     for arg in paths {
         if literal {
@@ -1045,6 +1275,8 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
             "-u" | "--update" => update = true,
             "-f" | "--force" => force = true,
             "-n" | "--dry-run" => dry_run = true,
+            "-N" | "--intent-to-add" => intent = true,
+            "--sparse" => sparse = true,
             option if option.starts_with('-') => {
                 return Err(format!("unsupported add option: {option}"))
             }
@@ -1066,8 +1298,7 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
         })
         .map(String::as_str);
     let mut index = state.starting_index(anchor)?;
-    let mut candidates: BTreeSet<_> = index.files.keys().cloned().collect();
-    candidates.extend(index.conflicts.keys().cloned());
+    let mut candidates = controlled_paths(&index);
     if !update {
         for path in worktree_tools::visible_paths(&state.repo.root, !force)? {
             let full = state.worktree_path(&path)?;
@@ -1077,18 +1308,56 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
         }
     }
     let selected = select_paths(&candidates, &selectors)?;
+    if !sparse
+        && !selectors.is_empty()
+        && selected.iter().all(|path| index.skipped(path))
+        && !selected.is_empty()
+    {
+        return Err(
+            "selected paths are skip-worktree; use --sparse to stage them explicitly".into(),
+        );
+    }
+    let mut count = 0;
     for path in &selected {
+        if intent && index.conflicts.contains_key(path) {
+            return Err("intent-to-add cannot resolve unmerged images; stage actual bytes or remove the path".into());
+        }
+        if index.skipped(path) && !sparse {
+            continue;
+        }
+        if index
+            .flags
+            .get(path)
+            .is_some_and(|flag| flag.assume_unchanged)
+        {
+            continue;
+        }
+        if intent && index.files.contains_key(path) {
+            continue;
+        }
         index.conflicts.remove(path);
         match state.worktree_module(path)? {
             Some(bytes) => {
                 validate_wasm(&bytes)?;
-                index.files.insert(path.clone(), bytes);
+                if intent {
+                    index.intents.insert(path.clone());
+                    index.format = 4;
+                } else {
+                    index.files.insert(path.clone(), bytes);
+                    index.intents.remove(path);
+                    if let Some(flag) = index.flags.get_mut(path) {
+                        flag.fsmonitor_valid = None;
+                    }
+                }
             }
             None => {
                 index.files.remove(path);
+                index.intents.remove(path);
             }
         }
+        count += 1;
     }
+    index.tidy();
     validate_index(&index)?;
     if !dry_run && !selected.is_empty() {
         state.save_index(&index)?;
@@ -1096,7 +1365,7 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
     Ok(format!(
         "{} {} paths; {} paths in index",
         if dry_run { "would stage" } else { "staged" },
-        selected.len(),
+        count,
         index.files.len()
     ))
 }
@@ -1196,6 +1465,18 @@ fn pending_status(
         );
         report["rebase"]["prepared_action"] = json!(rebase.prepared_action);
     }
+    if let Some(replay) = &pending.replay {
+        report["replay"] = json!({"queue":replay.queue,"cursor":replay.cursor,"progress":replay.progress,"progress_kind":if replay.options.no_commit{"tree"}else{"commit"},"no_commit":replay.options.no_commit,"steps":replay.steps,"checkpoint_pending":replay.checkpoint.is_some()});
+        report["phase"] = json!(if replay.checkpoint.is_some() {
+            "worktree-checkpoint"
+        } else if already_published {
+            "published"
+        } else {
+            &replay.stop
+        });
+        report["complete_index_required"] =
+            json!(replay.checkpoint.is_none() && replay.stop != "complete");
+    }
     report
 }
 
@@ -1248,6 +1529,7 @@ fn status(state: &State) -> Result<String, String> {
         .cloned()
         .chain(index.files.keys().cloned())
         .chain(index.conflicts.keys().cloned())
+        .chain(index.intents.iter().cloned())
         .collect();
     let mut rows = Vec::new();
     let mut staged_any = false;
@@ -1257,7 +1539,11 @@ fn status(state: &State) -> Result<String, String> {
     for p in paths {
         let old = head.files.get(&p);
         let staged = index.files.get(&p);
-        let current = worktree.get(&p).cloned().flatten();
+        let current = if index.hidden(&p) {
+            staged.cloned()
+        } else {
+            worktree.get(&p).cloned().flatten()
+        };
         let change = if index.conflicts.contains_key(&p) {
             "unmerged"
         } else {
@@ -1272,6 +1558,7 @@ fn status(state: &State) -> Result<String, String> {
             "unmerged"
         } else {
             match (staged, current.as_ref()) {
+                (None, Some(_)) if index.intents.contains(&p) => "added",
                 (None, Some(_)) => "untracked",
                 (Some(_), None) => "deleted",
                 _ if current.as_ref() != staged => "modified",
@@ -1279,9 +1566,17 @@ fn status(state: &State) -> Result<String, String> {
             }
         };
         staged_any |= change != "clean";
-        modified |= work == "modified";
+        modified |= matches!(work, "modified" | "added");
         deleted |= work == "deleted";
-        rows.push(json!({"path":p,"staged":change,"worktree":work}));
+        let mut row = json!({"path":p,"staged":change,"worktree":work});
+        if index.format == 4 {
+            row["intent_to_add"] = json!(index.intents.contains(&p));
+            row["assume_unchanged"] =
+                json!(index.flags.get(&p).is_some_and(|f| f.assume_unchanged));
+            row["skip_worktree"] = json!(index.skipped(&p));
+            row["fsmonitor_valid"] = json!(index_flags::monitor_valid(state, index, &p)?);
+        }
+        rows.push(row);
     }
     let untracked = scan_untracked(state, &controlled_paths(index))?;
     let singleton = if index.files.len() == 1 {
@@ -1303,11 +1598,13 @@ fn commit(state: &State, args: &[String]) -> Result<String, String> {
     let mut amend = false;
     let mut allow_empty = false;
     let mut message = None;
+    let mut all = false;
     let mut cursor = 2;
     while cursor < args.len() {
         match args[cursor].as_str() {
             "--amend" if !amend => amend = true,
             "--allow-empty" if !allow_empty => allow_empty = true,
+            "-a" | "--all" if !all => all = true,
             "-m" | "--message" if message.is_none() => {
                 cursor += 1;
                 message = Some(
@@ -1335,12 +1632,34 @@ fn commit(state: &State, args: &[String]) -> Result<String, String> {
             }
         })
         .ok_or("commit requires -m MESSAGE")?;
-    let index = match state.index()? {
+    let mut index = match state.index()? {
         Some(i) => i,
         None if allow_empty && head.is_none() => Index::empty(),
         None if amend || allow_empty => state.starting_index(None)?,
         None => return Err("nothing staged; use add DIR FILE...".into()),
     };
+    if all {
+        require_resolved_index(&index)?;
+        for path in controlled_paths(&index) {
+            if index.hidden(&path) {
+                continue;
+            }
+            match state.worktree_module(&path)? {
+                Some(bytes) => {
+                    validate_wasm(&bytes)?;
+                    index.files.insert(path.clone(), bytes);
+                    index.intents.remove(&path);
+                    index.flags.remove(&path);
+                }
+                None => {
+                    index.files.remove(&path);
+                    index.intents.remove(&path);
+                }
+            }
+        }
+        index.tidy();
+        validate_index(&index)?;
+    }
     let old = head
         .map(|id| state.revision_index(id, index.legacy_path.as_deref()))
         .transpose()?
@@ -1648,6 +1967,9 @@ fn clean_index(state: &State) -> Result<Option<Index>, String> {
     let index = state.index()?;
     if let Some(i) = &index {
         require_resolved_index(i)?;
+        if !i.intents.is_empty() {
+            return Err("index has intent-to-add paths; stage or remove them first".into());
+        }
         let h = state
             .head()?
             .map(|id| state.revision_index(&id, i.legacy_path.as_deref()))
@@ -1657,12 +1979,27 @@ fn clean_index(state: &State) -> Result<Option<Index>, String> {
             return Err("index has staged changes; commit or stash them first".into());
         }
         for (p, b) in &i.files {
-            if state.worktree(p)?.as_ref() != Some(b) {
+            let actual = state.worktree_module(p)?;
+            if actual.is_none() && i.skipped(p) {
+                continue;
+            }
+            if actual.as_ref() != Some(b) {
                 return Err(format!("tracked file has worktree changes: {p}"));
             }
         }
     }
     Ok(index)
+}
+fn plan_index_transition(
+    state: &State,
+    old: &Index,
+    target: &Index,
+    discard: bool,
+) -> Result<WorktreePlan, String> {
+    let mut target = target.clone();
+    index_flags::inherit(&mut target, old);
+    let work = index_flags::transition_worktree(state, old, &target, discard)?;
+    plan(state, &controlled_paths(old), &work)
 }
 pub fn assert_worktree_target_safe(
     repo: &Repository,
@@ -1675,7 +2012,11 @@ pub fn assert_worktree_target_safe(
     };
     if let Some(i) = state.index()? {
         require_resolved_index(&i)?;
-        plan(&state, &keys(&i.files), &files_worktree(files))?;
+        let mut target = Index::empty();
+        target.files = files.clone();
+        index_flags::inherit(&mut target, &i);
+        let work = index_flags::transition_worktree(&state, &i, &target, false)?;
+        plan(&state, &controlled_paths(&i), &work)?;
     }
     Ok(())
 }
@@ -1708,7 +2049,11 @@ pub fn assert_worktree_revision_safe(
         files.insert(path.clone(), bytes.clone());
     }
     validate_files(&files)?;
-    plan(&state, &keys(&index.files), &files_worktree(&files))?;
+    let mut target = Index::empty();
+    target.files = files;
+    index_flags::inherit(&mut target, &index);
+    let work = index_flags::transition_worktree(&state, &index, &target, false)?;
+    plan(&state, &controlled_paths(&index), &work)?;
     Ok(())
 }
 fn change_and_sync(
@@ -1735,14 +2080,17 @@ fn change_and_sync(
         return Ok(result);
     }
     if let Some(i) = index {
-        let target = state
+        let mut target = state
             .revision_index(
                 new.as_deref()
                     .ok_or("HEAD changed to unborn; index/worktree not updated")?,
                 i.legacy_path.as_deref(),
             )
             .map_err(|e| format!("HEAD changed, target tree read failed: {e}"))?;
-        let changes = plan(state, &keys(&i.files), &files_worktree(&target.files))
+        index_flags::inherit(&mut target, &i);
+        let work = index_flags::transition_worktree(state, &i, &target, false)
+            .map_err(|e| format!("HEAD changed; worktree planning failed: {e}"))?;
+        let changes = plan(state, &controlled_paths(&i), &work)
             .map_err(|e| format!("HEAD changed, worktree preflight failed: {e}"))?;
         apply_plan(state, &changes).map_err(|e| format!("HEAD changed; index not updated: {e}"))?;
         state
@@ -2006,7 +2354,7 @@ pub fn diff_snapshot(root: &str, cached: bool) -> Result<Vec<FileDiffSnapshot>, 
     } else {
         (
             files_worktree(&index.files),
-            state.snapshot_worktree(index.files.keys().cloned())?,
+            index_flags::query_worktree(&state, &index)?,
             "index",
             "worktree",
         )
@@ -2037,7 +2385,7 @@ pub fn diff_index_snapshot(
     let new = if cached {
         files_worktree(&index.files)
     } else {
-        state.snapshot_worktree(index.files.keys().cloned())?
+        index_flags::query_worktree(&state, &index)?
     };
     let paths: BTreeSet<_> = old.files.keys().chain(new.keys()).cloned().collect();
     Ok(paths
@@ -2259,7 +2607,7 @@ fn switch(state: &State, args: &[String]) -> Result<String, String> {
         let id = state.repo.resolve(revision)?;
         if let Some(index) = clean_index(state)? {
             let target = state.revision_index(&id, index.legacy_path.as_deref())?;
-            plan(state, &keys(&index.files), &files_worktree(&target.files))?;
+            plan_index_transition(state, &index, &target, false)?;
         }
         return change_and_sync(state, true, |repo| {
             repo.detach_head(&id)
@@ -2298,7 +2646,7 @@ fn switch(state: &State, args: &[String]) -> Result<String, String> {
                 if create { revision } else { name },
                 i.legacy_path.as_deref(),
             )?;
-            plan(state, &keys(&i.files), &files_worktree(&target.files))?;
+            plan_index_transition(state, &i, &target, false)?;
         }
     }
     change_and_sync(state, true, |repo| {
@@ -2318,8 +2666,8 @@ fn switch(state: &State, args: &[String]) -> Result<String, String> {
 }
 fn chosen_paths(index: &Index, paths: Vec<String>) -> Result<Vec<String>, String> {
     let paths = if paths.is_empty() {
-        if index.files.len() == 1 {
-            index.files.keys().cloned().collect()
+        if controlled_paths(index).len() == 1 {
+            controlled_paths(index).into_iter().collect()
         } else {
             return Err(
                 "specify tracked paths when index does not contain exactly one file".into(),
@@ -2331,7 +2679,10 @@ fn chosen_paths(index: &Index, paths: Vec<String>) -> Result<Vec<String>, String
     let mut unique = BTreeSet::new();
     for p in &paths {
         validate_tree_path(p)?;
-        if !index.files.contains_key(p) && !index.conflicts.contains_key(p) {
+        if !index.files.contains_key(p)
+            && !index.conflicts.contains_key(p)
+            && !index.intents.contains(p)
+        {
             return Err(format!("path is not tracked: {p}"));
         }
         if !unique.insert(p.clone()) {
@@ -2366,6 +2717,12 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
         .transpose()?
         .unwrap_or_else(Index::empty);
     for p in &paths {
+        if index.intents.contains(p) {
+            if !cached && !force && state.worktree_module(p)?.is_some() {
+                return Err("intent-to-add removal requires --cached or --force".into());
+            }
+            continue;
+        }
         if index.conflicts.contains_key(p) {
             if !force {
                 return Err("unmerged removal requires explicit --force".into());
@@ -2396,7 +2753,10 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
     for p in &paths {
         index.files.remove(p);
         index.conflicts.remove(p);
+        index.intents.remove(p);
+        index.flags.remove(p);
     }
+    index.tidy();
     validate_index(&index)?;
     if let Some(changes) = changes {
         apply_plan(state, &changes)?;
@@ -2417,19 +2777,32 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
 fn move_tracked(state: &State, old: &str, new: &str) -> Result<String, String> {
     let mut index = state.index()?.ok_or("no index")?;
     validate_tree_path(new)?;
-    let staged = index
-        .files
-        .get(old)
-        .ok_or("mv source is not tracked")?
-        .clone();
-    if index.files.contains_key(new) {
+    let staged = index.files.get(old).cloned();
+    let intent = index.intents.contains(old);
+    if staged.is_none() && !intent {
+        return Err("mv source is not tracked".into());
+    }
+    if controlled_paths(&index).contains(new) {
         return Err("mv destination already exists".into());
     }
     let bytes = state.worktree(old)?.ok_or("mv source is deleted")?;
-    let owned = keys(&index.files);
-    let mut target = state.snapshot_worktree(index.files.keys().cloned())?;
+    let owned = controlled_paths(&index);
+    let mut target = state.snapshot_worktree(owned.iter().cloned())?;
     index.files.remove(old);
-    index.files.insert(new.into(), staged);
+    index.intents.remove(old);
+    if let Some(bytes) = staged {
+        index.files.insert(new.into(), bytes);
+    }
+    if intent {
+        index.intents.insert(new.into());
+    }
+    if let Some(mut flag) = index.flags.remove(old) {
+        flag.fsmonitor_valid = None;
+        if !flag.empty() {
+            index.flags.insert(new.into(), flag);
+        }
+    }
+    index.tidy();
     validate_index(&index)?;
     target.insert(old.into(), None);
     target.insert(new.into(), Some(bytes));
@@ -2459,6 +2832,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
     let mut staged = false;
     let mut work = false;
     let mut overlay = false;
+    let mut ignore_skip = false;
     let mut output = None;
     let mut explicit_file = false;
     let mut paths = Vec::new();
@@ -2482,6 +2856,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
             "--staged" if !staged => staged = true,
             "--worktree" if !work => work = true,
             "--overlay" if !overlay => overlay = true,
+            "--ignore-skip-worktree-bits" if !ignore_skip => ignore_skip = true,
             "--output" if output.is_none() => {
                 cursor += 1;
                 output = Some(args.get(cursor).ok_or(USAGE)?.as_str());
@@ -2602,6 +2977,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
             .keys()
             .cloned()
             .chain(replacement.conflicts.keys().cloned())
+            .chain(replacement.intents.iter().cloned())
             .chain(target.files.keys().cloned())
             .collect()
     };
@@ -2619,6 +2995,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
             .files
             .keys()
             .chain(replacement.conflicts.keys())
+            .chain(replacement.intents.iter())
             .filter(|path| {
                 has_descendant(&selected, path)
                     || path
@@ -2636,26 +3013,40 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
     };
     for p in &selected {
         validate_tree_path(p)?;
+        if work && !staged && !ignore_skip && replacement.skipped(p) {
+            continue;
+        }
+        if target.intents.contains(p) {
+            return Err("intent-to-add has no image to restore; stage its content first".into());
+        }
         if target.conflicts.contains_key(p) {
             return Err("restore of unmerged paths requires --ours or --theirs".into());
         }
         replacement.conflicts.remove(p);
+        replacement.intents.remove(p);
+        let write_work = work && (ignore_skip || !replacement.skipped(p));
+        if replacement.files.get(p) != target.files.get(p) {
+            if let Some(flag) = replacement.flags.get_mut(p) {
+                flag.fsmonitor_valid = None;
+            }
+        }
         match target.files.get(p) {
             Some(b) => {
                 replacement.files.insert(p.clone(), b.clone());
-                if work {
+                if write_work {
                     desired.insert(p.clone(), Some(b.clone()));
                 }
             }
             None => {
                 replacement.files.remove(p);
-                if work {
+                if write_work {
                     desired.insert(p.clone(), None);
                 }
             }
         }
     }
     replacement.legacy_path = legacy_path;
+    replacement.tidy();
     validate_index(&replacement)?;
     if work {
         let owned = old.as_ref().map(controlled_paths).unwrap_or_default();
@@ -2718,16 +3109,27 @@ fn reset(state: &State, args: &[String]) -> Result<String, String> {
     let s = state.repo.state()?;
     let head = s.tip();
     let id = state.repo.resolve(rev)?;
-    let target = if mode == "--soft" {
+    let mut target = if mode == "--soft" {
         None
     } else {
         Some(state.revision_index(&id, old.as_ref().and_then(|i| i.legacy_path.as_deref()))?)
     };
+    if let (Some(target), Some(old)) = (&mut target, &old) {
+        index_flags::inherit(target, old);
+    }
     let changes = if mode == "--hard" {
+        let empty = Index::empty();
+        let before = old.as_ref().unwrap_or(&empty);
+        let work = index_flags::transition_worktree(
+            state,
+            before,
+            target.as_ref().ok_or("missing reset tree")?,
+            true,
+        )?;
         Some(plan(
             state,
             &old.as_ref().map(controlled_paths).unwrap_or_default(),
-            &files_worktree(&target.as_ref().ok_or("missing reset tree")?.files),
+            &work,
         )?)
     } else {
         None
@@ -2844,8 +3246,10 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
         {
             let index = state.index()?.ok_or("no index to stash")?;
             require_resolved_index(&index)?;
+            if !index.intents.is_empty() { return Err("stage or remove intent-to-add paths before stashing".into()); }
             let base = state.head()?.ok_or("cannot stash before first commit")?;
-            let target = state.revision_index(&base, index.legacy_path.as_deref())?;
+            let mut target = state.revision_index(&base, index.legacy_path.as_deref())?;
+            index_flags::inherit(&mut target,&index);
             let paths: BTreeSet<_> = index
                 .files
                 .keys()
@@ -2856,7 +3260,7 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
             if index.files == target.files && worktree == files_worktree(&target.files) {
                 return Ok("no local changes to save".into());
             }
-            let changes = plan(state, &keys(&index.files), &files_worktree(&target.files))?;
+            let changes = plan_index_transition(state,&index,&target,true)?;
             let id = all.next_id;
             all.next_id = id.checked_add(1).ok_or("stash sequence exhausted")?;
             all.entries.push(Stash {
@@ -2922,7 +3326,7 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
             let base = state.revision_index(&e.base, e.index.legacy_path.as_deref())?;
             let staged = merge_trees(&base.files, &ours.files, &files_worktree(&e.index.files))?;
             let worktree = merge_trees(&base.files, &ours.files, &e.worktree)?;
-            let target = Index {
+            let mut target = Index {
                 format: 2,
                 files: staged
                     .into_iter()
@@ -2930,7 +3334,10 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
                     .collect(),
                 legacy_path: ours.legacy_path.or_else(|| e.index.legacy_path.clone()),
                 conflicts: BTreeMap::new(),
+            flags: BTreeMap::new(),
+            intents: BTreeSet::new(),
             };
+            index_flags::inherit(&mut target,&e.index);
             validate_index(&target)?;
             let changes = plan(state, &keys(&current.files), &worktree)?;
             apply_plan(state, &changes)?;

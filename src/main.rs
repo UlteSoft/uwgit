@@ -28,6 +28,7 @@ mod query_commands;
 mod rebase_commands;
 mod ref_commands;
 mod remote;
+mod replay_commands;
 mod report;
 mod repository;
 mod resolve;
@@ -286,12 +287,13 @@ fn main() {
         "clone" if args.get(2).is_some_and(|url| remote::is_remote_url(url)) => {
             remote::run(&args[1..])
         }
-        "merge" | "cherry-pick" | "revert" | "rebase"
+        "cherry-pick" | "revert" => replay_commands::run(&args[1..]),
+        "merge" | "rebase"
             if operation_commands::requested(&args[1..]) =>
         {
             operation_commands::run(&args[1..])
         }
-        "cherry-pick" | "revert" | "rebase" => history_commands::run(&args[1..]),
+        "rebase" => history_commands::run(&args[1..]),
         "status" | "add" | "rm" | "mv" | "restore" | "reset" | "stash" | "config" | "tag"
         | "reflog" | "rev-parse" | "cat-file" | "ls-files" => porcelain::run(&args[1..]),
         "commit" if args.get(3).is_some_and(|arg| arg.starts_with('-')) => {
@@ -322,7 +324,7 @@ fn main() {
                 args[1].as_str(),
                 "merge" | "pull" | "cherry-pick" | "revert" | "rebase"
             ) && serde_json::from_str::<Value>(&output)
-                .is_ok_and(|report| report["status"] == "conflict");
+                .is_ok_and(|report| report["status"] == "conflict" || report["status"] == "empty");
             println!("{output}");
             if conflict {
                 std::process::exit(2);
@@ -901,11 +903,16 @@ fn print_usage() {
     );
     eprintln!("  tag <DIR> [NAME [REV]|-d NAME] | reflog <DIR> | rev-parse <DIR> <REV>");
     eprintln!("  cat-file <DIR> <REV> | ls-files <DIR> | config <DIR> [KEY [VALUE]]");
-    eprintln!("  ls-files <DIR> [-s|--unmerged] [-m|-d|-o|-i|-k] [-t] [--exclude-standard] [-z|--json|--format STR] [-- PATHSPEC...]");
-    eprintln!("  checkout-index <DIR> [-a] [-f] [-n] [--prefix STR] [--stage 1|2|3|all] [--temp] [--stdin] [-z] [-- PATH...]");
+    eprintln!("  ls-files <DIR> [-s|--unmerged] [-m|-d|-o|-i|-k] [-t|-v|-f] [--exclude-standard] [-z|--json|--format STR] [-- PATHSPEC...]");
+    eprintln!("  checkout-index <DIR> [-a] [-f] [-n] [--prefix STR] [--stage 1|2|3|all] [--temp] [--ignore-skip-worktree-bits] [--stdin] [-z] [-- PATH...]");
     eprintln!("  write-tree <DIR> [--prefix DIR/]");
     eprintln!("  read-tree <DIR> [-m BASE [OURS] THEIRS|--empty|TREE] [-u] [-n] [--prefix DIR/]");
     eprintln!("  update-index <DIR> [--add|--remove|--force-remove] PATH... | --cacheinfo MODE,ID,PATH | --index-info | --stdin [-z]");
+    eprintln!("  update-index <DIR> --[no-]assume-unchanged|--[no-]skip-worktree|--[no-]fsmonitor-valid PATH...");
+    eprintln!(
+        "  update-index <DIR> --refresh|--really-refresh [--ignore-missing] [--unmerged] [PATH...]"
+    );
+    eprintln!("  add <DIR> -N|--intent-to-add PATH... | add <DIR> --sparse PATH... | commit <DIR> -a -m MESSAGE");
     eprintln!("  merge-index <DIR> --all|-- PATHSPEC... [--dry-run] | restore <DIR> --ours|--theirs -- PATHSPEC...");
     eprintln!("  ls-tree <DIR> <REV> [-r] [--json|--name-only|--object-only] [-z] [-- PATH...]");
     eprintln!("  show-ref <DIR> [--head] [--heads|--tags] [--verify] [--quiet|--hash|--json] [PATTERN...]");
@@ -916,8 +923,9 @@ fn print_usage() {
         "  count-objects <DIR> [-v] [-H] | ls-remote <URL|DIR [REMOTE]> [--json] [PATTERN...]"
     );
     eprintln!(
-        "  cherry-pick <DIR> <REV> | revert <DIR> <REV> | rebase <DIR> <UPSTREAM> [--onto REV]"
+        "  cherry-pick|revert <DIR> <REV>... [--sequence|--stdin] [-n] [--reverse] | rebase <DIR> <UPSTREAM> [--onto REV]"
     );
+    eprintln!("  cherry-pick|revert <DIR> REV... [--mainline N] [-m MESSAGE] [--empty stop|drop|keep] [--allow-empty] [--ff] [-x]");
     eprintln!("  cherry-pick|revert <DIR> <TARGET_ID> [--mainline N] --resolved-index --expect-head <HEAD_ID> [--expect-branch NAME] [-m MESSAGE]");
     eprintln!(
         "  merge|cherry-pick|revert <DIR> <REV> --record-conflict [-m MESSAGE] [--mainline N]"

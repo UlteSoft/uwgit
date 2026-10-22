@@ -9,7 +9,7 @@ fn takes_value(command: &str, option: &str) -> bool {
         ),
         "cherry-pick" | "revert" => matches!(
             option,
-            "-m" | "--message" | "--mainline" | "--expect-head" | "--expect-branch"
+            "-m" | "--message" | "--mainline" | "--expect-head" | "--expect-branch" | "--empty"
         ),
         "rebase" => option == "--onto",
         "stash" => matches!(option, "-m" | "--message" | "--output"),

@@ -152,6 +152,7 @@ wasm-git commit ./legacy -m 'name legacy module and add second module'
 | `merge DIR TARGET_ID -m MESSAGE --resolved-index --expect-head HEAD_ID [--expect-branch NAME]` | 以真实 index 的完整树作为明确解决结果，保存双父历史与两侧逐文件审计；不修改 index 或工作文件，允许未暂存修改；没有 index 不代表空树。 |
 | `cherry-pick DIR REV [-m MESSAGE] [--mainline N]` | 重放选定提交相对父提交的修改，保留全部文件路径，创建新提交。 |
 | `revert DIR REV [-m MESSAGE] [--mainline N]` | 反向重放，创建新提交，保留原历史。 |
+| `cherry-pick/revert DIR REV... [-n] [--stdin] [--reverse] [--empty stop/drop/keep]` | 冻结多目标或范围；自动写入非冲突图像和冲突 stages；continue/skip/abort/quit，检查点恢复及其他选项见[多目标 replay](replay-queue.md)。 |
 | `cherry-pick/revert DIR TARGET_ID --resolved-index --expect-head HEAD_ID [--expect-branch NAME] [--mainline N] [-m MESSAGE]` | 用户审定完整 index 后发布单父提交，父为审定的 HEAD；保留 index 与未暂存工作字节，报告手工身份及各侧审计。 |
 | `rebase DIR UPSTREAM [--onto NEW_BASE]` | 只重放线性单父链，要求唯一 merge base；全部重放先在内存完成，晚冲突也不发布中间提交。 |
 
@@ -161,7 +162,7 @@ stash 可以保存编辑中的非 Wasm 工作字节或已删除文件。base 未
 
 merge、pull、cherry-pick、revert、rebase 的冲突输出 JSON 并返回 2；其他命令错误返回 1。
 默认 rebase 冲突不建立半完成状态；可用下述显式录制模式保存队列。不支持交互式或保留 merge 拓扑。
-自动合并与重放要求已建立的工作区干净，成功后同步全部 tracked 文件和 index。
+自动合并与提交式重放要求已建立的工作区干净，成功后同步受控文件和 index。新队列 -n 从完整当前 index 开始并保留未受结果影响的脏工作字节。
 显式 `--resolved-index` 操作只提交用户审定的完整暂存树，允许未暂存修改，不自动补入其他非冲突变更。
 cherry-pick／revert 的此模式只产生一个父提交；目标及选定 mainline 绑定在报告中，不成为第二父提交。
 它不要求此前冲突，也不建立 pending 状态。详细契约见[快进约束与单父手工重放](replay-resolution.md)。
@@ -338,10 +339,12 @@ mv 分别保留原暂存字节与未暂存工作字节，目录转换不会自�
 对象、bundle 和 HTTP/SSH RPC 使用本项目格式，不提供原生 Git wire/tree/pack 互操作。
 这些范围与未知指令、未知 section 的原字节保留规则相互独立。
 
-当前未实现的 Git 功能另有 detached/orphan HEAD、多目标 pick/revert 队列、
-unmerged index stages、交互 rebase、annotated tag、提交签名与自动 GC 等；这些是功能缺口，需要分别补充接口和状态契约。
-默认冲突不建立操作记录，abort/continue 只用于已显式录制的操作。checkout 已提供显式分支与路径入口，并保留独占导出用法。
+已支持 detached/orphan HEAD、[索引 stages](index-stages.md)、[索引标志](index-flags.md)与[多目标 pick/revert](replay-queue.md)。
+当前仍缺交互 rebase、annotated tag、提交签名与自动 GC 等。
+旧单目标默认冲突不建立操作记录；多目标、范围及 --sequence 自动记录检查点，使用对应操作的 abort/continue。checkout 已提供显式分支与路径入口，并保留独占导出用法。
 完整已支持/部分支持/缺失矩阵、当前安全用法及实施优先级见 [Git 命令覆盖与当前缺口](git-command-coverage.md)。
 SHA-256 表示内容完整性，不证明作者身份或行为。审计范围见 [README](../README.md)、[patch](patch.md)、[trace](trace.md)。
 
 索引未解决 stages、`restore/checkout --ours/--theirs`、`read-tree -m`、`update-index`、`checkout-index` 和底层列表合同见[原生索引](index-stages.md)。未解决项不能用作完整提交树。
+
+索引 assume/skip/原图像有效性标志、refresh、add -N、add --sparse 与 commit -a 的契约见[索引标志](index-flags.md)。

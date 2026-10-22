@@ -5,6 +5,7 @@ pub struct MergeToolInputs {
     pub pending: PendingOperation,
     pub base: Option<String>,
     pub ours: String,
+    pub ours_kind: String,
     pub theirs: Option<String>,
     pub files: BTreeMap<String, [Option<Vec<u8>>; 3]>,
 }
@@ -18,7 +19,12 @@ impl Repository {
         validate_pending_snapshot(&snapshot, &pending)?;
         check_expected_branch(&snapshot.manifest.head, Some(&pending.branch))?;
         check_expected(snapshot.manifest.tip(), Some(&pending.head))?;
-        if pending.prepared.is_some() {
+        if pending.prepared.is_some()
+            || pending
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.checkpoint.is_some() || replay.stop == "complete")
+        {
             return Err(
                 "pending publication is prepared; finish --continue before running a merge tool"
                     .into(),
@@ -28,7 +34,23 @@ impl Repository {
             .rebase
             .as_ref()
             .map(|rebase| rebase.progress_tip.clone())
+            .or_else(|| {
+                pending
+                    .replay
+                    .as_ref()
+                    .map(|replay| replay.progress.clone())
+            })
             .unwrap_or_else(|| pending.head.clone());
+        let ours_kind = if pending
+            .replay
+            .as_ref()
+            .is_some_and(|replay| replay.options.no_commit)
+        {
+            "tree"
+        } else {
+            "commit"
+        }
+        .to_owned();
         let (base, theirs) = if pending.operation == "revert" {
             (
                 Some(pending.target.clone()),
@@ -49,18 +71,22 @@ impl Repository {
             files: BTreeMap::new(),
             legacy_path: pending.legacy_path.clone(),
         };
-        let mut revisions = [
-            base.as_ref()
-                .map(|id| snapshot_files(&snapshot, id))
-                .transpose()?
-                .unwrap_or_else(empty),
-            snapshot_files(&snapshot, &ours)?,
-            theirs
-                .as_ref()
-                .map(|id| snapshot_files(&snapshot, id))
-                .transpose()?
-                .unwrap_or_else(empty),
-        ];
+        let mut revisions = if pending.replay.is_some() {
+            sequencer_storage::revisions(&snapshot, &pending)?
+        } else {
+            [
+                base.as_ref()
+                    .map(|id| snapshot_files(&snapshot, id))
+                    .transpose()?
+                    .unwrap_or_else(empty),
+                snapshot_files(&snapshot, &ours)?,
+                theirs
+                    .as_ref()
+                    .map(|id| snapshot_files(&snapshot, id))
+                    .transpose()?
+                    .unwrap_or_else(empty),
+            ]
+        };
         let merged = merge_file_revisions(revisions.clone(), pending.legacy_path.as_deref())?;
         for revision in &mut revisions {
             if let Some(bytes) = revision.legacy.take() {
@@ -105,6 +131,7 @@ impl Repository {
             pending,
             base,
             ours,
+            ours_kind,
             theirs,
             files,
         })

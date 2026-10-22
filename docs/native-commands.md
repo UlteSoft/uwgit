@@ -149,7 +149,7 @@ maintenance 支持 verify 和 gc，未实现的任务明确拒绝。所有维护
 
 ## 覆盖范围
 
-上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。仍需交互式/保留 merge 拓扑的 rebase、多目标 replay 队列、更多 pathspec 与引用事务、索引标志、浅层/稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
+上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。已增加[索引标志与意向条目](index-flags.md)和[多目标 replay 队列](replay-queue.md)。仍需交互式/保留 merge 拓扑的 rebase、更多 pathspec 与引用事务、浅层/完整稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
 
 ## 合并策略
 

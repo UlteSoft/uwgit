@@ -22,6 +22,10 @@ pub(super) struct Args {
     killed: bool,
     #[arg(short = 't')]
     tags: bool,
+    #[arg(short = 'v', conflicts_with_all=["tags","monitor_tags","format"])]
+    assume_tags: bool,
+    #[arg(short = 'f', conflicts_with_all=["tags","assume_tags","format"])]
+    monitor_tags: bool,
     #[arg(long)]
     deduplicate: bool,
     #[arg(long)]
@@ -247,7 +251,11 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
             }
         }
         let current = if options.deleted || options.modified {
-            state.worktree_module(path)?
+            if index.hidden(path) {
+                index.files.get(path).cloned()
+            } else {
+                state.worktree_module(path)?
+            }
         } else {
             None
         };
@@ -257,7 +265,13 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     path: path.clone(),
                     stage: Some(stage),
                     bytes: Some(bytes),
-                    reason: if stage == 0 { 'H' } else { 'M' },
+                    reason: if stage != 0 {
+                        'M'
+                    } else if index.skipped(path) {
+                        'S'
+                    } else {
+                        'H'
+                    },
                 });
             }
             if options.deleted && current.is_none() {
@@ -273,6 +287,32 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     path: path.clone(),
                     stage: Some(stage),
                     bytes: Some(bytes),
+                    reason: 'C',
+                });
+            }
+        }
+        if index.intents.contains(path) {
+            if cached {
+                rows.push(Row {
+                    path: path.clone(),
+                    stage: Some(0),
+                    bytes: None,
+                    reason: if index.skipped(path) { 'S' } else { 'H' },
+                });
+            }
+            if options.deleted && current.is_none() && !index.hidden(path) {
+                rows.push(Row {
+                    path: path.clone(),
+                    stage: Some(0),
+                    bytes: None,
+                    reason: 'R',
+                });
+            }
+            if options.modified && current.is_some() && !index.hidden(path) {
+                rows.push(Row {
+                    path: path.clone(),
+                    stage: Some(0),
+                    bytes: None,
                     reason: 'C',
                 });
             }
@@ -316,7 +356,12 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stage.cmp(&b.stage)));
     if options.deduplicate
-        && !(options.stage || options.unmerged || options.tags || format.is_some())
+        && !(options.stage
+            || options.unmerged
+            || options.tags
+            || options.assume_tags
+            || options.monitor_tags
+            || format.is_some())
     {
         rows.dedup_by(|a, b| a.path == b.path);
     }
@@ -327,7 +372,12 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
             .bytes
             .map(|bytes| state.repo.hash_payload("wasm", bytes, false))
             .transpose()?;
-        json_rows.push(json!({"path":row.path,"stage":row.stage,"object_id":id,"kind":row.bytes.map(|_|"wasm"),"byte_len":row.bytes.map(Vec::len),"reason":row.reason.to_string(),"object_may_be_unpublished":row.bytes.is_some()}));
+        let monitor = index_flags::monitor_valid(state, &index, &row.path)?;
+        let assume = index
+            .flags
+            .get(&row.path)
+            .is_some_and(|flag| flag.assume_unchanged);
+        json_rows.push(json!({"path":row.path,"stage":row.stage,"object_id":id,"kind":row.bytes.map(|_|"wasm"),"byte_len":row.bytes.map(Vec::len),"reason":row.reason.to_string(),"object_may_be_unpublished":row.bytes.is_some(),"intent_to_add":index.intents.contains(&row.path),"assume_unchanged":assume,"skip_worktree":index.skipped(&row.path),"fsmonitor_valid":monitor}));
         if let Some(fields) = &format {
             for field in fields {
                 match field {
@@ -336,21 +386,37 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                         "path" => row.path.clone(),
                         "objectname" => id.clone().unwrap_or_default(),
                         "objectmode" => "100644".into(),
-                        "objecttype" => "wasm".into(),
-                        "objectsize" => row.bytes.map(Vec::len).unwrap_or_default().to_string(),
+                        "objecttype" => if row.bytes.is_some() {
+                            "wasm"
+                        } else {
+                            "intent"
+                        }
+                        .into(),
+                        "objectsize" => row
+                            .bytes
+                            .map(|bytes| bytes.len().to_string())
+                            .unwrap_or_else(|| "-".into()),
                         "stage" => row.stage.unwrap_or_default().to_string(),
                         _ => unreachable!("validated fields"),
                     }),
                 }
             }
         } else {
-            if options.tags {
-                output.push(row.reason);
+            if options.tags || options.assume_tags || options.monitor_tags {
+                let lower = (options.assume_tags && assume) || (options.monitor_tags && monitor);
+                output.push(if lower {
+                    row.reason.to_ascii_lowercase()
+                } else {
+                    row.reason
+                });
                 output.push(' ');
             }
             if options.stage || options.unmerged {
                 if let (Some(id), Some(stage)) = (&id, row.stage) {
                     output.push_str(&format!("100644 {id} {stage}\t"));
+                }
+                if index.intents.contains(&row.path) {
+                    output.push_str("100644 - 0\t");
                 }
             }
             output.push_str(&row.path);
