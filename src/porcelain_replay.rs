@@ -4,6 +4,7 @@ use crate::repository::{ReplayCheckpoint, ReplayImages, ReplayOptions, ReplayReq
 
 fn result_index(images: &ReplayImages, anchor: Option<&str>, old: &Index) -> Result<Index, String> {
     let mut index = Index::empty();
+    index.format = old.format;
     index.files = images.files.clone();
     index.legacy_path = anchor.map(str::to_owned);
     index.conflicts = images
@@ -21,7 +22,7 @@ fn result_index(images: &ReplayImages, anchor: Option<&str>, old: &Index) -> Res
         })
         .collect();
     if !index.conflicts.is_empty() {
-        index.format = 3;
+        index.format = index.format.max(3);
     }
     index_flags::inherit(&mut index, old);
     index.tidy();
@@ -34,6 +35,7 @@ fn checkpoint(
     images: &ReplayImages,
     action: &str,
     before_progress: &Files,
+    skip_from: Option<&ReplayImages>,
 ) -> Result<ReplayCheckpoint, String> {
     let raw = regular(&state.metadata.join("index"))?;
     let decoded = raw.as_deref().map(decode_index).transpose();
@@ -50,14 +52,46 @@ fn checkpoint(
     if !old.intents.is_empty() {
         return Err("stage or remove intent-to-add paths before replay publication".into());
     }
-    let target = result_index(images, pending.legacy_path.as_deref(), &old)?;
+    let mut target = result_index(images, pending.legacy_path.as_deref(), &old)?;
     let replay = pending.replay.as_ref().ok_or("missing replay state")?;
-    let owned_before: BTreeSet<_> = replay
-        .owned
-        .iter()
-        .cloned()
-        .chain(controlled_paths(&old))
-        .collect();
+    let baseline = pending
+        .baseline_index
+        .as_deref()
+        .map(decode_index)
+        .transpose()?
+        .unwrap_or_else(Index::empty);
+    let restore_initial =
+        action == "skip" && replay.steps.iter().all(|step| step.action != "manual");
+    let affected = |path: &str| {
+        skip_from.is_some_and(|stopped| {
+            stopped.conflicts.contains_key(path)
+                || stopped.files.get(path) != before_progress.get(path)
+        })
+    };
+    if restore_initial {
+        for path in target.files.keys() {
+            if affected(path)
+                && before_progress.contains_key(path)
+                && baseline.skipped(path)
+                && replay.initial_worktree.get(path) == Some(&None)
+            {
+                let mut flag = baseline
+                    .flags
+                    .get(path)
+                    .ok_or("missing original skip flag")?
+                    .clone();
+                if target.files.get(path) != baseline.files.get(path) {
+                    flag.fsmonitor_valid = None;
+                }
+                target.flags.insert(path.clone(), flag);
+                target.format = 4;
+            }
+        }
+    }
+    let mut owned_before = replay.owned.clone();
+    if action != "skip" {
+        owned_before.extend(controlled_paths(&old));
+    }
     let scope: BTreeSet<_> = owned_before
         .iter()
         .cloned()
@@ -73,6 +107,58 @@ fn checkpoint(
     );
     for path in &scope {
         let actual = work_before.get(path).cloned().flatten();
+        if action == "skip" {
+            let stopped = skip_from.ok_or("skip needs its frozen stopped images")?;
+            let progress = before_progress.get(path);
+            let stop_image = stopped.files.get(path).or_else(|| {
+                stopped
+                    .conflicts
+                    .get(path)
+                    .and_then(|sides| sides[1].as_ref())
+            });
+            let initial = if restore_initial {
+                replay.initial_worktree.get(path).filter(|_| {
+                    baseline.files.get(path) == progress
+                        || (baseline.skipped(path)
+                            && replay.initial_worktree.get(path) == Some(&None))
+                })
+            } else {
+                None
+            };
+            // Undo only writes belonging to the stopped source. A cached
+            // deletion or unrelated staged file must not authorize deleting
+            // the user's retained working copy.
+            let retained_initial = stop_image == progress
+                && replay.initial_worktree.get(path) == Some(&actual)
+                && actual.as_ref() != progress;
+            let restored = if !affected(path)
+                || (progress.is_none() && stop_image.is_none())
+                || retained_initial
+            {
+                actual.clone()
+            } else if let Some(initial) = initial {
+                initial.clone()
+            } else {
+                progress.cloned()
+            };
+            let after = work_after.get(path).and_then(Option::as_ref);
+            let promised_absence = restored.is_none()
+                && (target.skipped(path)
+                    || (restore_initial
+                        && baseline.skipped(path)
+                        && before_progress.contains_key(path)));
+            let desired = if images.conflicts.contains_key(path) && promised_absence {
+                after.cloned()
+            } else if promised_absence || after == progress {
+                restored
+            } else if restored.as_ref() != progress {
+                return Err(format!("replay after skip would discard dirty work bytes at {path}; index and journal were not advanced"));
+            } else {
+                after.cloned()
+            };
+            work_after.insert(path.clone(), desired);
+            continue;
+        }
         let before = old.files.get(path).or_else(|| {
             old.conflicts
                 .get(path)
@@ -105,7 +191,12 @@ fn checkpoint(
         work_after,
         owned_before,
     };
-    validate_replay_checkpoint(&result, images, pending.legacy_path.as_deref())?;
+    validate_replay_checkpoint(
+        &result,
+        images,
+        pending.legacy_path.as_deref(),
+        Some(&replay.initial_worktree),
+    )?;
     Ok(result)
 }
 fn apply_checkpoint(state: &State, checkpoint: &ReplayCheckpoint) -> Result<(), String> {
@@ -177,8 +268,26 @@ pub fn replay_start(
     revisions: Vec<String>,
     options: ReplayOptions,
 ) -> Result<String, String> {
+    replay_start_onto(root, operation, revisions, options, None)
+}
+pub fn replay_start_onto(
+    root: &str,
+    operation: &str,
+    revisions: Vec<String>,
+    options: ReplayOptions,
+    onto: Option<String>,
+) -> Result<String, String> {
     let state = State::open(root)?;
     let _lock = state.lock()?;
+    start_in_state(&state, operation, revisions, options, onto)
+}
+pub(super) fn start_in_state(
+    state: &State,
+    operation: &str,
+    revisions: Vec<String>,
+    options: ReplayOptions,
+    onto: Option<String>,
+) -> Result<String, String> {
     require_no_pending(&state.repo)?;
     let snapshot = state.repo.state()?;
     let head = snapshot
@@ -186,7 +295,7 @@ pub fn replay_start(
         .ok_or("multi-target replay requires a committed HEAD")?
         .clone();
     if !options.no_commit {
-        clean_index(&state)?;
+        clean_index(state)?;
     }
     let raw = regular(&state.metadata.join("index"))?;
     let old = raw
@@ -213,6 +322,7 @@ pub fn replay_start(
         baseline_index: raw.clone(),
         legacy_path: anchor,
         worktree: work,
+        rebase_onto: onto,
     };
     let pending = state
         .repo
@@ -220,9 +330,9 @@ pub fn replay_start(
             if regular(&state.metadata.join("index"))? != raw {
                 return Err("index changed during replay planning; nothing published".into());
             }
-            checkpoint(&state, pending, images, "begin", &old.files)
+            checkpoint(state, pending, images, "begin", &old.files, None)
         })?;
-    finish_or_report(&state, pending)
+    finish_or_report(state, pending)
 }
 pub fn replay_control(root: &str, operation: &str, action: &str) -> Result<String, String> {
     let state = State::open(root)?;
@@ -230,6 +340,9 @@ pub fn replay_control(root: &str, operation: &str, action: &str) -> Result<Strin
     let pending = selected_pending(&state.repo, operation)?;
     if pending.replay.is_none() {
         return Err("the saved operation is not a multi-target replay".into());
+    }
+    if action == "skip" && operation == "merge" {
+        return Err("merge has no --skip; use --abort or --quit".into());
     }
     match action {
         "quit" => {
@@ -278,6 +391,11 @@ pub fn replay_control(root: &str, operation: &str, action: &str) -> Result<Strin
                 return json_text(&state.repo.replay_status(&pending)?);
             }
             let progress = state.repo.replay_progress_images(&pending)?;
+            let skipped = if action == "skip" {
+                Some(state.repo.replay_stopped_images(&pending)?)
+            } else {
+                None
+            };
             let raw = regular(&state.metadata.join("index"))?;
             let index = if action == "continue" {
                 let index = decode_index(
@@ -307,11 +425,33 @@ pub fn replay_control(root: &str, operation: &str, action: &str) -> Result<Strin
                             "index changed during replay continuation; nothing published".into(),
                         );
                     }
-                    checkpoint(&state, pending, images, action, &progress)
+                    checkpoint(&state, pending, images, action, &progress, skipped.as_ref())
                 },
             )?;
             finish_or_report(&state, next)
         }
         _ => Err("unknown replay control".into()),
     }
+}
+
+/// Version 1 records retain their original metadata-only continuation API.
+/// New records use the durable index/worktree checkpoint before publication.
+pub fn try_replay_control(
+    root: &str,
+    operation: &str,
+    action: &str,
+    resolved: bool,
+) -> Result<Option<String>, String> {
+    let repo = Repository::open(root)?;
+    let pending = selected_pending(&repo, operation)?;
+    let Some(replay) = pending.replay.as_ref() else {
+        return Ok(None);
+    };
+    if action == "continue" && !resolved && replay.checkpoint.is_none() && replay.stop != "complete"
+    {
+        return Err(
+            "continue requires --resolved-index after reviewing the complete stopped result".into(),
+        );
+    }
+    replay_control(root, operation, action).map(Some)
 }

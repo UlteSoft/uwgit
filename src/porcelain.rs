@@ -25,7 +25,7 @@ pub use index_plumbing::{index_command, index_command_handles};
 mod index_flags;
 #[path = "porcelain_replay.rs"]
 mod replay_worktree;
-pub use replay_worktree::{replay_control, replay_start};
+pub use replay_worktree::{replay_control, replay_start, try_replay_control};
 
 const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
@@ -421,6 +421,7 @@ pub fn validate_replay_checkpoint(
     checkpoint: &crate::repository::ReplayCheckpoint,
     images: &crate::repository::ReplayImages,
     anchor: Option<&str>,
+    original_work: Option<&Worktree>,
 ) -> Result<(), String> {
     let after = decode_index(&checkpoint.index_after)?;
     let conflicts: BTreeMap<_, _> = images
@@ -484,9 +485,11 @@ pub fn validate_replay_checkpoint(
                 .and_then(|side| side.ours.as_ref())
         });
         let preserved =
-            checkpoint.action != "skip" && old == expected && value.as_ref() == original;
-        let sparse = after.skipped(path) && value.is_none() && original.is_none();
-        if value.as_ref() != expected && !preserved && !sparse {
+            (checkpoint.action == "skip" || old == expected) && value.as_ref() == original;
+        let restored = checkpoint.action == "skip"
+            && original_work.and_then(|work| work.get(path)) == Some(value);
+        let sparse = after.skipped(path) && value.is_none() && (original.is_none() || restored);
+        if value.as_ref() != expected && !preserved && !sparse && !restored {
             return Err(format!(
                 "replay checkpoint work image is unrelated to its result: {path}"
             ));
@@ -1476,6 +1479,9 @@ fn pending_status(
         });
         report["complete_index_required"] =
             json!(replay.checkpoint.is_none() && replay.stop != "complete");
+        if let Some(rebase) = &replay.rebase {
+            report["rebase"] = json!({"upstream":rebase.upstream,"onto":rebase.onto,"fork_base":rebase.fork_base,"queue_length":replay.queue.len(),"cursor":replay.cursor,"current_source":replay.queue.get(replay.cursor),"progress_tip":replay.progress,"completed_steps":replay.steps.len(),"skipped_steps":replay.steps.iter().filter(|step|step.action=="skipped").count()});
+        }
     }
     report
 }
@@ -2126,14 +2132,21 @@ pub fn with_no_pending(
 
 /// Capture the original index while normal clean-history semantics still
 /// apply. Only the callback's actual conflict path records this backup.
-pub fn with_pending_begin(
+pub fn with_recorded_begin(
     root: &str,
+    kind: &str,
+    revisions: Vec<String>,
+    options: crate::repository::ReplayOptions,
+    onto: Option<String>,
     operation: impl FnOnce(&Repository, Option<&[u8]>, Option<&str>) -> Result<String, String>,
 ) -> Result<String, String> {
     let state = State::open(root)?;
     let _lock = state.lock()?;
     require_no_pending(&state.repo)?;
     let raw = regular(&state.metadata.join("index"))?;
+    if raw.is_some() {
+        return replay_worktree::start_in_state(&state, kind, revisions, options, onto);
+    }
     let decoded = raw.as_deref().map(decode_index).transpose()?;
     if clean_index(&state)? != decoded {
         return Err("index changed while capturing the pending baseline".into());

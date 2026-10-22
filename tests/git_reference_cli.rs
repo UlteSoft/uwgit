@@ -343,3 +343,153 @@ fn real_git_and_native_cleanup_preserve_ignored_and_tracked_bytes() {
     assert!(!native.join("remove.txt").exists());
     assert!(!reference.join("remove.txt").exists());
 }
+
+#[test]
+fn recorded_merge_and_rebase_match_real_git_conflict_sides_clean_paths_and_parent_counts() {
+    for operation in ["merge", "rebase"] {
+        let t = Temp::new();
+        let native = t.path("native");
+        let reference = t.path("reference");
+        fs::create_dir(&reference).unwrap();
+        success(git(&reference, &["init", "-b", "main"]));
+        success(uw(&["init", p(&native)]));
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(1)).unwrap();
+            fs::write(root.join("gone.wasm"), wasm(1)).unwrap();
+        }
+        let commit = |message: &str| {
+            success(uw(&["add", p(&native), "-A"]));
+            success(uw(&["commit", p(&native), "-m", message]));
+            success(git(&reference, &["add", "-A"]));
+            success(git(&reference, &["commit", "-m", message]));
+        };
+        commit("base");
+        success(uw(&["branch", p(&native), "source"]));
+        success(git(&reference, &["branch", "source"]));
+        success(uw(&["switch", p(&native), "source"]));
+        success(git(&reference, &["switch", "source"]));
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(2)).unwrap();
+            fs::write(root.join("incoming.wasm"), wasm(8)).unwrap();
+            fs::remove_file(root.join("gone.wasm")).unwrap();
+        }
+        commit("incoming");
+        success(uw(&["switch", p(&native), "main"]));
+        success(git(&reference, &["switch", "main"]));
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(3)).unwrap();
+            fs::write(root.join("local.wasm"), wasm(9)).unwrap();
+        }
+        commit("local");
+        if operation == "rebase" {
+            success(uw(&["switch", p(&native), "source"]));
+            success(git(&reference, &["switch", "source"]));
+        }
+        let target = if operation == "merge" {
+            "source"
+        } else {
+            "main"
+        };
+        let head = success(uw(&["rev-parse", p(&native), "HEAD"]));
+        let stopped = if operation == "merge" {
+            uw(&[
+                operation,
+                p(&native),
+                target,
+                "--record-conflict",
+                "-m",
+                "reviewed merge",
+            ])
+        } else {
+            uw(&[operation, p(&native), target, "--record-conflict"])
+        };
+        assert_eq!(
+            stopped.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+        assert_eq!(success(uw(&["rev-parse", p(&native), "HEAD"])), head);
+        let stopped = if operation == "merge" {
+            git(&reference, &["merge", "--no-edit", target])
+        } else {
+            git(&reference, &["rebase", target])
+        };
+        assert_eq!(stopped.status.code(), Some(1));
+        let native_rows: Value = serde_json::from_slice(&success(uw(&[
+            "ls-files",
+            p(&native),
+            "--unmerged",
+            "--json",
+        ])))
+        .unwrap();
+        let reference_rows =
+            String::from_utf8(success(git(&reference, &["ls-files", "--unmerged"]))).unwrap();
+        let rows = native_rows["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for (native_row, reference_row) in rows.iter().zip(reference_rows.lines()) {
+            let fields = reference_row.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(native_row["stage"].as_u64().unwrap().to_string(), fields[2]);
+            assert_eq!(native_row["path"], fields[3]);
+            let out = t.path(&format!("side-{}", fields[2]));
+            success(uw(&[
+                "cat-file",
+                p(&native),
+                native_row["object_id"].as_str().unwrap(),
+                "--output",
+                p(&out),
+            ]));
+            assert_eq!(
+                fs::read(out).unwrap(),
+                success(git(&reference, &["cat-file", "blob", fields[1]]))
+            );
+        }
+        for path in ["incoming.wasm", "local.wasm"] {
+            assert_eq!(
+                fs::read(native.join(path)).unwrap(),
+                fs::read(reference.join(path)).unwrap()
+            );
+        }
+        assert!(!native.join("gone.wasm").exists());
+        assert!(!reference.join("gone.wasm").exists());
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(4)).unwrap();
+        }
+        success(uw(&["add", p(&native), "a.wasm"]));
+        success(git(&reference, &["add", "a.wasm"]));
+        success(uw(&[
+            operation,
+            p(&native),
+            "--continue",
+            "--resolved-index",
+        ]));
+        if operation == "merge" {
+            success(git(&reference, &["commit", "-m", "reviewed merge"]));
+        } else {
+            success(git(
+                &reference,
+                &["-c", "core.editor=true", "rebase", "--continue"],
+            ));
+        }
+        let commit: Value =
+            serde_json::from_slice(&success(uw(&["show", p(&native), "HEAD"]))).unwrap();
+        let parents = String::from_utf8(success(git(
+            &reference,
+            &["rev-list", "--parents", "-n", "1", "HEAD"],
+        )))
+        .unwrap();
+        assert_eq!(
+            commit["parents"].as_array().unwrap().len(),
+            parents.split_whitespace().count() - 1
+        );
+        for path in ["a.wasm", "incoming.wasm", "local.wasm"] {
+            assert_eq!(
+                fs::read(native.join(path)).unwrap(),
+                fs::read(reference.join(path)).unwrap()
+            );
+        }
+        assert!(!native.join("gone.wasm").exists());
+        success(uw(&["fsck", p(&native)]));
+        success(git(&reference, &["fsck", "--full"]));
+    }
+}

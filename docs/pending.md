@@ -1,52 +1,60 @@
-# 单目标冲突续作与中断恢复
+# 录制冲突、原生 stages 与续作
 
-本页描述旧单目标接口。未选择新队列选项的单目标默认冲突保持 stateless；多目标、范围及 `--sequence` 使用[多目标 replay](replay-queue.md)，自动记录 stages 和工作区检查点。
-
-## 操作契约
+普通单目标命令保持 stateless：冲突只输出 JSON、退出 2，不改 index、工作文件或建立记录。
+已有 index 时，显式 `--record-conflict` 使用原生冻结队列，自动准备完整步骤的 stage 0 和真实冲突侧。
+merge 使用 version 3 journal；单目标 pick/revert 使用兼容的 version 2。对象、Wasm 图像、引用和传输仍全部由 uwgit 实现。
 
 ```sh
 wasm-git merge DIR REV --record-conflict -m MESSAGE
 wasm-git cherry-pick DIR REV --record-conflict [--mainline N] [-m MESSAGE]
 wasm-git revert DIR REV --record-conflict [--mainline N] [-m MESSAGE]
-
-# 准备并审阅完整 index 后，选择以下一种操作
+wasm-git ls-files DIR --unmerged
+wasm-git restore DIR --ours -- modules/a.wasm
+# 编辑并审阅完整 index，解决每个未解决项
+wasm-git add DIR modules/a.wasm
 wasm-git merge DIR --continue --resolved-index
+# 以下是其他互斥选择
 wasm-git merge DIR --abort
 wasm-git merge DIR --quit
 ```
 
-cherry-pick/revert 支持相同的续作入口，另支持单目标 `--skip`；merge 不支持 skip。
-录制仅发生于实际内容冲突；成功、快进或目标已包含时不留 pending。
-记录绑定操作种类、唯一 generation、原分支/HEAD、完整目标 ID、base 或 mainline/selected parent、消息、原 index 编码和 legacy 路径。
-目标 ref 后续移动不能改变已录制的目标；续作不接受新的 REV、消息或 mainline。
+## 完整结果与历史
 
-`--continue --resolved-index` 是对**完整暂存树**的显式承诺，不表示程序已经自动识别每一个冲突被解决。
-它保存所有暂存的新增、删除和其他路径；不会自动补入目标的非冲突部分。
-merge 保存两个父提交，pick/revert 只以原 HEAD 为父；四侧原字节 hex、SHA、长度、审计和从两侧到结果的差异进入报告。
-未暂存的脏字节、缺失文件、当前 index 均不被续作改写。
+录制前要求受控 index/worktree 干净，允许 skip-worktree 承诺的缺席。
+目标、检出身份、原 HEAD、mainline、消息、原 index 编码和受控工作字节在同一流程中绑定；后续引用移动不会更换来源。
+所有非冲突新增、修改、删除进入 stage 0；冲突的 base/ours/theirs 原字节进入 stage 1/2/3。
+缺席侧保持缺席，不能用空 Wasm 代替；目录/文件分歧保留整个冲突组。工作侧显示 ours，必要时展开稀疏冲突路径。
+`mergetool` 导出同一冻结三方输入，可明确暂存所选结果；其他非冲突项已经在新记录的 index 中。
 
-abort 在 index→writer 锁内恢复原 index 的原编码及开始时已有的受控工作文件，不移动 HEAD。
-后来新增的工作文件保留为 untracked；新文件、目录或 symlink 阻挡原路径恢复时，在写入前拒绝并保留记录。
-原本没有 index 的命名对象仓库可录制冲突；abort 恢复 index 不存在，保留一切工作文件。
-未命名 legacy 历史必须先建立有明确路径的 index，程序不猜路径。单目标 skip 做同样的恢复后结束本次操作。
-quit 只清除本地记录，允许处理外部引用更新后已陈旧的操作，不回退其他人的新提交。
+continue 必须显式带 `--resolved-index`，并且没有未解决项或 intent-to-add。
+它采用用户审定的**整个**暂存树，用户明确删除的路径不会被偷偷补回。
+merge 保留原 HEAD 与 target 两个有序父提交；pick/revert 保留一个父提交。
+四侧 Wasm 原字节、摘要、审计和差异进入 `manual_resolutions`，最后一个手工结果另提供 `tree_manual_resolution`。
+手工暂存以外的编辑不会自动进入提交；不受后续结果影响的工作字节保留。
+成功后 index/工作文件先完成可恢复检查点，最终 HEAD 才一次发布；完整状态语义见[原生队列](replay-queue.md)。
 
-已有 pending 时，普通 commit/amend、新历史操作、整树 reset、分支切换、绑定分支 rename/delete 和 stash push/apply/pop 会拒绝。
-add/rm/mv/restore/路径 reset 继续用于准备结果；status 显示绑定及 conflict/prepared/published 状态。
-pending 存在而 index 损坏时，status 明确给出 index_error 和不可用字段，不把未知状态当 clean。
+pick/revert 的 skip 跳过当前目标；单目标结束后不制造提交，返回 unchanged。merge 没有 skip。
+skip 只撤销当前来源产生的工作区变化，无关新暂存文件保留为 untracked，无关编辑保留。
+若后续自动步骤会覆盖这些编辑，先拒绝，不推进对象、index、journal 或 HEAD。
+abort 恢复操作开始时 index 的原编码与原受控工作字节，包括稀疏缺席；操作已物化并记录的路径可清除，后来新增的无关文件保留。
+目录、symlink 或新文件阻挡原路径恢复时先拒绝。quit 只清记录，保留当前 stages、暂存内容和工作字节。
 
-## 发布与恢复
+已有 pending 时，普通 commit/amend、新历史、整树 reset、分支切换、绑定分支 rename/delete 和 stash 应用会拒绝。
+add/rm/mv/restore/路径 reset 可以准备审定结果；status 报告当前阶段。损坏 index 会明确显示不可用，不能伪装 clean。
 
-续作先完整验证、准备并安装对象闭包，再持久化 prepared 提交 ID 与所用 index 原始摘要，然后才发布引用、reflog，最后清除状态。
-引用发布前重试必须仍是同一分支、原 HEAD 和同一份有效 index；不会用后来修改的 index 偷换已准备的提交。
-若引用已经指向 prepared 提交，重试从实际提交树重新审计、补缺本 generation 的唯一 reflog 并清理，既不重复提交也不重复记 log。
-这一恢复即使当前 index 被移除或损坏也可完成；不会覆盖后来修改的工作内容。
-第三种 HEAD 或同 tip 的另一分支会被拒绝，不自动 reset。
+## 检查点与兼容
 
-固定测试构造发布前与发布后中断状态，以及缺失 reflog、恢复失败和陈旧 generation，验证上述恢复分支；不是随机杀进程或断电测试。
-多文件恢复不承诺断电时整体回滚：中途 I/O 失败保留 pending，并准确报告可能已完成的恢复、发布或清理步骤。
-`.uwgit/pending.json` 为本地规范 version 1 JSON，包含原 index 备份的编码总量限制为 64 MiB。
-重复键、非规范编码、未知字段、非法绑定、非普通文件和 symlink 明确拒绝；pending 不进入对象、bundle、clone、HTTP 或 SSH 的仓库状态。
+记录严格规范 JSON，包含备份的总量限制为 64 MiB。每次读取重新验证冻结来源、父链、消息和自动组合。
+先安装完整对象闭包，再保存包含每个文件和 index 的写入前后字节的检查点，然后物化、结算，最后发布引用/reflog并清理。
+部分 I/O 失败保留记录；重试只接受原/新两种字节，后来的第三种编辑会被保护。
+`--continue` 在修复未完成检查点或结算最终发布时可以不带 resolved-index；修复到冲突状态不会冒充已审定的解决。
+引用已经发布时可补唯一 generation 的 reflog，保留后来损坏或移除的 index，不重复制造提交。
+这些是确定性中断状态测试；多文件 I/O 不是断电整体事务。
 
-这些命令与 Git 的控制语义作过对照。后续已加入[索引 stages](index-stages.md)、[多目标 replay](replay-queue.md)、[线性 rebase 续作](rebase-pending.md)和 [HEAD 状态](head-and-pathspec.md)。交互式 rebase 与全部 Git 选项仍未完成。
-参考 [Git merge](https://git-scm.com/docs/git-merge)、[Git cherry-pick](https://git-scm.com/docs/git-cherry-pick)、[Git revert](https://git-scm.com/docs/git-revert)、[Git rebase](https://git-scm.com/docs/git-rebase)；准确命令边界仍见[能力矩阵](git-command-coverage.md)。
+原先存在的 version 1 记录继续使用原来的元数据续作，不能自动升级后猜测当前工作内容。
+没有 index 的纯对象仓库也保留这个模式：不自动物化或创建 index，continue 要自行建立完整暂存树；abort 恢复 index 不存在并保留工作文件。
+此模式不自动补入非冲突路径，续作不改 index/worktree。其 prepared 引用发布前仍要求同一份审定 index；发布后可修复 reflog 并清理。
+未命名 legacy 历史必须先建立明确路径；程序不猜路径。记录不随 bundle/clone/HTTP/SSH 传输，已安装的对象仍遵守完整对象包规则。
+
+固定验证见 [pending_cli.rs](../tests/pending_cli.rs)、[repository_sequencer.rs](../src/repository_sequencer.rs) 和独立 [Git 对照](../tests/git_reference_cli.rs)。
+rebase 见[持久 rebase](rebase-pending.md)，剩余范围见[能力矩阵](git-command-coverage.md)。

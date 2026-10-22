@@ -1,17 +1,20 @@
 //! Explicit continuation of a frozen linear replay. Intermediate commits stay
-//! off the branch until the complete queue has a final, reviewed result.
+//! off the branch until the complete queue and index/worktree checkpoint finish.
+//! Object-only and existing version 1 records keep their metadata-only API.
 
 use crate::porcelain;
-use crate::repository::{PendingRebaseRequest, RepositoryResult};
+use crate::repository::{PendingRebaseRequest, ReplayOptions, RepositoryResult};
 
-const USAGE: &str = "rebase DIR UPSTREAM [--onto NEW_BASE] --record-conflict; rebase DIR --continue --resolved-index; rebase DIR --abort|--skip|--quit. Each continuation reviews the complete staged tree for the current stopped step; HEAD advances only after the whole replay succeeds.";
+const USAGE: &str = "rebase DIR UPSTREAM [--onto NEW_BASE] --record-conflict; rebase DIR --continue --resolved-index; rebase DIR --abort|--skip|--quit. Each continuation reviews the complete staged tree for the current stopped step; HEAD advances only after the whole replay succeeds. Indexed recordings automatically prepare original conflict stages and synchronize complete results through recoverable checkpoints.";
 
 enum Mode {
     Start {
         upstream: String,
         onto: Option<String>,
     },
-    Continue,
+    Continue {
+        resolved: bool,
+    },
     Abort,
     Skip,
     Quit,
@@ -61,8 +64,7 @@ fn parse(args: &[String]) -> RepositoryResult<Mode> {
         return Err("rebase continuation uses the saved upstream, onto and replay queue; do not supply replacements".into());
     }
     match (control, resolved) {
-        (Some("--continue"), true) => Ok(Mode::Continue),
-        (Some("--continue"), false) => Err("rebase --continue requires --resolved-index: review and stage the complete result of the current stopped step first".into()),
+        (Some("--continue"), resolved) => Ok(Mode::Continue { resolved }),
         (Some("--abort"), false) => Ok(Mode::Abort),
         (Some("--skip"), false) => Ok(Mode::Skip),
         (Some("--quit"), false) => Ok(Mode::Quit),
@@ -76,9 +78,38 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
     }
     let mode = parse(args)?;
     let root = &args[1];
+    let control = match &mode {
+        Mode::Continue { resolved } => Some(("continue", *resolved)),
+        Mode::Abort => Some(("abort", false)),
+        Mode::Quit => Some(("quit", false)),
+        Mode::Skip => Some(("skip", false)),
+        Mode::Start { .. } => None,
+    };
+    if let Some((action, resolved)) = control {
+        if let Some(report) = porcelain::try_replay_control(root, "rebase", action, resolved)? {
+            return Ok(report);
+        }
+        if action == "continue" && !resolved {
+            return Err("rebase --continue requires --resolved-index: review and stage the complete result tree first".into());
+        }
+    }
     match mode {
-        Mode::Start { upstream, onto } => {
-            porcelain::with_pending_begin(root, |repo, baseline, anchor| {
+        Mode::Start { upstream, onto } => porcelain::with_recorded_begin(
+            root,
+            "rebase",
+            vec![upstream.clone()],
+            ReplayOptions {
+                no_commit: false,
+                mainline: None,
+                message: None,
+                append_source: false,
+                empty: "keep".into(),
+                allow_empty: true,
+                fast_forward: false,
+                reverse: false,
+            },
+            onto.clone(),
+            |repo, baseline, anchor| {
                 let state = repo.state()?;
                 let head = state
                     .tip()
@@ -113,17 +144,17 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
                     }
                 }
                 serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
-            })
-        }
-        Mode::Continue => porcelain::with_pending_index(root, |repo, index| {
+            },
+        ),
+        Mode::Continue { .. } => porcelain::with_pending_index(root, |repo, index| {
             let pending = repo.pending()?.ok_or("no rebase operation is pending")?;
             let report = repo.continue_rebase_pending(&pending, index)?;
-            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
         }),
         Mode::Skip => porcelain::with_pending_control(root, |repo| {
             let pending = repo.pending()?.ok_or("no rebase operation is pending")?;
             let report = repo.skip_rebase_pending(&pending)?;
-            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
         }),
         Mode::Abort => porcelain::pending_abort(root, "rebase", false),
         Mode::Quit => porcelain::pending_quit(root, "rebase"),

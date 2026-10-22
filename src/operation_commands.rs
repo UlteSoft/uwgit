@@ -1,11 +1,12 @@
 //! Explicit, single-target conflict continuation. Ordinary conflict reporting
-//! remains stateless; the caller opts in to saving a local operation journal.
+//! remains stateless; indexed recordings use native stages and recoverable
+//! worktree checkpoints. Version 1 records retain their metadata-only API.
 
 use crate::porcelain;
-use crate::repository::{PendingRequest, RepositoryResult};
+use crate::repository::{PendingRequest, ReplayOptions, RepositoryResult};
 use serde_json::{json, Value};
 
-const USAGE: &str = "merge DIR REV --record-conflict -m MESSAGE; cherry-pick|revert DIR REV --record-conflict [-m MESSAGE] [--mainline N]; merge|cherry-pick|revert DIR --continue --resolved-index; merge|cherry-pick|revert DIR --abort|--quit; cherry-pick|revert DIR --skip. Continuation uses the complete explicitly reviewed index; it does not infer that conflicts were resolved.";
+const USAGE: &str = "merge DIR REV --record-conflict -m MESSAGE; cherry-pick|revert DIR REV --record-conflict [-m MESSAGE] [--mainline N]; merge|cherry-pick|revert DIR --continue --resolved-index; merge|cherry-pick|revert DIR --abort|--quit; cherry-pick|revert DIR --skip. Continuation uses the complete explicitly reviewed index; unmerged entries must be explicitly resolved. Indexed recordings automatically prepare nonconflicting images and original conflict stages; object-only recordings retain metadata-only continuation.";
 
 const CONTROLS: [&str; 5] = [
     "--record-conflict",
@@ -27,7 +28,9 @@ enum Mode {
         message: Option<String>,
         mainline: Option<usize>,
     },
-    Continue,
+    Continue {
+        resolved: bool,
+    },
     Abort,
     Quit,
     Skip,
@@ -95,11 +98,9 @@ fn parse(args: &[String]) -> RepositoryResult<Mode> {
         return Err("continuation controls use the saved target, message and mainline; do not supply replacements".into());
     }
     match control {
-        "--continue" if resolved_index => Ok(Mode::Continue),
-        "--continue" => Err(
-            "--continue requires --resolved-index: review and stage the complete result tree first"
-                .into(),
-        ),
+        "--continue" => Ok(Mode::Continue {
+            resolved: resolved_index,
+        }),
         "--abort" if !resolved_index => Ok(Mode::Abort),
         "--quit" if !resolved_index => Ok(Mode::Quit),
         "--skip" if !resolved_index && args[0] != "merge" => Ok(Mode::Skip),
@@ -118,8 +119,23 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
     let mode = parse(args)?;
     let operation = args[0].as_str();
     let root = &args[1];
+    let control = match &mode {
+        Mode::Continue { resolved } => Some(("continue", *resolved)),
+        Mode::Abort => Some(("abort", false)),
+        Mode::Quit => Some(("quit", false)),
+        Mode::Skip => Some(("skip", false)),
+        Mode::Start { .. } => None,
+    };
+    if let Some((action, resolved)) = control {
+        if let Some(report) = porcelain::try_replay_control(root, operation, action, resolved)? {
+            return Ok(report);
+        }
+        if action == "continue" && !resolved {
+            return Err("--continue requires --resolved-index: review and stage the complete result tree first".into());
+        }
+    }
     match mode {
-        Mode::Continue => porcelain::with_pending_index(root, |repo, index| {
+        Mode::Continue { .. } => porcelain::with_pending_index(root, |repo, index| {
             let pending = repo.pending()?.ok_or("no conflict operation is pending")?;
             if pending.operation != operation {
                 return Err(format!(
@@ -137,90 +153,107 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             revision,
             message,
             mainline,
-        } => porcelain::with_pending_begin(root, |repo, baseline, anchor| {
-            let state = repo.state()?;
-            let head = state
-                .tip()
-                .ok_or("recorded conflict operation requires a committed HEAD")?;
-            let selected = repo.read_commit(&revision)?;
-            let saved_message = message.clone().unwrap_or_else(|| {
-                if operation == "revert" {
-                    format!(
-                        "Revert \"{}\"\n\nThis reverts commit {}.",
-                        selected.commit.message, selected.id
-                    )
-                } else {
-                    selected.commit.message.clone()
-                }
-            });
-            let output = if operation == "merge" {
-                serde_json::to_string_pretty(&repo.merge_on_branch(
-                    &selected.id,
-                    &saved_message,
-                    &state.head,
-                    Some(head),
-                )?)
-                .map_err(|error| error.to_string())?
-            } else {
-                crate::history_commands::apply_one_bound(
-                    repo,
-                    operation,
-                    &selected.id,
-                    message,
-                    mainline,
-                    Some((&state.head, head)),
-                )?
-            };
-            let mut report: Value = serde_json::from_str(&output)
-                .map_err(|error| format!("operation returned an invalid report: {error}"))?;
-            if report["status"] != "conflict" {
-                return Ok(output);
-            }
-            // A concurrent low-level ref writer may have changed the branch
-            // while the operation ran. Bind to exactly the reported conflict;
-            // record_pending rechecks that binding under its writer lock.
-            let branch = report["branch"]
-                .as_str()
-                .ok_or("conflict report lacks its bound branch")?;
-            let head = report["old_head"]
-                .as_str()
-                .ok_or("conflict report lacks its bound committed HEAD")?;
-            if branch != state.head || state.tip().map(String::as_str) != Some(head) {
-                return Err(
-                    "branch or HEAD changed during conflict computation; no operation recorded"
-                        .into(),
-                );
-            }
-            if report["target"].as_str() != Some(selected.id.as_str()) {
-                return Err(
-                    "conflict report changed its immutable target; no operation recorded".into(),
-                );
-            }
-            let pending = repo.record_pending(PendingRequest {
-                operation: operation.into(),
-                branch: branch.into(),
-                head: head.into(),
-                target: selected.id,
+        } => porcelain::with_recorded_begin(
+            root,
+            operation,
+            vec![revision.clone()],
+            ReplayOptions {
+                no_commit: false,
                 mainline,
-                message: saved_message,
-                baseline_index: baseline.map(<[u8]>::to_vec),
-                legacy_path: anchor.map(str::to_owned),
-            })?;
-            report["pending"] = json!({
-                "id":pending.id,
-                "operation":pending.operation,
-                "branch":pending.branch,
-                "old_head":pending.head,
-                "target":pending.target,
-                "base":pending.base,
-                "selected_parent":pending.selected_parent,
-                "mainline":pending.mainline,
-                "phase":"conflict",
-                "index_updated":false,
-                "worktree_updated":false,
-                "complete_index_required":true
-            });
-            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
-        }),
+                message: message.clone(),
+                append_source: false,
+                empty: if operation == "merge" { "keep" } else { "stop" }.into(),
+                allow_empty: operation == "merge",
+                fast_forward: operation == "merge",
+                reverse: false,
+            },
+            None,
+            |repo, baseline, anchor| {
+                let state = repo.state()?;
+                let head = state
+                    .tip()
+                    .ok_or("recorded conflict operation requires a committed HEAD")?;
+                let selected = repo.read_commit(&revision)?;
+                let saved_message = message.clone().unwrap_or_else(|| {
+                    if operation == "revert" {
+                        format!(
+                            "Revert \"{}\"\n\nThis reverts commit {}.",
+                            selected.commit.message, selected.id
+                        )
+                    } else {
+                        selected.commit.message.clone()
+                    }
+                });
+                let output = if operation == "merge" {
+                    serde_json::to_string_pretty(&repo.merge_on_branch(
+                        &selected.id,
+                        &saved_message,
+                        &state.head,
+                        Some(head),
+                    )?)
+                    .map_err(|error| error.to_string())?
+                } else {
+                    crate::history_commands::apply_one_bound(
+                        repo,
+                        operation,
+                        &selected.id,
+                        message,
+                        mainline,
+                        Some((&state.head, head)),
+                    )?
+                };
+                let mut report: Value = serde_json::from_str(&output)
+                    .map_err(|error| format!("operation returned an invalid report: {error}"))?;
+                if report["status"] != "conflict" {
+                    return Ok(output);
+                }
+                // A concurrent low-level ref writer may have changed the branch
+                // while the operation ran. Bind to exactly the reported conflict;
+                // record_pending rechecks that binding under its writer lock.
+                let branch = report["branch"]
+                    .as_str()
+                    .ok_or("conflict report lacks its bound branch")?;
+                let head = report["old_head"]
+                    .as_str()
+                    .ok_or("conflict report lacks its bound committed HEAD")?;
+                if branch != state.head || state.tip().map(String::as_str) != Some(head) {
+                    return Err(
+                        "branch or HEAD changed during conflict computation; no operation recorded"
+                            .into(),
+                    );
+                }
+                if report["target"].as_str() != Some(selected.id.as_str()) {
+                    return Err(
+                        "conflict report changed its immutable target; no operation recorded"
+                            .into(),
+                    );
+                }
+                let pending = repo.record_pending(PendingRequest {
+                    operation: operation.into(),
+                    branch: branch.into(),
+                    head: head.into(),
+                    target: selected.id,
+                    mainline,
+                    message: saved_message,
+                    baseline_index: baseline.map(<[u8]>::to_vec),
+                    legacy_path: anchor.map(str::to_owned),
+                })?;
+                report["pending"] = json!({
+                    "id":pending.id,
+                    "operation":pending.operation,
+                    "branch":pending.branch,
+                    "old_head":pending.head,
+                    "target":pending.target,
+                    "base":pending.base,
+                    "selected_parent":pending.selected_parent,
+                    "mainline":pending.mainline,
+                    "phase":"conflict",
+                    "index_updated":false,
+                    "worktree_updated":false,
+                    "complete_index_required":true
+                });
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+            },
+        ),
     }
 }

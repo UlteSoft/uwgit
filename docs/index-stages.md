@@ -148,4 +148,4 @@ clean 将未解决路径视为受控文件，不能当作 untracked 删除。
 接口参考 [Git ls-files](https://git-scm.com/docs/git-ls-files) 与 [Git checkout-index](https://git-scm.com/docs/git-checkout-index)，对象及数据持久化继续使用 uwgit。
 
 索引 version 4、assume/skip/图像有效性标志、intent-to-add 与 commit -a 见[原生索引标志](index-flags.md)。
-多目标 pick/revert 自动建立上述 stages，且带可恢复的工作区检查点，见[多目标 replay](replay-queue.md)。
+已有 index 的 merge/pick/revert/rebase 录制及多目标 pick/revert 自动建立上述 stages，并带可恢复的工作区检查点；见[录制冲突](pending.md)、[rebase](rebase-pending.md)及[原生队列](replay-queue.md)。

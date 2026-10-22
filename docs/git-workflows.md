@@ -180,25 +180,14 @@ wasm-git merge ./history --abort
 wasm-git merge ./history --quit
 ```
 
-continue、abort、quit 是三种互斥的选择，不应顺序执行。cherry-pick/revert 支持相同入口；单目标 `--skip` 恢复原状态并结束本次操作，merge 没有 skip。
-`--record-conflict` 仅在实际冲突时保存 `.uwgit/pending.json`，不把半成品写入 index 或工作文件；成功、快进或已包含目标时不留状态。
-默认命令仍只报告冲突。录制前要求受控 index/worktree 干净；没有 index 的命名对象仓库也可以录制，但无明确路径的旧未命名历史须先建立 index。
+continue、abort、quit 互斥；pick/revert 支持当前源 skip，merge 没有 skip。
+已有 index 时，录制自动将非冲突增删放入 stage 0，冲突原侧进入 stage 1/2/3；不受选定步骤影响的编辑保留。
+continue 仍要求审阅整个 index 并显式 --resolved-index，未解决项与意向条目会被拒绝。
+merge 发布双父，pick/revert 发布单父；检查点先同步文件/index，最终才发布 HEAD。
+abort 恢复原 index 编码和原受控字节及缺席，清理本次归属的物化路径；无关用户文件保留。quit 只忘记状态。
 
-`--continue --resolved-index` 表示用户明确审定了**整个**暂存树，包括所有新增、删除和不相关路径；程序没有 Git 的 unmerged stages，不能自动确认每个冲突已经解决。
-续作使用保存的操作、原 HEAD、目标和 mainline，不能同时指定新的 REV、消息或 mainline。
-merge 发布双父提交，pick/revert 发布单父提交；index 和工作文件均不改变，允许保留未暂存修改。
-已有 pending 时，普通 commit/amend、新历史操作、整树 reset、分支切换、绑定分支重命名和 stash push/apply/pop 会拒绝；add/rm/mv/restore/路径 reset 仍用于准备结果。
-
-abort 恢复原 index 的原编码与原受控工作文件，只处理开始时已有的受控路径。
-后来新增的工作文件保留为 untracked；它们或 symlink/目录阻挡原路径恢复时，在写入前拒绝并保留状态。
-原本没有 index 时，abort 恢复其不存在状态，工作文件全部保留。quit 只清记录，可用于外部写入后已陈旧的操作，不替用户回退其他人的提交。
-
-续作在移动引用前先安装完整对象闭包，并持久化 prepared 提交 ID 和所用 index 原始摘要。
-若中断发生在引用已发布、状态未清理之间，重试识别实际提交、补缺本次唯一 reflog 并清理，保留后来移除或损坏的 index，不重复提交。
-引用未发布时，重试必须仍是同一分支、原 HEAD 和同一份 index；第三种 HEAD 不会被自动重置。
-这是受检查的恢复流程，不承诺多个工作文件在断电时整体回滚；I/O 失败报告已完成范围并保留可重试的状态。
-pending 是本地元数据，不进入提交、bundle、clone 或传输；其规范 JSON 总大小限制为 64 MiB，包含原 index 备份。
-详细验证见[单目标续作](pending.md)。
+没有 index 的纯对象模式与旧 version 1 journal 保留原来的元数据续作：自行准备完整结果、不自动填充非冲突项，continue 保留 index/工作字节。
+原本无 index 的 abort 恢复其不存在；详情及中断恢复见[录制冲突](pending.md)。
 
 ### 显式录制线性 rebase
 
@@ -218,12 +207,12 @@ wasm-git rebase DIR --quit
 所有步骤成功后才一次移动原分支；中间成功步骤仅作为本地对象和 journal 进度保存，status 显示当前位置。
 每次 continue 的完整 index 只替换当前冲突步骤；随后步骤自动重放，可能再次返回冲突和退出 2。
 当前步骤的 ours 是已重放的进度树，不能用仍指向最初 tip 的 HEAD 代替。
-手工树不会自动补入当前步骤的其他非冲突路径，须审阅完整报告后显式暂存整个结果。
+新工作区模式已准备当前步骤的非冲突项；continue 采用完整审定树，用户明确移除的路径不会再被补回。旧 journal/纯对象模式仍须自行准备完整结果。
 
-continue/skip 保留当前 index 和全部工作文件，即使最终提交还包含后续自动步骤；要物化最终树可在保存本地编辑后显式 restore。
+已有 index 的新录制模式在每个停止和完成点同步阶段索引与工作文件，保留不受后续结果影响的编辑；旧 journal/纯对象模式继续保留元数据续作，完成后可显式 restore。
 skip 跳过当前原提交并继续余下队列，不使用当前 index 内容，也不恢复最初 index；abort 才恢复最初 baseline。
 quit 只移除操作记录，不发布中间进度。pending 不随 clone、bundle、HTTP 或 SSH 传输。
-发布前保存 prepared 最终 tip；中断后重试按原 generation 修复 reflog/清理。自动 begin/skip 准备结果无需当前 index；continue 准备结果在发布前要求同一份有效 index。
+新模式在文件/index 检查点结算后才发布最终 tip；重试按原/新字节修复物化，最终发布可补唯一 reflog。旧 journal 的 continue prepared 恢复在引用发布前仍要求同一份有效 index。
 旧单目标 version 1 journal 的编码继续可读。验证及精确限制见[rebase 续作](rebase-pending.md)。
 
 ## 引用、查询和本地配置

@@ -4040,7 +4040,7 @@ fn check_upstream_tip(
 }
 
 fn encode_pending(pending: &PendingOperation) -> RepositoryResult<Vec<u8>> {
-    if !matches!(pending.version, 1 | 2) || (pending.version == 2) != pending.replay.is_some() {
+    if !matches!(pending.version, 1..=3) || (pending.version >= 2) != pending.replay.is_some() {
         return Err("unsupported pending operation version".into());
     }
     for id in [&pending.id, &pending.head, &pending.target] {
@@ -4053,7 +4053,13 @@ fn encode_pending(pending: &PendingOperation) -> RepositoryResult<Vec<u8>> {
     ) {
         return Err("unsupported pending operation kind".into());
     }
-    if (pending.operation == "rebase") != pending.rebase.is_some() {
+    if (pending.operation == "rebase")
+        != (pending.rebase.is_some()
+            || pending
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.rebase.is_some()))
+    {
         return Err("pending rebase state does not match its operation kind".into());
     }
     if pending.mainline == Some(0) {

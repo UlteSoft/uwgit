@@ -17,8 +17,8 @@ pick 按父先于子，revert 按子先于父；同层顺序沿用原生 rev-lis
 `--reverse` 翻转冻结后的队列。最多 4096 个选择器和 4096 个结果提交；stdin 是 UTF-8 一行一项，最多 64 MiB，不能再给位置目标。
 所有目标、mainline 与路径锚点先完整校验；后面的非法提交不会先安装成功前缀。
 
-单目标未使用新队列选项时保留原来的 stateless 行为；其 `--record-conflict` 仍使用 version 1 记录。
-多目标、范围、`--sequence`、`--stdin`、`-n` 等选择新的 version 2 原生队列，冲突自动记录并生成真实 stages。
+单目标未使用新队列选项时保留原来的 stateless 行为；已有 index 时的 `--record-conflict` 也使用原生队列；无 index 的纯对象仓库保留 version 1 元数据模式。
+多目标、范围、`--sequence`、`--stdin`、`-n` 等选择新的 version 2 原生队列，冲突自动记录并生成真实 stages。merge/rebase 的新工作区记录使用 version 3，见[单目标录制](pending.md)与[rebase](rebase-pending.md)。
 原来的不可变完整 ID 加 `--resolved-index --expect-head ID` 接口仍可用。
 
 | 选项 | 合同 |
@@ -56,9 +56,9 @@ ours 是当前队列进度；no-commit 的 ours 真实类型为 tree。缺席侧
 
 continue 要求没有未解决 stages 或 intent-to-add 的完整审定 index，将它作为当前步骤结果，再自动处理后续步骤。
 未暂存编辑不自动进入提交；目标图像没有改变的路径保留实际编辑字节。遇到下一冲突或空结果再次退出 2；
-全部成功返回 committed，no-commit 返回 staged，全部 skip/drop 返回 unchanged。报告提供完整 queue、cursor、步骤来源/结果及实际更新标志。
+全部成功返回 committed，no-commit 返回 staged，全部 skip/drop 返回 unchanged。手工来源审计提供实际 result 类型；no-commit 的 commit 为 null、commits 为空，不把 tree ID 冒充提交。报告提供完整 queue、cursor、步骤来源/结果及实际更新标志。
 
-skip 放弃当前停止步骤的编辑与解决内容，回到该步骤之前的进度后继续；不能把未受控文件当受控文件删除。
+skip 撤销当前来源产生的工作区变化，回到该步骤之前的进度后继续；无关新暂存文件保留为 untracked，无关编辑保留。若后续自动步骤会覆盖这些编辑，先拒绝。首次跳过可从冻结起点恢复原有脏字节及稀疏缺席，不能把未受控文件当受控文件删除。
 abort 恢复整个操作开始时 index 的原编码及当时受控工作字节，包含 no-commit 原有暂存和脏编辑、跳过路径的缺席；
 操作产生的已记录路径移除，后来新增的无关文件保留。阻挡恢复的文件类型、符号链接或目录仍会导致拒绝。
 quit 只忘记 journal，不恢复任何字节。revert 使用相同控制入口，但必须匹配当前操作种类。

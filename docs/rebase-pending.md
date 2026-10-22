@@ -1,33 +1,54 @@
-# 线性 rebase 持久队列与冲突续作
+# 线性 rebase、自动 stages 与恢复检查点
 
-线性 rebase 支持显式录制持久队列。默认 rebase 仍是无状态全量计算，晚冲突不会建立 pending 或发布中间提交。接口参照 [Git rebase 官方手册](https://git-scm.com/docs/git-rebase)的 continue/skip/abort/quit；本程序在冲突期间保持原分支与 HEAD，进度保存在本地对象及 journal，和 Git 的中间 detached HEAD 有明确差异。
-
-## 使用与结果范围
+`rebase --record-conflict` 在已有 index 的工作区中使用 version 3 原生队列。
+每个停止步骤自动提供完整 stage 0 和真实冲突原侧，continue/skip 同步当前结果，整个队列完成后才一次发布原 HEAD。
+普通 rebase 仍为 stateless 全量计算：晚冲突不发布半成品，不建立记录。
 
 ```sh
 wasm-git rebase DIR UPSTREAM [--onto NEW_BASE] --record-conflict
+wasm-git ls-files DIR --unmerged
+# 编辑并 add/rm，审阅当前步骤的整个暂存树
 wasm-git rebase DIR --continue --resolved-index
 wasm-git rebase DIR --skip
 wasm-git rebase DIR --abort
 wasm-git rebase DIR --quit
 ```
 
-开始时要求已有受控 index/worktree 干净；无 index 的命名对象仓库也可用，但不自动物化工作区。upstream、onto、唯一 merge base 及从原 tip 到 base 的完整单父队列均冻结为完整 ID，后续引用移动不能替换队列。根提交和 merge commit 不作为 replay source，未知选项、重复或混用 control、新 target/onto 与 continue/skip 的组合均明确拒绝。
+## 冻结来源与步骤
 
-continue 审定当前停止步骤的**完整暂存树**，不会自动补入当前步骤其他非冲突路径。该步骤的 base 为原提交父树，ours 为当前已重放进度，theirs 为原提交树。接受后自动重放后续步骤，到下一冲突返回退出 2，到队列结束才一次发布原分支。每次新的停止都须重新审阅并显式使用 --resolved-index。
+开始时受控 index/worktree 必须干净；原来的 skip-worktree 缺席可以保留。
+在已验证快照内绑定原 HEAD、完整 upstream/onto ID、唯一 merge base 和原单父序列。
+源队列不含 root 或 merge commit；后续引用改变不能更换队列或目的地。空队列直接使用实际 onto，不制造合成提交。
+原 HEAD 一直保留，进度是实际原生单父提交；不模仿 Git 的中间 detached HEAD 或虚构作者/时间。
 
-skip 不读取 index，只跳过当前原提交，再继续余下步骤；和单目标 pick/revert 的 skip 恢复原 baseline 后结束不同。continue/skip 保留当前 index 与工作文件，最终 tip 可能包含后续自动步骤；物化最终树须保存当前编辑后显式 restore。全自动开始成功时则沿用正常干净历史工作区同步，并在发布前检查 untracked/目录阻挡，逻辑拒绝不写对象、journal 或引用。
+每一步的 base 是原 source 的父树，ours 是当前重放进度，theirs 是原 source 树。
+支持的非冲突 Wasm 组合和路径增删进入 stage 0，未解决项保存真实 stage 1/2/3，工作侧保留 ours。
+以后步骤尚未重放的文件不会提前混进当前结果。用户不必先 restore progress 或重建其他非冲突路径。
 
-abort 恢复开始时的原始 index 编码及原受控工作文件，保留后来新增文件；恢复阻挡时先拒绝。原本无 index 时恢复其不存在并保留工作文件。quit 只删除本地记录，不发布中间进度，也不回退其他 writer 的新引用。继续和 abort 绑定原分支/HEAD，陈旧操作只能显式 quit。已有 pending 的 commit/amend、切分支、新历史、整树 reset 和 stash 应用等保护继续生效。
+continue 要求 `--resolved-index`、完整已解决 index 和没有意向条目。
+该完整树只替换当前停止步骤，用户选择的删除不会自动补回；其后自动重放直到下一停止或完成。
+不受结果影响的脏编辑保留；会被后续自动步骤覆盖时，在任何对象、journal 或文件发布前拒绝。
+skip 丢弃当前来源的解决内容并继续，保留无关新文件和无关编辑，可以用已验证的进度重建损坏 index。
+所有步骤成功时，检查点同步最终 index 和工作文件，然后发布 tip。报告含 queue/cursor/progress、各步 source/before/result/action 和实际更新标志。
 
-## 状态、审计与中断恢复
+abort 恢复最初 index 的原编码、原受控字节及缺席，删除本次已物化并归属操作的路径，保留无关用户文件。
+quit 只忘记状态。两者仍保护目录/symlink/类型阻挡；第三种 HEAD 或同 tip 的另一检出分支拒绝 continue/skip/abort，陈旧状态可 quit。
+控制不能组合新 upstream、onto、消息或其他替换选项；准备期间的普通历史写入继续受 guard 保护。
 
-pending version 1 新增可省略的 rebase 子记录，旧单目标记录的原编码继续可读。队列、cursor、progress tip、各步原 source/before/result/action、手工 raw index SHA 和 prepared action 均受 64 MiB 编码总量限制。每次读取严格核对原队列与源父链，逐步重放自动步骤并比对其实际树；历史 manual/skip 也必须对应当时实际冲突，不接受把自动干净步骤伪写成手工解决或跳过的规范 JSON。
+## 日志、审计和中断
 
-每个 manual result 都从存储的不可变四侧重建原 bytes/hex/SHA、精确审计和差异。报告保留所有步骤的 old/new 映射及 skipped 列表，第二次冲突的 ours 使用第一步实际结果，而非仍未变化的公开 HEAD。
+`replay.rebase` 保存 upstream/onto/fork_base，`replay.queue` 保存冻结 source，所有内容与原 index/工作域一起绑定摘要。
+每次读取重新计算原队列和每个自动步骤，核对父链、实际 Wasm 树和消息，拒绝伪造 fork、source 顺序或对象类型。
+每个手工结果从存储对象重建四侧 bytes/hex/SHA 与审计，位于 `manual_resolutions`；后续冲突的 ours 使用真实进度。
 
-重放对象闭包安装完成后才发布 journal；最终 prepared tip 持久化后才移动引用并记录同 generation 的 reflog。continue 准备的最终结果在引用发布前要求同一份有效 raw index 和最后一次手工树一致，后续自动步骤可以改变最终树；begin/skip 不使用 index，其 prepared 恢复也不要求 index。引用已指向 prepared 时可在 index 缺失或损坏后修复缺失 reflog 并清理，不重复提交或 log。恢复不自动同步工作文件。
+Wasm→tree→父先于子提交的闭包安装后才保存物化检查点。逐文件及 index 完成并结算后，才发布最终引用与唯一 generation reflog。
+任一物化中断保留原/新字节；重试不重复制造提交，不覆盖后来的第三种编辑。
+修复到冲突停止时不会消费未经审定的 index。最终引用已发布而 reflog/清理未完成时，继续可保留后来编辑的 index/工作区并补 log。
+这不是跨文件断电原子事务；固定测试构造各写入前缀、引用已发布缺 log、状态篡改及迟到编辑。
 
-这些是固定构造的中断状态与 I/O 边界检查，不是随机杀进程或断电测试。多文件工作区 I/O 失败不保证整体回滚，错误明确指出可能完成的步骤。pending 不进入对象格式、bundle 或 HTTP/SSH 状态；完整对象包可能包含已安装的未引用进度对象，不能把“状态不传输”解释成“这些对象绝不传输”。
+旧 version 1 rebase 记录继续可读，原有 prepared 手工 index 摘要约束及元数据续作保持有效。
+无 index 的命名对象仓库继续选用这种模式，不自动建立或物化工作区；continue 要自行准备完整树，skip 不替换其当前 index/工作文件。
+该兼容模式完成后可显式 restore。原本无 index 的 abort 恢复其不存在并保留工作字节。
 
-此 rebase 接口尚不支持 interactive/todo 编辑、merge 拓扑保留、root replay、patch-equivalence 自动去重或自动生成冲突 stages。通用[索引 stages](index-stages.md)、[HEAD 状态](head-and-pathspec.md)和[多目标 pick/revert](replay-queue.md)已由其他接口提供。准确能力见[命令矩阵](git-command-coverage.md)。
+验证包括 [rebase_pending_cli.rs](../tests/rebase_pending_cli.rs)、[恢复测试](../src/repository_sequencer.rs) 和独立 [Git 对照](../tests/git_reference_cli.rs)。
+interactive/todo、保留 merge 拓扑、root replay、自动 patch-equivalence 及其他 Git 选项仍见[能力矩阵](git-command-coverage.md)。

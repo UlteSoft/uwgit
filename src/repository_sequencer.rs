@@ -1,4 +1,4 @@
-//! Frozen multi-target replay over native Wasm images. HEAD is published only
+//! Frozen history operations over native Wasm images. HEAD is published only
 //! after the complete queue and its index/worktree checkpoint have succeeded.
 use super::*;
 type Files = BTreeMap<String, Vec<u8>>;
@@ -32,6 +32,15 @@ pub struct ReplayJournal {
     pub checkpoint: Option<ReplayCheckpoint>,
     pub index_changed: bool,
     pub worktree_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase: Option<ReplayRebase>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayRebase {
+    pub upstream: String,
+    pub onto: String,
+    pub fork_base: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +75,7 @@ pub struct ReplayRequest {
     pub baseline_index: Option<Vec<u8>>,
     pub legacy_path: Option<String>,
     pub worktree: Worktree,
+    pub rebase_onto: Option<String>,
 }
 fn mapped(snapshot: &Snapshot, id: &str, anchor: Option<&str>) -> RepositoryResult<RevisionFiles> {
     let mut revision = if let Some(Object::Tree(tree)) = snapshot.objects.get(id) {
@@ -116,14 +126,94 @@ fn selected_parent(
     pending: &PendingOperation,
     source: &str,
 ) -> RepositoryResult<Option<String>> {
-    Ok(pending_identity(
+    Ok(binding(snapshot, pending, source)?.1)
+}
+fn binding(
+    snapshot: &Snapshot,
+    pending: &PendingOperation,
+    source: &str,
+) -> RepositoryResult<(Option<String>, Option<String>)> {
+    if pending.operation == "merge" {
+        return Ok((
+            Some(unique_merge_base(&pending.head, source, &snapshot.objects)?),
+            None,
+        ));
+    }
+    pending_identity(
         snapshot,
-        &pending.operation,
+        if pending.operation == "rebase" {
+            "cherry-pick"
+        } else {
+            &pending.operation
+        },
         &pending.head,
         source,
         pending.mainline,
-    )?
-    .1)
+    )
+}
+fn result_parents(pending: &PendingOperation, before: &str, source: &str) -> Vec<String> {
+    if pending
+        .replay
+        .as_ref()
+        .is_some_and(|replay| replay.options.no_commit)
+    {
+        Vec::new()
+    } else if pending.operation == "merge" {
+        vec![before.into(), source.into()]
+    } else {
+        vec![before.into()]
+    }
+}
+fn initial_progress(pending: &PendingOperation) -> RepositoryResult<String> {
+    let replay = pending.replay.as_ref().ok_or("missing replay state")?;
+    Ok(if let Some(rebase) = &replay.rebase {
+        rebase.onto.clone()
+    } else if replay.options.no_commit {
+        replay.initial_tree.clone()
+    } else {
+        pending.head.clone()
+    })
+}
+fn can_fast_forward(
+    snapshot: &Snapshot,
+    pending: &PendingOperation,
+    source: &str,
+    before: &str,
+) -> RepositoryResult<bool> {
+    if !pending
+        .replay
+        .as_ref()
+        .ok_or("missing replay state")?
+        .options
+        .fast_forward
+    {
+        return Ok(false);
+    }
+    if pending.operation == "merge" {
+        is_ancestor(before, source, &snapshot.objects)
+    } else {
+        Ok(
+            selected_parent(snapshot, pending, source)?.as_deref() == Some(before)
+                && matches!(snapshot.objects.get(source),Some(Object::Commit(commit)) if commit.format==2 && commit.legacy_path==pending.legacy_path),
+        )
+    }
+}
+fn contained(
+    snapshot: &Snapshot,
+    pending: &PendingOperation,
+    source: &str,
+    before: &str,
+) -> RepositoryResult<bool> {
+    Ok(pending.operation == "merge" && is_ancestor(source, before, &snapshot.objects)?)
+}
+fn stops(pending: &PendingOperation, unchanged: bool, originally_empty: bool, ff: bool) -> bool {
+    pending.operation != "merge"
+        && stops_empty(
+            &pending.replay.as_ref().expect("replay state").options,
+            unchanged,
+            originally_empty,
+            ff,
+        )
 }
 fn message(
     snapshot: &Snapshot,
@@ -171,7 +261,11 @@ fn views(
     progress: &str,
 ) -> RepositoryResult<[RevisionFiles; 3]> {
     let anchor = pending.legacy_path.as_deref();
-    let parent = selected_parent(snapshot, pending, source)?;
+    let parent = if pending.operation == "merge" {
+        binding(snapshot, pending, source)?.0
+    } else {
+        selected_parent(snapshot, pending, source)?
+    };
     let parent = parent
         .as_deref()
         .map(|id| mapped(snapshot, id, anchor))
@@ -254,17 +348,17 @@ fn stage_image(
     snapshot: &mut Snapshot,
     encoded: &mut BTreeMap<String, Vec<u8>>,
     files: &Files,
-    before: Option<&str>,
+    parents: &[String],
     message: &str,
     anchor: Option<&str>,
 ) -> RepositoryResult<String> {
     let mut staged = BTreeMap::new();
-    let id = if let Some(before) = before {
-        check_tree_parents(snapshot, &[before.into()], anchor)?;
+    let id = if !parents.is_empty() {
+        check_tree_parents(snapshot, parents, anchor)?;
         prepare_tree_commit(
             files,
             message,
-            &[before.into()],
+            parents,
             anchor,
             &snapshot.encoded,
             &mut staged,
@@ -293,18 +387,23 @@ fn stage_image(
 }
 fn bind(snapshot: &Snapshot, pending: &mut PendingOperation) -> RepositoryResult<()> {
     let replay = pending.replay.as_ref().ok_or("missing replay state")?;
+    if replay.queue.is_empty() {
+        let rebase = replay
+            .rebase
+            .as_ref()
+            .ok_or("empty non-rebase replay queue")?;
+        pending.target = pending.head.clone();
+        pending.base = Some(rebase.fork_base.clone());
+        pending.selected_parent = None;
+        pending.message.clear();
+        return Ok(());
+    }
     let source = replay
         .queue
         .get(replay.cursor.min(replay.queue.len().saturating_sub(1)))
         .ok_or("empty replay queue")?
         .clone();
-    let (base, parent) = pending_identity(
-        snapshot,
-        &pending.operation,
-        &pending.head,
-        &source,
-        pending.mainline,
-    )?;
+    let (base, parent) = binding(snapshot, pending, &source)?;
     let text = message(snapshot, pending, &source)?;
     pending.target = source;
     pending.base = base;
@@ -376,12 +475,43 @@ impl Repository {
         }
         check_expected_branch(&snapshot.manifest.head, Some(&request.branch))?;
         check_expected(snapshot.manifest.tip(), Some(&request.head))?;
-        let queue = frozen_queue(
-            &snapshot,
-            &request.operation,
-            &request.revisions,
-            request.options.reverse,
-        )?;
+        let (queue, rebase) = if request.operation == "rebase" {
+            let [upstream] = request.revisions.as_slice() else {
+                return Err("recorded rebase requires one upstream".into());
+            };
+            let upstream = snapshot_revision(&snapshot, upstream)?;
+            let onto = request
+                .rebase_onto
+                .as_deref()
+                .map(|value| snapshot_revision(&snapshot, value))
+                .transpose()?
+                .unwrap_or_else(|| upstream.clone());
+            let (fork_base, queue) = rebase_queue(&snapshot, &request.head, &upstream)?;
+            (
+                queue,
+                Some(ReplayRebase {
+                    upstream,
+                    onto,
+                    fork_base,
+                }),
+            )
+        } else {
+            if request.rebase_onto.is_some() {
+                return Err("onto applies only to rebase".into());
+            }
+            if request.operation == "merge" && request.revisions.len() != 1 {
+                return Err("recorded merge requires exactly one target".into());
+            }
+            (
+                frozen_queue(
+                    &snapshot,
+                    &request.operation,
+                    &request.revisions,
+                    request.options.reverse,
+                )?,
+                None,
+            )
+        };
         let head = mapped(&snapshot, &request.head, request.legacy_path.as_deref())?;
         let files = crate::porcelain::replay_baseline_files(
             request.baseline_index.as_deref(),
@@ -394,17 +524,24 @@ impl Repository {
             &mut snapshot,
             &mut encoded,
             &files,
-            None,
+            &[],
             "",
             request.legacy_path.as_deref(),
         )?;
-        let progress = if request.options.no_commit {
+        let progress = if let Some(rebase) = &rebase {
+            rebase.onto.clone()
+        } else if request.options.no_commit {
             initial_tree.clone()
         } else {
             request.head.clone()
         };
+        let target = queue.first().unwrap_or(&request.head).clone();
         let mut pending = PendingOperation {
-            version: 2,
+            version: if matches!(request.operation.as_str(), "merge" | "rebase") {
+                3
+            } else {
+                2
+            },
             id: format!(
                 "{:x}",
                 Sha256::digest(unique_name("pending-replay").as_bytes())
@@ -412,7 +549,7 @@ impl Repository {
             operation: request.operation,
             branch: request.branch,
             head: request.head,
-            target: queue[0].clone(),
+            target,
             base: None,
             selected_parent: None,
             mainline: request.options.mainline,
@@ -435,6 +572,7 @@ impl Repository {
                 checkpoint: None,
                 index_changed: false,
                 worktree_changed: false,
+                rebase,
             }),
         };
         pending.replay.as_mut().unwrap().selection_sha256 = selection_digest(&pending)?;
@@ -471,6 +609,9 @@ impl Repository {
         if !matches!(action, "continue" | "skip") {
             return Err("invalid replay action".into());
         }
+        if action == "skip" && pending.operation == "merge" {
+            return Err("merge has no --skip; use --abort or --quit".into());
+        }
         self.advance_replay(
             snapshot,
             pending,
@@ -493,7 +634,6 @@ impl Repository {
             let replay = pending.replay.as_ref().ok_or("not a multi-target replay")?;
             let source = replay.queue[replay.cursor].clone();
             let before = replay.progress.clone();
-            let no_commit = replay.options.no_commit;
             let (result, sha) = if action == "continue" {
                 let index = index
                     .as_ref()
@@ -511,7 +651,7 @@ impl Repository {
                     &mut snapshot,
                     &mut encoded,
                     index.files,
-                    (!no_commit).then_some(before.as_str()),
+                    &result_parents(&pending, &before, &source),
                     &text,
                     pending.legacy_path.as_deref(),
                 )?;
@@ -559,17 +699,17 @@ impl Repository {
             }
             let unchanged = images.files == sides[1].files;
             let originally_empty = sides[0].files == sides[2].files;
-            let fast_forward = options.fast_forward
-                && selected_parent(&snapshot, &pending, &source)?.as_deref()
-                    == Some(before.as_str())
-                && matches!(snapshot.objects.get(&source),Some(Object::Commit(commit)) if commit.format==2 && commit.legacy_path==pending.legacy_path);
-            if stops_empty(&options, unchanged, originally_empty, fast_forward) {
+            let fast_forward = can_fast_forward(&snapshot, &pending, &source, &before)?;
+            let contained = contained(&snapshot, &pending, &source, &before)?;
+            if stops(&pending, unchanged, originally_empty, fast_forward) {
                 pending.replay.as_mut().unwrap().stop = "empty".into();
                 break images;
             }
             let drop_empty = unchanged && options.empty == "drop" && !originally_empty;
             let text = message(&snapshot, &pending, &source)?;
-            let (result, kind) = if drop_empty {
+            let (result, kind) = if contained {
+                (None, "already-contained")
+            } else if drop_empty {
                 (None, "empty-dropped")
             } else if fast_forward {
                 (Some(source.clone()), "fast-forward")
@@ -579,7 +719,7 @@ impl Repository {
                         &mut snapshot,
                         &mut encoded,
                         &images.files,
-                        (!options.no_commit).then_some(before.as_str()),
+                        &result_parents(&pending, &before, &source),
                         &text,
                         pending.legacy_path.as_deref(),
                     )?),
@@ -668,6 +808,7 @@ impl Repository {
         if !published {
             check_expected(snapshot.manifest.tip(), Some(&pending.head))?;
         }
+        let mut report = report(&snapshot, &pending)?;
         if !replay.options.no_commit && replay.progress != pending.head {
             let operation = format!("pending-continue-{}", pending.id);
             if !published {
@@ -675,9 +816,10 @@ impl Repository {
             }
             self.ensure_pending_reflog(&pending, &replay.progress, &operation)?;
         }
-        let mut report = report(&pending);
         report["status"] = json!(if replay.options.no_commit {
             "staged"
+        } else if pending.operation == "rebase" {
+            "rebased"
         } else if replay.progress == pending.head {
             "unchanged"
         } else {
@@ -697,11 +839,27 @@ impl Repository {
         let replay = pending.replay.as_ref().ok_or("not a replay")?;
         Ok(mapped(&snapshot, &replay.progress, pending.legacy_path.as_deref())?.files)
     }
+    pub fn replay_stopped_images(
+        &self,
+        pending: &PendingOperation,
+    ) -> RepositoryResult<ReplayImages> {
+        let _lock = self.lock()?;
+        let snapshot = self.snapshot()?;
+        let pending = self.checked_pending(&snapshot, pending)?;
+        let replay = pending.replay.as_ref().ok_or("not a replay")?;
+        if replay.stop == "complete" {
+            return Err("replay has no stopped source".into());
+        }
+        merge_images(
+            revisions(&snapshot, &pending)?,
+            pending.legacy_path.as_deref(),
+        )
+    }
     pub fn replay_status(&self, pending: &PendingOperation) -> RepositoryResult<Value> {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         let pending = self.checked_pending(&snapshot, pending)?;
-        Ok(report(&pending))
+        report(&snapshot, &pending)
     }
 }
 fn selection_digest(pending: &PendingOperation) -> RepositoryResult<String> {
@@ -719,17 +877,30 @@ fn selection_digest(pending: &PendingOperation) -> RepositoryResult<String> {
         &replay.initial_worktree,
     ))
     .map_err(|e| e.to_string())?;
+    let bytes = if pending.version == 3 {
+        serde_json::to_vec(&(bytes, &replay.rebase)).map_err(|e| e.to_string())?
+    } else {
+        bytes
+    };
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 pub(super) fn validate_shape(pending: &PendingOperation) -> RepositoryResult<()> {
     let replay = pending.replay.as_ref().ok_or("missing replay state")?;
-    if !matches!(pending.operation.as_str(), "cherry-pick" | "revert")
-        || pending.rebase.is_some()
-        || pending.version != 2
+    if !matches!(
+        pending.operation.as_str(),
+        "cherry-pick" | "revert" | "merge" | "rebase"
+    ) || pending.rebase.is_some()
+        || pending.version
+            != if matches!(pending.operation.as_str(), "merge" | "rebase") {
+                3
+            } else {
+                2
+            }
+        || (pending.operation == "rebase") != replay.rebase.is_some()
     {
         return Err("replay journal has an incompatible operation or version".into());
     }
-    if replay.queue.is_empty()
+    if (replay.queue.is_empty() && replay.rebase.is_none())
         || replay.queue.len() > 4096
         || replay.cursor > replay.queue.len()
         || replay.steps.len() != replay.cursor
@@ -742,10 +913,29 @@ pub(super) fn validate_shape(pending: &PendingOperation) -> RepositoryResult<()>
         || opts.mainline != pending.mainline
         || (opts.no_commit && (opts.fast_forward || opts.message.is_some() || opts.append_source))
         || (opts.fast_forward
+            && pending.operation != "merge"
             && (opts.message.is_some() || opts.append_source || pending.operation != "cherry-pick"))
         || (opts.append_source && pending.operation != "cherry-pick")
     {
         return Err("invalid frozen replay options".into());
+    }
+    if pending.version == 3
+        && (opts.no_commit
+            || opts.mainline.is_some()
+            || opts.append_source
+            || opts.reverse
+            || opts.empty != "keep"
+            || !opts.allow_empty
+            || (pending.operation == "merge"
+                && (replay.queue.len() != 1 || opts.message.is_none() || !opts.fast_forward))
+            || (pending.operation == "rebase" && (opts.message.is_some() || opts.fast_forward)))
+    {
+        return Err("invalid recorded merge/rebase options".into());
+    }
+    if let Some(rebase) = &replay.rebase {
+        for id in [&rebase.upstream, &rebase.onto, &rebase.fork_base] {
+            require_id(id)?;
+        }
     }
     if selection_digest(pending)? != replay.selection_sha256 {
         return Err("frozen replay selection digest changed".into());
@@ -777,11 +967,22 @@ pub(super) fn validate_shape(pending: &PendingOperation) -> RepositoryResult<()>
         }
         if !matches!(
             step.action.as_str(),
-            "automatic" | "manual" | "skipped" | "empty-dropped" | "fast-forward"
-        ) || matches!(step.action.as_str(), "skipped" | "empty-dropped") != step.result.is_none()
+            "automatic"
+                | "manual"
+                | "skipped"
+                | "empty-dropped"
+                | "fast-forward"
+                | "already-contained"
+        ) || matches!(
+            step.action.as_str(),
+            "skipped" | "empty-dropped" | "already-contained"
+        ) != step.result.is_none()
             || (step.action == "manual") != step.index_sha256.is_some()
         {
             return Err("invalid replay step action or image".into());
+        }
+        if pending.operation == "merge" && step.action == "skipped" {
+            return Err("merge has no skip step".into());
         }
     }
     if let Some(cp) = &replay.checkpoint {
@@ -844,19 +1045,31 @@ pub(super) fn validate_snapshot(
         &replay.initial_worktree,
         replay.options.no_commit,
     )?;
+    if let Some(rebase) = &replay.rebase {
+        let (fork_base, queue) = rebase_queue(snapshot, &pending.head, &rebase.upstream)?;
+        if fork_base != rebase.fork_base
+            || queue != replay.queue
+            || !matches!(snapshot.objects.get(&rebase.onto), Some(Object::Commit(_)))
+        {
+            return Err("recorded rebase changed its original fork, queue, or onto commit".into());
+        }
+        let _ = mapped(snapshot, &rebase.onto, pending.legacy_path.as_deref())?;
+    }
     for source in &replay.queue {
         let _ = views(snapshot, pending, source, &pending.head)?;
     }
-    let mut progress = if replay.options.no_commit {
-        replay.initial_tree.clone()
-    } else {
-        pending.head.clone()
-    };
+    let mut progress = initial_progress(pending)?;
     let mut allowed: BTreeSet<_> = replay
         .initial_worktree
         .keys()
         .cloned()
         .chain(baseline.keys().cloned())
+        .chain(
+            mapped(snapshot, &progress, pending.legacy_path.as_deref())?
+                .files
+                .keys()
+                .cloned(),
+        )
         .collect();
     for (position, step) in replay.steps.iter().enumerate() {
         if replay.queue.get(position) != Some(&step.source) || step.before != progress {
@@ -867,11 +1080,18 @@ pub(super) fn validate_snapshot(
         let conflict = !merged.conflicts.is_empty();
         let unchanged = merged.files == sides[1].files;
         let originally_empty = sides[0].files == sides[2].files;
-        let can_ff = replay.options.fast_forward
-            && selected_parent(snapshot, pending, &step.source)?.as_deref()
-                == Some(progress.as_str())
-            && matches!(snapshot.objects.get(&step.source),Some(Object::Commit(commit)) if commit.format==2 && commit.legacy_path==pending.legacy_path);
-        let stopped = conflict || stops_empty(&replay.options, unchanged, originally_empty, can_ff);
+        let can_ff = can_fast_forward(snapshot, pending, &step.source, &progress)?;
+        let already_contained = contained(snapshot, pending, &step.source, &progress)?;
+        let stopped = conflict || stops(pending, unchanged, originally_empty, can_ff);
+        if step.action == "already-contained" {
+            if !already_contained || conflict || !unchanged {
+                return Err("merge skipped a target which was not already contained".into());
+            }
+            continue;
+        }
+        if already_contained {
+            return Err("merge fabricated a result for already-contained history".into());
+        }
         if matches!(step.action.as_str(), "manual" | "skipped") && !stopped {
             return Err(
                 "replay manual/skip step did not stop at a conflict or empty change".into(),
@@ -907,7 +1127,7 @@ pub(super) fn validate_snapshot(
                         return Err("replay result is not a commit".into());
                     };
                     if commit.format != 2
-                        || commit.parents != [progress.clone()]
+                        || commit.parents != result_parents(pending, &progress, &step.source)
                         || commit.message != message(snapshot, pending, &step.source)?
                         || commit.legacy_path != pending.legacy_path
                     {
@@ -917,7 +1137,8 @@ pub(super) fn validate_snapshot(
                     }
                 }
                 if step.action == "automatic"
-                    && (stopped
+                    && (can_ff
+                        || stopped
                         || conflict
                         || files != merged.files
                         || (unchanged && replay.options.empty == "drop" && !originally_empty))
@@ -957,14 +1178,11 @@ pub(super) fn validate_snapshot(
         let sides = views(snapshot, pending, &replay.queue[replay.cursor], &progress)?;
         allowed.extend(sides.iter().flat_map(|side| side.files.keys().cloned()));
         let images = merge_images(sides.clone(), pending.legacy_path.as_deref())?;
-        let can_ff = replay.options.fast_forward
-            && selected_parent(snapshot, pending, &replay.queue[replay.cursor])?.as_deref()
-                == Some(progress.as_str())
-            && matches!(snapshot.objects.get(&replay.queue[replay.cursor]),Some(Object::Commit(commit)) if commit.format==2 && commit.legacy_path==pending.legacy_path);
+        let can_ff = can_fast_forward(snapshot, pending, &replay.queue[replay.cursor], &progress)?;
         let expected = if !images.conflicts.is_empty() {
             "conflict"
-        } else if stops_empty(
-            &replay.options,
+        } else if stops(
+            pending,
             images.files == sides[1].files,
             sides[0].files == sides[2].files,
             can_ff,
@@ -1003,7 +1221,12 @@ pub(super) fn validate_snapshot(
                 return Err("replay checkpoint no longer names its reviewed index".into());
             }
         }
-        crate::porcelain::validate_replay_checkpoint(cp, &images, pending.legacy_path.as_deref())?;
+        crate::porcelain::validate_replay_checkpoint(
+            cp,
+            &images,
+            pending.legacy_path.as_deref(),
+            Some(&replay.initial_worktree),
+        )?;
     }
     if replay.options.no_commit {
         if pending.prepared.is_some() {
@@ -1022,9 +1245,44 @@ pub(super) fn validate_snapshot(
     }
     Ok(())
 }
-pub(super) fn report(pending: &PendingOperation) -> Value {
-    let replay = pending.replay.as_ref().expect("replay report");
-    json!({"schema_version":1,"status":if replay.stop=="complete"{"prepared"}else{&replay.stop},"operation":pending.operation,"pending_id":pending.id,"branch":pending.branch,"old_head":pending.head,"target":pending.target,"queue":replay.queue,"cursor":replay.cursor,"remaining":replay.queue.len()-replay.cursor,"progress":replay.progress,"progress_kind":if replay.options.no_commit{"tree"}else{"commit"},"no_commit":replay.options.no_commit,"steps":replay.steps,"checkpoint_pending":replay.checkpoint.is_some(),"head_updated":false,"index_updated":replay.index_changed,"worktree_updated":replay.worktree_changed,"pending_cleared":false})
+pub(super) fn report(snapshot: &Snapshot, pending: &PendingOperation) -> RepositoryResult<Value> {
+    let replay = pending.replay.as_ref().ok_or("missing replay state")?;
+    let mut report = json!({"schema_version":1,"journal_version":pending.version,"status":if replay.stop=="complete"{"prepared"}else{&replay.stop},"operation":pending.operation,"pending_id":pending.id,"branch":pending.branch,"old_head":pending.head,"target":pending.target,"queue":replay.queue,"cursor":replay.cursor,"remaining":replay.queue.len()-replay.cursor,"progress":replay.progress,"progress_kind":if replay.options.no_commit{"tree"}else{"commit"},"no_commit":replay.options.no_commit,"steps":replay.steps,"checkpoint_pending":replay.checkpoint.is_some(),"head_updated":false,"index_updated":replay.index_changed,"worktree_updated":replay.worktree_changed,"pending_cleared":false});
+    let mut manual = Vec::new();
+    for step in replay.steps.iter().filter(|step| step.action == "manual") {
+        let result = step
+            .result
+            .as_ref()
+            .ok_or("manual replay result is absent")?;
+        let files = mapped(snapshot, result, pending.legacy_path.as_deref())?.files;
+        let audit = manual_tree_resolution(
+            views(snapshot, pending, &step.source, &step.before)?,
+            &files,
+            pending.legacy_path.as_deref(),
+        )?;
+        manual.push(json!({"source":step.source,"before":step.before,"result":result,"commit":(!replay.options.no_commit).then_some(result),"result_kind":if replay.options.no_commit {"tree"}else{"commit"},"tree_manual_resolution":audit}));
+    }
+    if let Some(last) = manual.last() {
+        report["tree_manual_resolution"] = last["tree_manual_resolution"].clone();
+    }
+    report["manual_resolutions"] = json!(manual);
+    report["commit"] =
+        json!((replay.stop == "complete" && !replay.options.no_commit).then_some(&replay.progress));
+    report["commits"] = json!(replay
+        .steps
+        .iter()
+        .filter_map(|step| (!replay.options.no_commit)
+            .then_some(step.result.as_ref())
+            .flatten())
+        .collect::<Vec<_>>());
+    report["stopped_at"] = json!(replay.queue.get(replay.cursor));
+    if let Some(rebase) = &replay.rebase {
+        report["progress_tip"] = json!(replay.progress);
+        report["upstream"] = json!(rebase.upstream);
+        report["onto"] = json!(rebase.onto);
+        report["fork_base"] = json!(rebase.fork_base);
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1107,6 +1365,7 @@ mod tests {
             baseline_index: Some(raw.clone()),
             legacy_path: None,
             worktree: work.clone(),
+            rebase_onto: None,
         };
         let pending = repo
             .begin_replay_pending(request, |_, images| {
@@ -1198,8 +1457,215 @@ mod tests {
         fs::write(f.repo.metadata.join("index"), &cp.index_after).unwrap();
     }
     fn control(f: &Fixture, action: &str) -> RepositoryResult<Value> {
-        crate::porcelain::replay_control(f.repo.root.to_str().unwrap(), "cherry-pick", action)
-            .map(|v| serde_json::from_str(&v).unwrap())
+        crate::porcelain::replay_control(
+            f.repo.root.to_str().unwrap(),
+            &f.pending.operation,
+            action,
+        )
+        .map(|v| serde_json::from_str(&v).unwrap())
+    }
+    fn recorded_fixture(operation: &str) -> Fixture {
+        let mut f = fixture(false);
+        let source = f
+            .pending
+            .replay
+            .as_ref()
+            .unwrap()
+            .queue
+            .last()
+            .unwrap()
+            .clone();
+        f.repo.quit_pending(&f.pending).unwrap();
+        let upstream = f.head.clone();
+        if operation == "rebase" {
+            f.repo.switch_branch("source").unwrap();
+            f.head = source.clone();
+            f.original = f.repo.files_at(&source).unwrap().files;
+        }
+        for (path, bytes) in &f.original {
+            fs::write(f.repo.root.join(path), bytes).unwrap();
+        }
+        let raw = index(&f.original);
+        fs::write(f.repo.metadata.join("index"), &raw).unwrap();
+        let work: Worktree = f
+            .original
+            .iter()
+            .map(|(p, b)| (p.clone(), Some(b.clone())))
+            .collect();
+        let request = ReplayRequest {
+            operation: operation.into(),
+            branch: f.repo.state().unwrap().head,
+            head: f.head.clone(),
+            revisions: vec![if operation == "rebase" {
+                upstream
+            } else {
+                source
+            }],
+            options: ReplayOptions {
+                no_commit: false,
+                mainline: None,
+                message: (operation == "merge").then(|| "merge original sides".into()),
+                append_source: false,
+                empty: "keep".into(),
+                allow_empty: true,
+                fast_forward: operation == "merge",
+                reverse: false,
+            },
+            baseline_index: Some(raw.clone()),
+            legacy_path: None,
+            worktree: work.clone(),
+            rebase_onto: None,
+        };
+        f.pending = f
+            .repo
+            .begin_replay_pending(request, |_, images| {
+                assert!(images.conflicts.is_empty());
+                Ok(ReplayCheckpoint {
+                    action: "begin".into(),
+                    index_before: Some(raw),
+                    index_after: index(&images.files),
+                    work_before: work.clone(),
+                    work_after: work
+                        .keys()
+                        .map(|p| (p.clone(), images.files.get(p).cloned()))
+                        .collect(),
+                    owned_before: work.keys().cloned().collect(),
+                })
+            })
+            .unwrap();
+        f
+    }
+
+    #[test]
+    fn recorded_merge_and_rebase_recover_all_checkpoint_write_prefixes_and_exact_parent_graphs() {
+        for operation in ["merge", "rebase"] {
+            for cut in 0..=4 {
+                let f = recorded_fixture(operation);
+                assert_eq!(f.pending.version, 3);
+                let cp = f
+                    .pending
+                    .replay
+                    .as_ref()
+                    .unwrap()
+                    .checkpoint
+                    .as_ref()
+                    .unwrap();
+                for (path, bytes) in cp.work_after.iter().take(cut.min(3)) {
+                    fs::write(f.repo.root.join(path), bytes.as_ref().unwrap()).unwrap();
+                }
+                if cut == 4 {
+                    fs::write(f.repo.metadata.join("index"), &cp.index_after).unwrap();
+                }
+                let objects = f.repo.snapshot().unwrap().encoded;
+                let logs = f.repo.reflog().unwrap().len();
+                let report = control(&f, "continue").unwrap();
+                assert_eq!(
+                    report["status"],
+                    if operation == "rebase" {
+                        "rebased"
+                    } else {
+                        "committed"
+                    }
+                );
+                let replay = f.pending.replay.as_ref().unwrap();
+                let result = f.repo.read_commit(&replay.progress).unwrap();
+                if operation == "merge" {
+                    assert_eq!(
+                        result.commit.parents,
+                        vec![f.head.clone(), replay.queue[0].clone()]
+                    );
+                } else {
+                    assert_eq!(
+                        f.repo
+                            .read_commit(&replay.steps[0].result.clone().unwrap())
+                            .unwrap()
+                            .commit
+                            .parents,
+                        vec![replay.rebase.as_ref().unwrap().onto.clone()]
+                    );
+                }
+                assert_eq!(f.repo.snapshot().unwrap().encoded, objects);
+                assert_eq!(f.repo.reflog().unwrap().len(), logs + 1);
+                assert_eq!(
+                    fs::read(f.repo.metadata.join("index")).unwrap(),
+                    cp.index_after
+                );
+                for (path, bytes) in &cp.work_after {
+                    assert_eq!(
+                        fs::read(f.repo.root.join(path)).unwrap(),
+                        *bytes.as_ref().unwrap()
+                    );
+                }
+                assert!(f.repo.pending().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_merge_and_rebase_published_recovery_keeps_later_work_and_repairs_one_reflog() {
+        for operation in ["merge", "rebase"] {
+            let f = recorded_fixture(operation);
+            write_checkpoint(&f);
+            let settled = f
+                .repo
+                .settle_replay_checkpoint(&f.pending, |_| Ok(()))
+                .unwrap();
+            let progress = settled.replay.as_ref().unwrap().progress.clone();
+            fs::write(
+                f.repo.metadata.join(format!("refs/{}", settled.branch)),
+                format!("{progress}\n"),
+            )
+            .unwrap();
+            fs::write(f.repo.root.join("a.wasm"), b"later raw edit").unwrap();
+            fs::write(f.repo.metadata.join("index"), b"later index edit").unwrap();
+            let objects = f.repo.snapshot().unwrap().encoded;
+            let logs = f.repo.reflog().unwrap().len();
+            assert_eq!(control(&f, "continue").unwrap()["already_published"], true);
+            assert_eq!(f.repo.reflog().unwrap().len(), logs + 1);
+            fs::write(
+                f.repo.metadata.join("pending.json"),
+                encode_pending(&settled).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(control(&f, "continue").unwrap()["already_published"], true);
+            assert_eq!(f.repo.reflog().unwrap().len(), logs + 1);
+            assert_eq!(f.repo.snapshot().unwrap().encoded, objects);
+            assert_eq!(
+                fs::read(f.repo.root.join("a.wasm")).unwrap(),
+                b"later raw edit"
+            );
+            assert_eq!(
+                fs::read(f.repo.metadata.join("index")).unwrap(),
+                b"later index edit"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_rebase_fork_and_source_queue_cannot_be_forged_even_with_a_recomputed_selection_digest(
+    ) {
+        let f = recorded_fixture("rebase");
+        for kind in 0..3 {
+            let mut forged = f.pending.clone();
+            let replay = forged.replay.as_mut().unwrap();
+            match kind {
+                0 => replay.rebase.as_mut().unwrap().fork_base = f.head.clone(),
+                1 => replay.queue.reverse(),
+                _ => replay.rebase.as_mut().unwrap().onto = replay.initial_tree.clone(),
+            };
+            forged.replay.as_mut().unwrap().selection_sha256 = selection_digest(&forged).unwrap();
+            fs::write(
+                f.repo.metadata.join("pending.json"),
+                encode_pending(&forged).unwrap(),
+            )
+            .unwrap();
+            assert!(f.repo.pending().is_err());
+            assert_eq!(f.repo.state().unwrap().tip(), Some(&f.head));
+            assert_eq!(
+                fs::read(f.repo.metadata.join("index")).unwrap(),
+                index(&f.original)
+            );
+        }
     }
 
     #[test]

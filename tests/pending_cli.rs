@@ -119,7 +119,7 @@ fn value(args: &[&str]) -> Value {
 fn module(value: i32) -> Vec<u8> {
     wat::parse_str(format!("(module (func (result i32) i32.const {value}))")).unwrap()
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Entry {
     Directory,
     File(Vec<u8>),
@@ -189,7 +189,7 @@ fn conflicting_history(t: &Temp, operation: &str) -> (String, String) {
 }
 
 #[test]
-fn recording_is_explicit_and_changes_only_the_pending_record_on_conflict() {
+fn recording_is_explicit_and_populates_original_stages_without_changing_history() {
     for operation in ["merge", "cherry-pick", "revert"] {
         let t = Temp::new();
         let (head, target) = conflicting_history(&t, operation);
@@ -203,7 +203,19 @@ fn recording_is_explicit_and_changes_only_the_pending_record_on_conflict() {
         assert!(t.pending().is_file());
         let mut recorded = snapshot(&t.repo);
         recorded.remove(Path::new(".uwgit/pending.json"));
-        assert_eq!(recorded, before);
+        let mut expected = before.clone();
+        expected.insert(
+            PathBuf::from(".uwgit/index"),
+            recorded[Path::new(".uwgit/index")].clone(),
+        );
+        assert_eq!(recorded, expected);
+        assert_eq!(
+            value(&["ls-files", t.root(), "--unmerged", "--json"])["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         let status = value(&["status", t.root()]);
         assert_eq!(status["pending"]["operation"], operation);
         assert_eq!(status["pending"]["stale"], false);
@@ -221,8 +233,113 @@ fn recording_is_explicit_and_changes_only_the_pending_record_on_conflict() {
         );
         let quit = value(&[operation, t.root(), "--quit"]);
         assert_eq!(quit["status"], "quit");
-        assert_eq!(snapshot(&t.repo), before);
+        assert_eq!(snapshot(&t.repo), expected);
     }
+}
+
+#[test]
+fn recorded_merge_stages_clean_additions_and_deletions_and_commits_the_reviewed_two_parent_tree() {
+    let t = Temp::new();
+    t.stage("a.wasm", &module(0));
+    t.stage("deleted.wasm", HEADER);
+    let base = t.commit("base");
+    ok(&["branch", t.root(), "topic"]);
+    ok(&["switch", t.root(), "topic"]);
+    t.stage("a.wasm", &module(2));
+    t.stage("incoming.wasm", UNKNOWN);
+    ok(&["rm", t.root(), "deleted.wasm"]);
+    let target = t.commit("incoming");
+    ok(&["switch", t.root(), "main"]);
+    t.stage("a.wasm", &module(1));
+    t.stage("local.wasm", HEADER);
+    let head = t.commit("local");
+    t.record("merge", &target);
+    assert_eq!(t.head(), head);
+    assert_eq!(fs::read(t.path("incoming.wasm")).unwrap(), UNKNOWN);
+    assert!(!t.path("deleted.wasm").exists());
+    let rows = value(&["ls-files", t.root(), "--unmerged", "--json"]);
+    assert_eq!(rows["entries"].as_array().unwrap().len(), 3);
+    rejected(&t, &["write-tree", t.root()]);
+    rejected(&t, &["merge", t.root(), "--continue", "--resolved-index"]);
+    let review = t.base.join("merge-review");
+    let report = value(&["mergetool", t.root(), "--output", s(&review)]);
+    for (side, n) in [("base", 0), ("local", 1), ("remote", 2)] {
+        assert_eq!(
+            fs::read(report["files"][0][side]["file"].as_str().unwrap()).unwrap(),
+            module(n)
+        );
+    }
+    t.stage("a.wasm", &module(9));
+    let done = value(&["merge", t.root(), "--continue", "--resolved-index"]);
+    assert_eq!(done["status"], "committed");
+    assert_eq!(
+        value(&["show", t.root(), "HEAD"])["parents"],
+        json!([head, target])
+    );
+    assert_eq!(t.stored("a.wasm"), module(9));
+    assert_eq!(t.stored("incoming.wasm"), UNKNOWN);
+    assert_eq!(t.stored("local.wasm"), HEADER);
+    assert!(!ok(&["ls-files", t.root()]).contains("deleted.wasm"));
+    assert_ne!(t.head(), base);
+    assert!(!t.pending().exists());
+    ok(&["fsck", t.root()]);
+}
+
+#[test]
+fn recorded_merge_reuses_fast_forwards_and_preserves_two_parents_for_divergent_empty_changes() {
+    let t = Temp::new();
+    t.stage("a.wasm", HEADER);
+    t.commit("base");
+    ok(&["branch", t.root(), "topic"]);
+    ok(&["switch", t.root(), "topic"]);
+    t.stage("a.wasm", &module(1));
+    let target = t.commit("source");
+    ok(&["switch", t.root(), "main"]);
+    let objects = snapshot(&t.path(".uwgit/objects"));
+    let report = value(&[
+        "merge",
+        t.root(),
+        "topic",
+        "--record-conflict",
+        "-m",
+        "unused in ff",
+    ]);
+    assert_eq!(report["steps"][0]["action"], "fast-forward");
+    assert_eq!(t.head(), target);
+    assert_eq!(snapshot(&t.path(".uwgit/objects")), objects);
+    let report = value(&[
+        "merge",
+        t.root(),
+        "topic",
+        "--record-conflict",
+        "-m",
+        "already contained",
+    ]);
+    assert_eq!(report["status"], "unchanged");
+    assert_eq!(report["steps"][0]["action"], "already-contained");
+    assert_eq!(t.head(), target);
+    ok(&["commit", t.root(), "--allow-empty", "-m", "main empty"]);
+    let head = t.head();
+    ok(&["switch", t.root(), "topic"]);
+    ok(&["commit", t.root(), "--allow-empty", "-m", "topic empty"]);
+    let source = t.head();
+    ok(&["switch", t.root(), "main"]);
+    let original = fs::read(t.path("a.wasm")).unwrap();
+    value(&[
+        "merge",
+        t.root(),
+        "topic",
+        "--record-conflict",
+        "-m",
+        "join two empty changes",
+    ]);
+    assert_eq!(
+        value(&["show", t.root(), "HEAD"])["parents"],
+        json!([head, source])
+    );
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), original);
+    assert!(!t.pending().exists());
+    ok(&["fsck", t.root()]);
 }
 
 #[test]
@@ -242,8 +359,8 @@ fn continue_uses_the_complete_index_and_correct_parents_without_touching_work_fi
         let working = worktree(&t);
         rejected(&t, &[operation, t.root(), "--continue"]);
         let report = value(&[operation, t.root(), "--continue", "--resolved-index"]);
-        assert_eq!(report["status"], "continued");
-        assert_eq!(report["index_updated"], false);
+        assert_eq!(report["status"], "committed");
+        assert_eq!(report["index_updated"], true);
         assert_eq!(report["worktree_updated"], false);
         assert_eq!(
             report["tree_manual_resolution"]["supplied_complete_tree"],
@@ -276,7 +393,8 @@ fn continue_uses_the_complete_index_and_correct_parents_without_touching_work_fi
 }
 
 #[test]
-fn abort_and_single_target_skip_restore_exact_baseline_but_preserve_new_work_files() {
+fn abort_restores_the_exact_baseline_and_skip_reverts_only_its_source_while_preserving_other_work()
+{
     for (operation, control) in [
         ("merge", "--abort"),
         ("cherry-pick", "--abort"),
@@ -299,15 +417,24 @@ fn abort_and_single_target_skip_restore_exact_baseline_but_preserve_new_work_fil
         assert_eq!(
             report["status"],
             if control == "--skip" {
-                "skipped"
+                "unchanged"
             } else {
                 "aborted"
             }
         );
         assert_eq!(t.head(), head);
-        assert_eq!(fs::read(t.path(".uwgit/index")).unwrap(), raw);
+        if control == "--abort" {
+            assert_eq!(fs::read(t.path(".uwgit/index")).unwrap(), raw);
+        } else {
+            assert_eq!(value(&["status", t.root()])["staged"], false);
+            assert!(ok(&["ls-files", t.root(), "--unmerged"]).is_empty());
+        }
         assert_eq!(fs::read(t.path("a.wasm")).unwrap(), original_a);
-        assert_eq!(fs::read(t.path("retained.wasm")).unwrap(), HEADER);
+        if control == "--abort" {
+            assert_eq!(fs::read(t.path("retained.wasm")).unwrap(), HEADER);
+        } else {
+            assert!(!t.path("retained.wasm").exists());
+        }
         assert_eq!(fs::read(t.path("new.wasm")).unwrap(), HEADER);
         assert_eq!(fs::read(t.path("private.txt")).unwrap(), b"preserve");
         assert!(!t.pending().exists());

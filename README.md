@@ -136,10 +136,10 @@ wasm-git trace ./history HEAD --file modules/a.wasm --range 40:48
 merge／pull 另支持 `--ff-only`；cherry-pick／revert 可用 `--resolved-index --expect-head ID`
 提交用户审定的完整暂存树，保持单父历史和未暂存工作字节，详见[快进约束与单父手工重放](docs/replay-resolution.md)。
 分支 upstream 支持设置、取消、`-vv` 与 `@{u}` 查询，并接入默认 pull/push；网络 clone、分支及 remote 的 rename/delete 同步维护关联，详见[upstream 验证与范围](docs/upstream.md)。
-merge/cherry-pick/revert 可用 `--record-conflict` 录制单目标冲突，再用 `--continue --resolved-index`、`--abort` 或 `--quit`；pick/revert 另支持单目标 `--skip`，详见[续作契约与验证](docs/pending.md)。
+merge/cherry-pick/revert 可用 `--record-conflict` 录制单目标冲突；已有 index 时自动准备非冲突项和真实 stages，再用 `--continue --resolved-index`、`--abort` 或 `--quit`；pick/revert 另支持 `--skip`，详见[续作契约与验证](docs/pending.md)。
 多目标及范围 pick/revert 现有冻结队列、自动原生 stages、no-commit、empty/ff 和可恢复工作区检查点，见[多目标 replay](docs/replay-queue.md)。
 索引另支持 assume/skip/原图像有效性标志、intent-to-add、refresh 和 commit -a，见[索引标志](docs/index-flags.md)。
-线性 rebase 也可用 `--record-conflict` 冻结队列；`--continue --resolved-index` 审定当前冲突步骤后继续，`--skip` 跳过当前步骤，另支持 `--abort/--quit`。原 HEAD 保持到全队列成功才一次发布，详见[rebase 续作契约](docs/rebase-pending.md)。
+线性 rebase 也可用 `--record-conflict` 冻结队列；`--continue --resolved-index` 审定当前冲突步骤后继续，`--skip` 跳过当前步骤，另支持 `--abort/--quit`。已有 index 时自动准备每步 stages 并同步当前/最终结果，原 HEAD 保持到全队列和恢复检查点完成才一次发布，详见[rebase 续作契约](docs/rebase-pending.md)。
 `ls-tree`、`show-ref`、`for-each-ref` 和 `count-objects` 可查询实际已提交树、引用与唯一对象统计；`ls-remote` 通过 HTTP/SSH 查询远端广告并明确标注对象尚未验证。格式、筛选、退出码与选项子集见[只读查询契约](docs/queries.md)。
 `describe` 可按实际标签祖先生成可回读的修订名；`archive` 可将选定已提交文件的原字节导出为确定的 ustar，旧单模块需显式命名。元数据策略与选项边界见[描述与归档契约](docs/describe-archive.md)。
 `bisect` 可冻结 good/bad 端点并保存测试判断，在完整 DAG 或第一父历史中选择候选；仅支持不切换工作区的流程，skip 歧义明确报告。用法与范围见[历史二分契约](docs/bisect.md)。

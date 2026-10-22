@@ -298,6 +298,135 @@ fn skip_advances_one_target_and_all_skips_restore_the_original_tree_without_new_
 }
 
 #[test]
+fn skip_keeps_unrelated_staged_work_files_and_unstaged_edits_outside_the_stopped_source() {
+    let t = Temp::new();
+    let [_, first, second, ours] = t.fixture(true);
+    let r = t.root();
+    let count = commits(&t);
+    fs::write(t.0.join("c.wasm"), b"initial editor bytes").unwrap();
+    stop(&["cherry-pick", r, "-n", &first, &second], "conflict");
+    t.write("new.wasm", 9);
+    ok(&["add", r, "new.wasm"]);
+    fs::write(t.0.join("c.wasm"), b"later unrelated edit").unwrap();
+    stop(&["cherry-pick", r, "--skip"], "conflict");
+    t.assert_file("new.wasm", 9);
+    assert!(!ok(&["ls-files", r]).contains("new.wasm"));
+    assert_eq!(
+        fs::read(t.0.join("c.wasm")).unwrap(),
+        b"later unrelated edit"
+    );
+    value(&["cherry-pick", r, "--skip"]);
+    assert_eq!(t.head(), ours);
+    assert_eq!(commits(&t), count);
+    t.assert_file("new.wasm", 9);
+    assert_eq!(
+        fs::read(t.0.join("c.wasm")).unwrap(),
+        b"later unrelated edit"
+    );
+    t.no_pending();
+}
+
+#[test]
+fn skip_restores_preexisting_no_commit_dirty_bytes_on_the_affected_path() {
+    let t = Temp::new();
+    let [_, first, second, ours] = t.fixture(true);
+    let r = t.root();
+    fs::write(t.0.join("a.wasm"), b"original non-Wasm editor bytes").unwrap();
+    let baseline = t.index();
+    stop(&["cherry-pick", r, "-n", &first, &second], "conflict");
+    t.write("a.wasm", 9);
+    ok(&["add", r, "a.wasm"]);
+    stop(&["cherry-pick", r, "--skip"], "conflict");
+    assert_eq!(
+        fs::read(t.0.join("a.wasm")).unwrap(),
+        b"original non-Wasm editor bytes"
+    );
+    value(&["cherry-pick", r, "--abort"]);
+    assert_eq!(t.index(), baseline);
+    assert_eq!(t.head(), ours);
+    assert_eq!(
+        fs::read(t.0.join("a.wasm")).unwrap(),
+        b"original non-Wasm editor bytes"
+    );
+    t.no_pending();
+}
+
+#[test]
+fn skip_after_an_earlier_manual_resolution_keeps_untouched_initial_dirty_bytes() {
+    let t = Temp::new();
+    let [_, first, second, ours] = t.fixture(true);
+    let r = t.root();
+    let count = commits(&t);
+    fs::write(
+        t.0.join("b.wasm"),
+        b"initial editor bytes kept across both stops",
+    )
+    .unwrap();
+    stop(&["cherry-pick", r, "-n", &first, &second], "conflict");
+    t.write("a.wasm", 4);
+    ok(&["add", r, "a.wasm"]);
+    stop(
+        &["cherry-pick", r, "--continue", "--resolved-index"],
+        "conflict",
+    );
+    let report = value(&["cherry-pick", r, "--skip"]);
+    assert_eq!(report["status"], "staged");
+    assert_eq!(
+        fs::read(t.0.join("b.wasm")).unwrap(),
+        b"initial editor bytes kept across both stops"
+    );
+    assert_eq!(t.head(), ours);
+    assert_eq!(commits(&t), count);
+    t.assert_file("a.wasm", 4);
+    t.no_pending();
+}
+
+#[test]
+fn later_automatic_replay_cannot_discard_an_unrelated_dirty_path_after_skip() {
+    let t = Temp::new();
+    let [_, first, second, _] = t.fixture(false);
+    let r = t.root();
+    t.write("a.wasm", 3);
+    t.commit("ours conflict only in a");
+    stop(&["cherry-pick", r, &first, &second], "conflict");
+    t.write("b.wasm", 9);
+    let before = snapshot(&t.0);
+    fail(&["cherry-pick", r, "--skip"]);
+    assert_eq!(snapshot(&t.0), before);
+    t.write("b.wasm", 1);
+    value(&["cherry-pick", r, "--skip"]);
+    t.assert_file("a.wasm", 3);
+    t.assert_file("b.wasm", 2);
+    t.no_pending();
+}
+
+#[test]
+fn skip_restores_the_original_sparse_omission_and_index_flags_after_conflict_expansion() {
+    let t = Temp::new();
+    let [_, first, _, ours] = t.fixture(true);
+    let r = t.root();
+    ok(&[
+        "update-index",
+        r,
+        "--skip-worktree",
+        "--fsmonitor-valid",
+        "a.wasm",
+    ]);
+    fs::remove_file(t.0.join("a.wasm")).unwrap();
+    let baseline = t.index();
+    stop(&["cherry-pick", r, "--sequence", &first], "conflict");
+    t.assert_file("a.wasm", 3);
+    t.write("a.wasm", 9);
+    ok(&["add", r, "a.wasm"]);
+    value(&["cherry-pick", r, "--skip"]);
+    assert_eq!(t.head(), ours);
+    assert_eq!(t.index(), baseline);
+    assert!(!t.0.join("a.wasm").exists());
+    assert!(ok(&["ls-files", r, "-t"]).contains("S a.wasm"));
+    t.no_pending();
+}
+
+#[test]
 fn abort_restores_raw_flags_staged_inputs_sparse_absence_and_dirty_initial_bytes() {
     let t = Temp::new();
     let [_, first, _, ours] = t.fixture(true);
@@ -675,10 +804,18 @@ fn no_commit_conflict_exports_a_real_tree_progress_and_continues_without_creatin
     );
     t.write("b.wasm", 4);
     ok(&["add", r, "b.wasm"]);
-    assert_eq!(
-        value(&["cherry-pick", r, "--continue", "--resolved-index"])["status"],
-        "staged"
-    );
+    let report = value(&["cherry-pick", r, "--continue", "--resolved-index"]);
+    assert_eq!(report["status"], "staged");
+    assert_eq!(report["commits"], json!([]));
+    assert!(report["commit"].is_null());
+    for row in report["manual_resolutions"].as_array().unwrap() {
+        assert!(row["commit"].is_null());
+        assert_eq!(row["result_kind"], "tree");
+        assert_eq!(
+            ok(&["cat-file", r, "-t", row["result"].as_str().unwrap()]),
+            "tree"
+        );
+    }
     assert_eq!(t.head(), ours);
     assert_eq!(commits(&t), count);
     t.assert_file("a.wasm", 4);

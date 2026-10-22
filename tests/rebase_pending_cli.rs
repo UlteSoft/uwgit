@@ -64,7 +64,7 @@ impl Temp {
     }
     fn restore_progress(&self) {
         let journal = self.journal();
-        let progress = journal["rebase"]["progress_tip"].as_str().unwrap();
+        let progress = journal["replay"]["progress"].as_str().unwrap();
         ok(&[
             "restore",
             self.root(),
@@ -233,34 +233,40 @@ fn reflog_len(t: &Temp) -> usize {
 }
 
 #[test]
-fn recording_is_explicit_and_freezes_the_queue_without_publishing_automatic_steps() {
+fn recording_is_explicit_and_materializes_stages_while_keeping_automatic_commits_unpublished() {
     let t = Temp::new();
     let h = history(&t);
     let before = snapshot(&t.repo);
     let stateless = report(&["rebase", t.root(), "main"], 2);
     assert_eq!(stateless["stopped_at"], h.queue[1]);
     assert_eq!(snapshot(&t.repo), before);
-    let index = t.index();
-    let work = worktree(&t);
     let logs = reflog_len(&t);
     let recorded = t.record();
     assert_eq!(recorded["status"], "conflict");
-    assert_eq!(recorded["index_updated"], false);
-    assert_eq!(recorded["worktree_updated"], false);
+    assert_eq!(recorded["index_updated"], true);
+    assert_eq!(recorded["worktree_updated"], true);
     assert_eq!(t.head(), h.head);
     assert_eq!(reflog_len(&t), logs);
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
+    assert_eq!(
+        value(&["ls-files", t.root(), "--unmerged", "--json"])["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), module(1));
+    assert_eq!(fs::read(t.path("b.wasm")).unwrap(), module(1));
+    assert!(!t.path("tail.wasm").exists());
     let saved = t.journal();
     assert_eq!(saved["head"], h.head);
     assert_eq!(saved["target"], h.queue[1]);
-    assert_eq!(saved["rebase"]["upstream"], h.upstream);
-    assert_eq!(saved["rebase"]["onto"], h.upstream);
-    assert_eq!(saved["rebase"]["fork_base"], h.fork);
-    assert_eq!(saved["rebase"]["queue"], json!(h.queue));
-    assert_eq!(saved["rebase"]["cursor"], 1);
-    assert_eq!(saved["rebase"]["steps"][0]["action"], "automatic");
-    let progress = saved["rebase"]["progress_tip"].as_str().unwrap();
+    assert_eq!(saved["replay"]["rebase"]["upstream"], h.upstream);
+    assert_eq!(saved["replay"]["rebase"]["onto"], h.upstream);
+    assert_eq!(saved["replay"]["rebase"]["fork_base"], h.fork);
+    assert_eq!(saved["replay"]["queue"], json!(h.queue));
+    assert_eq!(saved["replay"]["cursor"], 1);
+    assert_eq!(saved["replay"]["steps"][0]["action"], "automatic");
+    let progress = saved["replay"]["progress"].as_str().unwrap();
     let stored = t.stored(progress);
     assert_eq!(stored["automatic.wasm"], UNKNOWN);
     assert_eq!(stored["a.wasm"], module(1));
@@ -275,6 +281,59 @@ fn recording_is_explicit_and_freezes_the_queue_without_publishing_automatic_step
 }
 
 #[test]
+fn automatic_stages_allow_consecutive_resolutions_without_restoring_or_filling_in_other_paths() {
+    let t = Temp::new();
+    let h = history(&t);
+    let logs = reflog_len(&t);
+    t.record();
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), module(1));
+    assert_eq!(fs::read(t.path("b.wasm")).unwrap(), module(1));
+    assert!(!t.path("tail.wasm").exists());
+    assert_eq!(t.head(), h.head);
+    t.stage("a.wasm", &module(9));
+    let next = report(&["rebase", t.root(), "--continue", "--resolved-index"], 2);
+    assert_eq!(next["stopped_at"], h.queue[2]);
+    assert_eq!(t.head(), h.head);
+    let rows = value(&["ls-files", t.root(), "--unmerged", "--json"]);
+    let rows = rows["entries"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row["path"] == "b.wasm"));
+    t.stage("b.wasm", &module(9));
+    let done = value(&["rebase", t.root(), "--continue", "--resolved-index"]);
+    assert_eq!(done["status"], "rebased");
+    assert_eq!(done["commits"].as_array().unwrap().len(), 4);
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), module(9));
+    assert_eq!(fs::read(t.path("b.wasm")).unwrap(), module(9));
+    assert_eq!(fs::read(t.path("tail.wasm")).unwrap(), HEADER);
+    assert_eq!(value(&["status", t.root()])["staged"], false);
+    assert_eq!(reflog_len(&t), logs + 1);
+    assert!(!t.path(".uwgit/pending.json").exists());
+    ok(&["fsck", t.root()]);
+}
+
+#[test]
+fn an_empty_rebase_queue_fast_forwards_to_the_frozen_onto_without_synthetic_commits() {
+    let t = Temp::new();
+    t.stage("a.wasm", HEADER);
+    t.commit("base");
+    ok(&["branch", t.root(), "feature"]);
+    t.stage("new.wasm", UNKNOWN);
+    let upstream = t.commit("upstream");
+    ok(&["switch", t.root(), "feature"]);
+    let before = value(&["count-objects", t.root(), "-v"])["by_kind"]["commit"]["objects"].clone();
+    let done = value(&["rebase", t.root(), "main", "--record-conflict"]);
+    assert_eq!(done["status"], "rebased");
+    assert_eq!(done["queue"], json!([]));
+    assert_eq!(t.head(), upstream);
+    assert_eq!(fs::read(t.path("new.wasm")).unwrap(), UNKNOWN);
+    assert_eq!(
+        value(&["count-objects", t.root(), "-v"])["by_kind"]["commit"]["objects"],
+        before
+    );
+    assert!(!t.path(".uwgit/pending.json").exists());
+}
+
+#[test]
 fn two_resolutions_preserve_dirty_index_and_work_and_publish_only_the_final_tip() {
     let t = Temp::new();
     let h = history(&t);
@@ -283,31 +342,27 @@ fn two_resolutions_preserve_dirty_index_and_work_and_publish_only_the_final_tip(
     t.restore_progress();
     t.stage("a.wasm", &module(9));
     t.write("a.wasm", &module(10));
-    let index = t.index();
-    let work = worktree(&t);
     let next = report(&["rebase", t.root(), "--continue", "--resolved-index"], 2);
     assert_eq!(next["stopped_at"], h.queue[2]);
     assert_eq!(next["manual_resolutions"].as_array().unwrap().len(), 1);
     assert_eq!(t.head(), h.head);
     assert_eq!(reflog_len(&t), logs);
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
-    assert_eq!(t.journal()["rebase"]["cursor"], 2);
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), module(10));
+    assert_eq!(t.journal()["replay"]["cursor"], 2);
     t.restore_progress();
     t.stage("b.wasm", &module(9));
     t.write("b.wasm", &module(10));
     t.write("untracked.wasm", UNKNOWN);
-    let index = t.index();
-    let work = worktree(&t);
     let done = value(&["rebase", t.root(), "--continue", "--resolved-index"]);
     assert_eq!(done["status"], "rebased");
     assert_eq!(done["pending_cleared"], true);
-    assert_eq!(done["index_updated"], false);
-    assert_eq!(done["worktree_updated"], false);
+    assert_eq!(done["index_updated"], true);
+    assert_eq!(done["worktree_updated"], true);
     assert_eq!(done["manual_resolutions"].as_array().unwrap().len(), 2);
     assert_eq!(done["commits"].as_array().unwrap().len(), 4);
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
+    assert_eq!(fs::read(t.path("b.wasm")).unwrap(), module(10));
+    assert_eq!(fs::read(t.path("tail.wasm")).unwrap(), HEADER);
+    assert_eq!(fs::read(t.path("untracked.wasm")).unwrap(), UNKNOWN);
     assert_eq!(reflog_len(&t), logs + 1);
     assert!(!t.path(".uwgit/pending.json").exists());
     let stored = t.stored("HEAD");
@@ -345,11 +400,8 @@ fn a_complete_manual_index_can_delete_nonconflicting_paths_without_automatic_com
         "kept.wasm",
         "automatic.wasm",
     ]);
-    let index = t.index();
-    let work = worktree(&t);
     let next = report(&["rebase", t.root(), "--continue", "--resolved-index"], 2);
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), UNKNOWN);
     let manual = &next["manual_resolutions"][0];
     assert_eq!(
         manual["tree_manual_resolution"]["supplied_complete_tree"],
@@ -373,12 +425,14 @@ fn a_complete_manual_index_can_delete_nonconflicting_paths_without_automatic_com
             ("tail.wasm".into(), HEADER.to_vec()),
         ])
     );
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), UNKNOWN);
+    assert_eq!(fs::read(t.path("tail.wasm")).unwrap(), HEADER);
+    assert_eq!(fs::read(t.path("b.wasm")).unwrap(), module(1));
 }
 
 #[test]
-fn skip_replays_the_remaining_queue_without_reading_or_replacing_a_broken_index() {
+fn skip_repairs_a_broken_index_and_materializes_the_remaining_queue_without_losing_untracked_files()
+{
     let t = Temp::new();
     let h = history(&t);
     t.record();
@@ -386,8 +440,6 @@ fn skip_replays_the_remaining_queue_without_reading_or_replacing_a_broken_index(
     fs::write(t.path(".uwgit/index"), b"damaged index kept by skip").unwrap();
     t.write("a.wasm", UNKNOWN);
     t.write("new.wasm", HEADER);
-    let index = t.index();
-    let work = worktree(&t);
     let logs = reflog_len(&t);
     let done = value(&["rebase", t.root(), "--skip"]);
     assert_eq!(done["status"], "rebased");
@@ -395,10 +447,11 @@ fn skip_replays_the_remaining_queue_without_reading_or_replacing_a_broken_index(
     assert_eq!(done["steps"][2]["source"], h.queue[2]);
     assert_eq!(done["steps"][2]["commit"], Value::Null);
     assert_eq!(done["commits"].as_array().unwrap().len(), 3);
-    assert_eq!(done["index_updated"], false);
-    assert_eq!(done["worktree_updated"], false);
-    assert_eq!(t.index(), index);
-    assert_eq!(worktree(&t), work);
+    assert_eq!(done["index_updated"], true);
+    assert_eq!(done["worktree_updated"], true);
+    assert_eq!(fs::read(t.path("a.wasm")).unwrap(), UNKNOWN);
+    assert_eq!(fs::read(t.path("new.wasm")).unwrap(), HEADER);
+    assert_eq!(value(&["status", t.root()])["staged"], false);
     assert_eq!(reflog_len(&t), logs + 1);
     let stored = t.stored("HEAD");
     assert_eq!(stored["a.wasm"], module(9));
@@ -510,9 +563,14 @@ fn clean_recorded_rebase_updates_an_existing_clean_workspace_but_keeps_no_index_
         let work = worktree(&t);
         let done = value(&["rebase", t.root(), "main", "--record-conflict"]);
         assert_eq!(done["status"], "rebased");
-        assert_eq!(done["existing_clean_workspace_synchronized"], indexed);
-        assert!(done.get("index_updated").is_none());
-        assert!(done.get("worktree_updated").is_none());
+        if indexed {
+            assert_eq!(done["index_updated"], true);
+            assert_eq!(done["worktree_updated"], true);
+        } else {
+            assert_eq!(done["existing_clean_workspace_synchronized"], false);
+            assert!(done.get("index_updated").is_none());
+            assert!(done.get("worktree_updated").is_none());
+        }
         assert!(!t.path(".uwgit/pending.json").exists());
         assert_eq!(
             value(&["show", t.root(), "HEAD"])["parents"],
@@ -538,13 +596,13 @@ fn frozen_upstream_and_queue_survive_ref_replacement_and_stale_bindings_only_all
     ok(&["branch", t.root(), "main", "HEAD"]);
     continue_first(&t);
     let frozen = t.journal();
-    assert_eq!(frozen["rebase"]["upstream"], h.upstream);
-    assert_eq!(frozen["rebase"]["queue"], json!(h.queue));
+    assert_eq!(frozen["replay"]["rebase"]["upstream"], h.upstream);
+    assert_eq!(frozen["replay"]["queue"], json!(h.queue));
     value(&["rebase", t.root(), "--skip"]);
     let automatic = value(&[
         "show",
         t.root(),
-        frozen["rebase"]["steps"][0]["commit"].as_str().unwrap(),
+        frozen["replay"]["steps"][0]["result"].as_str().unwrap(),
     ]);
     assert_eq!(automatic["parents"], json!([h.upstream]));
     for same_tip_other_branch in [false, true] {
@@ -653,10 +711,10 @@ fn onto_is_frozen_independently_of_the_upstream_fork_and_later_ref_updates() {
         2,
     );
     let saved = t.journal();
-    assert_eq!(saved["rebase"]["upstream"], h.upstream);
-    assert_eq!(saved["rebase"]["onto"], onto);
-    assert_eq!(saved["rebase"]["fork_base"], h.fork);
-    assert_eq!(saved["rebase"]["queue"], json!(h.queue));
+    assert_eq!(saved["replay"]["rebase"]["upstream"], h.upstream);
+    assert_eq!(saved["replay"]["rebase"]["onto"], onto);
+    assert_eq!(saved["replay"]["rebase"]["fork_base"], h.fork);
+    assert_eq!(saved["replay"]["queue"], json!(h.queue));
     ok(&["branch", t.root(), "-D", "new-base"]);
     ok(&["branch", t.root(), "new-base", "HEAD"]);
     continue_first(&t);
