@@ -34,6 +34,13 @@ mod merge_tool_storage;
 #[path = "repository_plumbing.rs"]
 mod plumbing_storage;
 pub use plumbing_storage::MergeBaseMode;
+#[path = "repository_head.rs"]
+mod head_storage;
+#[path = "repository_revisions.rs"]
+mod revision_syntax;
+pub(crate) use head_storage::is_detached_identity;
+pub(crate) use head_storage::validate_head_identity;
+use head_storage::{check_pending_head, head_tip};
 
 pub type RepositoryResult<T> = Result<T, String>;
 
@@ -409,6 +416,7 @@ pub struct QueryRefs {
     pub schema_version: u32,
     pub head: String,
     pub head_tip: Option<String>,
+    pub head_object: Option<QueryObject>,
     pub refs: Vec<QueryRef>,
 }
 
@@ -730,6 +738,9 @@ enum Object {
 struct Snapshot {
     manifest: Manifest,
     upstreams: BTreeMap<String, Upstream>,
+    upstream_tips: BTreeMap<String, RepositoryResult<String>>,
+    checkouts: Vec<String>,
+    head_reflog: Vec<ReflogEntry>,
     tracking: BTreeMap<String, String>,
     reflog: Vec<ReflogEntry>,
     encoded: BTreeMap<String, Vec<u8>>,
@@ -812,20 +823,13 @@ impl Repository {
         let snapshot = self.snapshot()?;
         if let Some(Object::Commit(commit)) = snapshot
             .manifest
-            .refs
-            .get(&snapshot.manifest.head)
+            .tip()
             .and_then(|id| snapshot.objects.get(id))
         {
             require_legacy_commit(commit)?;
         }
+        let parents = snapshot.manifest.tip().cloned().into_iter().collect();
         let branch = snapshot.manifest.head;
-        let parents = snapshot
-            .manifest
-            .refs
-            .get(&branch)
-            .cloned()
-            .into_iter()
-            .collect();
         let wasm = self.store_object(WASM_KIND, bytes)?;
         let commit = Commit {
             format: 1,
@@ -854,7 +858,7 @@ impl Repository {
             target_revision,
             message,
             &state.head,
-            state.branches.get(&state.head).map(String::as_str),
+            state.tip().map(String::as_str),
         )
     }
 
@@ -925,19 +929,16 @@ impl Repository {
         ff_only: bool,
         no_ff: bool,
     ) -> RepositoryResult<RepositoryMergeOutcome> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         let _lock = self.lock()?;
         // Verify the whole store, including dangling histories, before treating
         // ancestry as evidence or allowing a fast-forward to hide corruption.
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, Some(expected_branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected_head,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected_head)?;
         let branch = snapshot.manifest.head.clone();
         let target = snapshot_revision(&snapshot, target_revision)?;
-        let old_head = snapshot.manifest.refs.get(&branch).cloned();
+        let old_head = snapshot.manifest.tip().cloned();
         let mut outcome = RepositoryMergeOutcome {
             schema_version: 1,
             status: String::new(),
@@ -1083,7 +1084,7 @@ impl Repository {
         bytes: &[u8],
         message: &str,
     ) -> RepositoryResult<RepositoryMergeOutcome> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         require_id(expected_head)?;
         require_id(target_id)?;
         let _lock = self.lock()?;
@@ -1092,8 +1093,7 @@ impl Repository {
         let branch = snapshot.manifest.head.clone();
         let ours = snapshot
             .manifest
-            .refs
-            .get(&branch)
+            .tip()
             .cloned()
             .ok_or("manual merge resolution requires an existing HEAD commit")?;
         if ours != expected_head {
@@ -1164,16 +1164,13 @@ impl Repository {
         legacy_path: Option<&str>,
         message: &str,
     ) -> RepositoryResult<RepositoryMergeOutcome> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         require_id(expected_head)?;
         require_id(target_id)?;
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, Some(expected_branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(expected_branch),
-            Some(expected_head),
-        )?;
+        check_expected(snapshot.manifest.tip(), Some(expected_head))?;
         // A complete hexadecimal ID is still required to name a commit, rather
         // than a similarly named ref that could redirect an explicit resolution.
         if !matches!(snapshot.objects.get(target_id), Some(Object::Commit(_))) {
@@ -1261,12 +1258,9 @@ impl Repository {
     ) -> RepositoryResult<String> {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         check_expected_branch(&snapshot.manifest.head, Some(expected_branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected)?;
         check_tree_head_anchor(&snapshot, legacy_path)?;
         check_tree_parents(&snapshot, parents, legacy_path)?;
         let mut encoded = BTreeMap::new();
@@ -1292,14 +1286,11 @@ impl Repository {
         commits: &[(BTreeMap<String, Vec<u8>>, String)],
         legacy_path: Option<&str>,
     ) -> RepositoryResult<Vec<String>> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, Some(expected_branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected)?;
         check_tree_head_anchor(&snapshot, legacy_path)?;
         let mut parent = snapshot_revision(&snapshot, base)?;
         check_tree_parents(&snapshot, std::slice::from_ref(&parent), legacy_path)?;
@@ -1388,13 +1379,10 @@ impl Repository {
         let snapshot = self.snapshot()?;
         let id = match revision {
             Some(rev) => snapshot_revision(&snapshot, rev)?,
-            None => {
-                let branch = self.current_branch()?;
-                match self.read_ref_optional(&branch)? {
-                    Some(id) => id,
-                    None => return Ok(Vec::new()),
-                }
-            }
+            None => match snapshot.manifest.tip() {
+                Some(id) => id.clone(),
+                None => return Ok(Vec::new()),
+            },
         };
         self.verify_history(&id)?;
         let mut commits = BTreeMap::new();
@@ -1457,16 +1445,18 @@ impl Repository {
         if snapshot.manifest.head == name {
             return Ok(());
         }
-        let old = snapshot.manifest.refs.get(&snapshot.manifest.head).cloned();
+        let old = snapshot.manifest.tip().cloned();
         self.assert_branch_available(name)?;
         self.register_selected_branch(name)?;
         self.atomic_write(&self.metadata.join("HEAD"), format!("{name}\n").as_bytes())?;
         self.record_reflog(
             "HEAD",
-            old,
-            Some(id),
+            old.clone(),
+            Some(id.clone()),
             &format!("switch {} -> {name}", snapshot.manifest.head),
-        )
+        )?;
+        self.record_head_event(old, Some(id), "switch")?;
+        self.record_checkout(&snapshot.checkouts, &snapshot.manifest.head)
     }
 
     pub fn fsck(&self) -> RepositoryResult<FsckReport> {
@@ -1518,8 +1508,7 @@ impl Repository {
         let incoming = decode_bundle(&read_regular(source.as_ref())?)?;
         let tip = incoming
             .manifest
-            .refs
-            .get(&incoming.manifest.head)
+            .tip()
             .cloned()
             .ok_or_else(|| "bundle has no commit at its HEAD branch".to_string())?;
         // Match receive's lock order so an add cannot create an index between
@@ -1586,7 +1575,12 @@ impl Repository {
                 repo.record_reflog(
                     "HEAD",
                     snapshot.manifest.refs.get("main").cloned(),
-                    snapshot.manifest.refs.get(&snapshot.manifest.head).cloned(),
+                    snapshot.manifest.tip().cloned(),
+                    "clone-head",
+                )?;
+                repo.record_head_event(
+                    snapshot.manifest.refs.get("main").cloned(),
+                    snapshot.manifest.tip().cloned(),
                     "clone-head",
                 )?;
             }
@@ -1768,7 +1762,12 @@ impl Repository {
         Ok(QueryRefs {
             schema_version: 1,
             head: snapshot.manifest.head.clone(),
-            head_tip: snapshot.manifest.refs.get(&snapshot.manifest.head).cloned(),
+            head_tip: snapshot.manifest.tip().cloned(),
+            head_object: snapshot
+                .manifest
+                .tip()
+                .map(|id| query_object(&snapshot, id))
+                .transpose()?,
             refs,
         })
     }
@@ -1882,10 +1881,12 @@ impl Repository {
             .values()
             .chain(snapshot.manifest.tags.values())
             .chain(snapshot.tracking.values())
+            .chain(valid_id(&snapshot.manifest.head).then_some(&snapshot.manifest.head))
             .chain(
                 snapshot
                     .reflog
                     .iter()
+                    .chain(&snapshot.head_reflog)
                     .flat_map(|entry| entry.old.iter().chain(&entry.new)),
             )
             .cloned()
@@ -1921,7 +1922,7 @@ impl Repository {
             reachable_objects: reachable.len(),
             unreachable_objects: snapshot.objects.len() - reachable.len(),
             root_commits: roots.len(),
-            root_policy: "local_branches+local_tags+fetched_tracking_branches+reflog_old_and_new; remote_only_tags+pending+index_excluded; unlike_refs_only_fsck; unreachable_is_not_a_deletion_recommendation".into(),
+            root_policy: "local_branches+local_tags+detached_HEAD+fetched_tracking_branches+reflog_old_and_new+local_HEAD_reflog; remote_only_tags+pending+index_excluded; unlike_refs_only_fsck; unreachable_is_not_a_deletion_recommendation".into(),
             by_kind,
         })
     }
@@ -2111,7 +2112,7 @@ impl Repository {
     /// Record a conflict already computed for these immutable revisions. The
     /// caller holds the index lock from clean-index admission through here.
     pub fn record_pending(&self, request: PendingRequest) -> RepositoryResult<PendingOperation> {
-        validate_ref_name(&request.branch)?;
+        validate_head_identity(&request.branch)?;
         require_id(&request.head)?;
         require_id(&request.target)?;
         let _lock = self.lock()?;
@@ -2122,10 +2123,7 @@ impl Repository {
             );
         }
         check_expected_branch(&snapshot.manifest.head, Some(&request.branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&request.branch),
-            Some(&request.head),
-        )?;
+        check_expected(snapshot.manifest.tip(), Some(&request.head))?;
         let (base, selected_parent) = pending_identity(
             &snapshot,
             &request.operation,
@@ -2169,8 +2167,8 @@ impl Repository {
         if pending.rebase.is_some() {
             return Err("use the rebase continuation API for its saved linear replay".into());
         }
-        check_expected_branch(&snapshot.manifest.head, Some(&pending.branch))?;
-        let current = snapshot.manifest.refs.get(&pending.branch);
+        check_pending_head(&snapshot, &pending)?;
+        let current = snapshot.manifest.tip();
         let already_published = pending
             .prepared
             .as_ref()
@@ -2278,7 +2276,7 @@ impl Repository {
     /// Begin an opt-in linear replay. Automatic prefixes are stored without
     /// publishing a branch; a conflicting source keeps its original baseline.
     pub fn begin_rebase_pending(&self, request: PendingRebaseRequest) -> RepositoryResult<Value> {
-        validate_ref_name(&request.branch)?;
+        validate_head_identity(&request.branch)?;
         for id in [&request.head, &request.upstream, &request.onto] {
             require_id(id)?;
         }
@@ -2290,10 +2288,7 @@ impl Repository {
             );
         }
         check_expected_branch(&snapshot.manifest.head, Some(&request.branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&request.branch),
-            Some(&request.head),
-        )?;
+        check_expected(snapshot.manifest.tip(), Some(&request.head))?;
         let (fork_base, queue) = rebase_queue(&snapshot, &request.head, &request.upstream)?;
         let mut pending = PendingOperation {
             version: 1,
@@ -2356,15 +2351,13 @@ impl Repository {
         if pending.operation != "rebase" || pending.rebase.is_none() {
             return Err("the saved operation is not a linear rebase".into());
         }
-        check_expected_branch(&snapshot.manifest.head, Some(&pending.branch))?;
-        let already_published = pending.prepared.as_ref().is_some_and(|prepared| {
-            snapshot.manifest.refs.get(&pending.branch) == Some(&prepared.commit)
-        });
+        check_pending_head(&snapshot, &pending)?;
+        let already_published = pending
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| snapshot.manifest.tip() == Some(&prepared.commit));
         if !already_published {
-            check_expected(
-                snapshot.manifest.refs.get(&pending.branch),
-                Some(&pending.head),
-            )?;
+            check_expected(snapshot.manifest.tip(), Some(&pending.head))?;
         }
         if pending.prepared.is_some() {
             return self.finish_rebase_pending(
@@ -2633,11 +2626,8 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         let pending = self.checked_pending(&snapshot, expected)?;
-        check_expected_branch(&snapshot.manifest.head, Some(&pending.branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&pending.branch),
-            Some(&pending.head),
-        )?;
+        check_pending_head(&snapshot, &pending)?;
+        check_expected(snapshot.manifest.tip(), Some(&pending.head))?;
         let head = snapshot_files(&snapshot, &pending.head)?;
         restore(&pending, &head).map_err(|error| {
             format!("pending state retained; abort restoration may be partly completed: {error}")
@@ -2699,9 +2689,14 @@ impl Repository {
             .ok_or_else(|| format!("unknown branch: {name}"))?
             .clone();
         if !force {
-            let head = snapshot.manifest.refs.get(&snapshot.manifest.head).ok_or(
-                "cannot establish merged ancestry from an unborn HEAD; use force explicitly",
-            )?;
+            let head = snapshot
+                .upstream_tips
+                .get(name)
+                .and_then(|result| result.as_ref().ok())
+                .or_else(|| snapshot.manifest.tip())
+                .ok_or(
+                    "cannot establish merged ancestry from an unborn HEAD; use force explicitly",
+                )?;
             if !is_ancestor(&id, head, &snapshot.objects)? {
                 return Err(format!(
                     "branch {name} is not fully merged into HEAD; use force explicitly"
@@ -2716,29 +2711,51 @@ impl Repository {
     /// atomically move its local association, then update HEAD and remove the old
     /// branch. I/O errors can leave both names; messages identify completed steps.
     pub fn rename_branch(&self, old: &str, new: &str) -> RepositoryResult<()> {
+        self.rename_branch_mode(old, new, false, false)
+    }
+
+    pub fn rename_branch_mode(
+        &self,
+        old: &str,
+        new: &str,
+        force: bool,
+        copy: bool,
+    ) -> RepositoryResult<()> {
         validate_ref_name(old)?;
         validate_ref_name(new)?;
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
-        self.assert_branch_available(old)?;
+        if !copy {
+            self.assert_branch_available(old)?;
+        }
         self.assert_branch_available(new)?;
         if old == new {
             return Err("old and new branch names are identical".into());
         }
-        if snapshot.manifest.refs.contains_key(new) || snapshot.manifest.head == new {
+        if (!force && snapshot.manifest.refs.contains_key(new)) || snapshot.manifest.head == new {
             return Err(format!("branch {new} already exists"));
         }
         let id = snapshot.manifest.refs.get(old).cloned();
+        if copy && id.is_none() {
+            return Err("copy requires a committed source branch".into());
+        }
         if id.is_none() && snapshot.manifest.head != old {
             return Err(format!("unknown branch: {old}"));
         }
-        let mut upstreams = snapshot.upstreams;
-        let moved_upstream = if let Some(upstream) = upstreams.remove(old) {
-            upstreams.insert(new.into(), upstream);
-            true
+        let original = snapshot.upstreams.clone();
+        let mut upstreams = original.clone();
+        let binding = if copy {
+            upstreams.get(old).cloned()
         } else {
-            false
+            upstreams.remove(old)
         };
+        if force {
+            upstreams.remove(new);
+        }
+        if let Some(upstream) = binding {
+            upstreams.insert(new.into(), upstream);
+        }
+        let moved_upstream = upstreams != original;
         // Size and naming failures must precede the first replacement ref.
         let upstream_bytes = if moved_upstream {
             Some(encode_upstreams(&upstreams)?)
@@ -2753,7 +2770,7 @@ impl Repository {
             self.publish_upstreams(bytes, "rename branch upstream association")
                 .map_err(|error| format!("replacement branch {new} is present and original branch {old} is retained; moving its upstream association did not complete durably: {error}"))?;
         }
-        if snapshot.manifest.head == old {
+        if !copy && snapshot.manifest.head == old {
             self.register_selected_branch(new)?;
             self.atomic_write(&self.metadata.join("HEAD"), format!("{new}\n").as_bytes())
                 .map_err(|error| format!("rename branch {old} -> {new}: replacement branch and any upstream move were published, but HEAD publication is uncertain; the original branch has not been removed: {error}"))?;
@@ -2763,12 +2780,26 @@ impl Repository {
                 id.clone(),
                 &format!("rename {old} -> {new}"),
             ).map_err(|error| format!("rename branch {old} -> {new}: HEAD and any upstream move were published; the original branch has not been removed: {error}"))?;
+            self.record_head_event(id.clone(), id.clone(), &format!("rename {old} -> {new}"))?;
         }
-        if let Some(id) = &id {
+        if let Some(id) = &id.filter(|_| !copy) {
             self.remove_named_ref("refs", old, id, "rename-branch-remove")
                 .map_err(|error| format!("rename branch {old} -> {new}: replacement branch and any upstream move were published; removal of the original branch or its reflog may be incomplete: {error}"))?;
         }
         Ok(())
+    }
+
+    pub fn force_branch(&self, name: &str, revision: &str) -> RepositoryResult<String> {
+        validate_ref_name(name)?;
+        let _lock = self.lock()?;
+        let snapshot = self.snapshot()?;
+        if snapshot.manifest.head == name {
+            return Err("cannot force-update the current branch".into());
+        }
+        self.assert_branch_available(name)?;
+        let id = snapshot_revision(&snapshot, revision)?;
+        self.write_named_ref("refs", name, &id, "branch-force")?;
+        Ok(id)
     }
 
     /// Explicit history rewrite guarded by an exact current-HEAD comparison.
@@ -2784,7 +2815,7 @@ impl Repository {
         expected_branch: &str,
         expected: Option<&str>,
     ) -> RepositoryResult<String> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         self.reset_checked(revision, Some(expected_branch), expected)
     }
 
@@ -2797,10 +2828,7 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, expected_branch)?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected)?;
         let id = snapshot_revision(&snapshot, revision)?;
         self.write_named_ref("refs", &snapshot.manifest.head, &id, "reset")?;
         Ok(id)
@@ -2827,7 +2855,7 @@ impl Repository {
         expected_branch: &str,
         expected: Option<&str>,
     ) -> RepositoryResult<String> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         self.commit_checked(bytes, message, parents, Some(expected_branch), expected)
     }
 
@@ -2843,10 +2871,7 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, expected_branch)?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected)?;
         require_legacy_head(&snapshot)?;
         let mut seen = BTreeSet::new();
         for parent in parents {
@@ -2893,7 +2918,7 @@ impl Repository {
         base: &str,
         commits: &[(Vec<u8>, String)],
     ) -> RepositoryResult<Vec<String>> {
-        validate_ref_name(expected_branch)?;
+        validate_head_identity(expected_branch)?;
         self.replay_checked(Some(expected_branch), expected, base, commits)
     }
 
@@ -2907,10 +2932,7 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, expected_branch)?;
-        check_expected(
-            snapshot.manifest.refs.get(&snapshot.manifest.head),
-            expected,
-        )?;
+        check_expected(snapshot.manifest.tip(), expected)?;
         require_legacy_head(&snapshot)?;
         let mut parent = snapshot_revision(&snapshot, base)?;
         if let Some(Object::Commit(commit)) = snapshot.objects.get(&parent) {
@@ -2987,7 +3009,11 @@ impl Repository {
             snapshot.manifest.head = "transfer".into();
             snapshot.manifest.refs = BTreeMap::from([("transfer".into(), tip)]);
             snapshot.manifest.tags.retain(|_, id| commits.contains(id));
-            snapshot.manifest.format = manifest_format(&snapshot.manifest.tags, &snapshot.objects);
+            snapshot.manifest.format = manifest_format(
+                &snapshot.manifest.head,
+                &snapshot.manifest.tags,
+                &snapshot.objects,
+            );
         }
         Ok((
             manifest_state(&snapshot.manifest),
@@ -3036,8 +3062,7 @@ impl Repository {
                 let incoming = decode_bundle(bytes)?;
                 incoming
                     .manifest
-                    .refs
-                    .get(&incoming.manifest.head)
+                    .tip()
                     .cloned()
                     .ok_or("bundle has no commit at its HEAD branch".into())
             })(),
@@ -3178,7 +3203,12 @@ impl Repository {
                 repo.record_reflog(
                     "HEAD",
                     snapshot.manifest.refs.get("main").cloned(),
-                    snapshot.manifest.refs.get(&snapshot.manifest.head).cloned(),
+                    snapshot.manifest.tip().cloned(),
+                    "clone-head",
+                )?;
+                repo.record_head_event(
+                    snapshot.manifest.refs.get("main").cloned(),
+                    snapshot.manifest.tip().cloned(),
                     "clone-head",
                 )?;
             }
@@ -3356,7 +3386,11 @@ impl Repository {
         commit: &str,
         operation: &str,
     ) -> RepositoryResult<()> {
-        let reference = format!("refs/heads/{}", pending.branch);
+        let reference = if valid_id(&pending.branch) {
+            "HEAD".into()
+        } else {
+            format!("refs/heads/{}", pending.branch)
+        };
         let entries = self.read_reflog()?;
         let matches: Vec<_> = entries
             .iter()
@@ -3378,6 +3412,9 @@ impl Repository {
             }
             _ => Err("the pending generation has conflicting or duplicate reflog entries".into()),
         }
+        .and_then(|()| {
+            self.record_head_event(Some(pending.head.clone()), Some(commit.into()), operation)
+        })
     }
 
     fn read_upstreams(
@@ -3480,7 +3517,12 @@ impl Repository {
             {
                 return Err(format!("invalid remote tracking schema for {name}"));
             }
-            validate_ref_name(&record.state.head)?;
+            validate_head_identity(&record.state.head)?;
+            if record.state.detached()
+                && !matches!(objects.get(&record.state.head), Some(Object::Commit(_)))
+            {
+                return Err("remote detached HEAD is missing or is not a commit".into());
+            }
             for (branch, id) in &record.state.branches {
                 validate_ref_name(branch)?;
                 require_id(id)?;
@@ -3566,6 +3608,9 @@ impl Repository {
         id: &str,
         operation: &str,
     ) -> RepositoryResult<()> {
+        if namespace == "refs" && valid_id(name) {
+            return self.write_detached_tip(name, id, operation);
+        }
         validate_ref_name(name)?;
         require_id(id)?;
         if namespace == "refs" {
@@ -3610,7 +3655,11 @@ impl Repository {
             "refs/{}/{name}",
             if namespace == "tags" { "tags" } else { "heads" }
         );
-        self.record_reflog(&reference, old, Some(id.into()), operation)
+        self.record_reflog(&reference, old.clone(), Some(id.into()), operation)?;
+        if namespace == "refs" && self.current_branch()? == name {
+            self.record_head_event(old, Some(id.into()), operation)?;
+        }
+        Ok(())
     }
 
     fn remove_named_ref(
@@ -3891,10 +3940,11 @@ impl Repository {
             encoded.insert(id, bytes);
         }
         let mut manifest = manifest;
-        manifest.format = manifest_format(&manifest.tags, &objects);
+        manifest.format = manifest_format(&manifest.head, &manifest.tags, &objects);
         validate_snapshot(&manifest, &objects)?;
         let reflog = self.read_reflog()?;
-        for entry in &reflog {
+        let head_reflog = self.read_head_reflog()?;
+        for entry in reflog.iter().chain(&head_reflog) {
             for id in entry.old.iter().chain(entry.new.iter()) {
                 if !matches!(objects.get(id), Some(Object::Commit(_))) {
                     return Err(format!(
@@ -3905,9 +3955,14 @@ impl Repository {
         }
         let tracking = self.read_tracking(&objects)?;
         let upstreams = self.read_upstreams(&manifest.refs)?;
+        let upstream_tips = revision_syntax::upstream_tips(self, &upstreams, &tracking);
+        let checkouts = self.checkout_history()?;
         Ok(Snapshot {
             manifest,
             upstreams,
+            upstream_tips,
+            checkouts,
+            head_reflog,
             tracking,
             reflog,
             encoded,
@@ -3968,7 +4023,7 @@ fn encode_pending(pending: &PendingOperation) -> RepositoryResult<Vec<u8>> {
     for id in [&pending.id, &pending.head, &pending.target] {
         require_id(id)?;
     }
-    validate_ref_name(&pending.branch)?;
+    validate_head_identity(&pending.branch)?;
     if !matches!(
         pending.operation.as_str(),
         "merge" | "cherry-pick" | "revert" | "rebase"
@@ -4645,7 +4700,7 @@ fn parse_ref_file(bytes: &[u8], object: bool) -> RepositoryResult<String> {
     if object {
         require_id(value)?;
     } else {
-        validate_ref_name(value)?;
+        validate_head_identity(value)?;
     }
     Ok(value.to_owned())
 }
@@ -4684,8 +4739,14 @@ fn validate_tree_paths<'a>(paths: impl Iterator<Item = &'a str>) -> RepositoryRe
     Ok(())
 }
 
-fn manifest_format(tags: &BTreeMap<String, String>, objects: &BTreeMap<String, Object>) -> u32 {
-    if objects.values().any(|object| {
+fn manifest_format(
+    head: &str,
+    tags: &BTreeMap<String, String>,
+    objects: &BTreeMap<String, Object>,
+) -> u32 {
+    if valid_id(head) {
+        4
+    } else if objects.values().any(|object| {
         matches!(object, Object::Tree(_))
             || matches!(object, Object::Commit(commit) if commit.format == 2)
     }) {
@@ -4707,8 +4768,7 @@ fn require_legacy_commit(commit: &Commit) -> RepositoryResult<()> {
 fn require_legacy_head(snapshot: &Snapshot) -> RepositoryResult<()> {
     if let Some(Object::Commit(commit)) = snapshot
         .manifest
-        .refs
-        .get(&snapshot.manifest.head)
+        .tip()
         .and_then(|id| snapshot.objects.get(id))
     {
         require_legacy_commit(commit)?;
@@ -4719,8 +4779,7 @@ fn require_legacy_head(snapshot: &Snapshot) -> RepositoryResult<()> {
 fn check_tree_head_anchor(snapshot: &Snapshot, legacy_path: Option<&str>) -> RepositoryResult<()> {
     if let Some(Object::Commit(commit)) = snapshot
         .manifest
-        .refs
-        .get(&snapshot.manifest.head)
+        .tip()
         .and_then(|id| snapshot.objects.get(id))
     {
         if let Some(anchor) = &commit.legacy_path {
@@ -5376,10 +5435,13 @@ fn validate_snapshot(
     manifest: &Manifest,
     objects: &BTreeMap<String, Object>,
 ) -> RepositoryResult<()> {
-    if manifest.format != manifest_format(&manifest.tags, objects) {
+    if manifest.format != manifest_format(&manifest.head, &manifest.tags, objects) {
         return Err("unsupported or inconsistent bundle manifest format".into());
     }
-    validate_ref_name(&manifest.head)?;
+    validate_head_identity(&manifest.head)?;
+    if valid_id(&manifest.head) && !matches!(objects.get(&manifest.head), Some(Object::Commit(_))) {
+        return Err("detached HEAD references a missing or non-commit object".into());
+    }
     for (name, id) in &manifest.refs {
         validate_ref_name(name)?;
         require_id(id)?;
@@ -5411,6 +5473,7 @@ fn reachable_objects(
             .refs
             .values()
             .chain(manifest.tags.values())
+            .chain(valid_id(&manifest.head).then_some(&manifest.head))
             .cloned(),
         objects,
     )
@@ -5549,6 +5612,21 @@ fn snapshot_revision(snapshot: &Snapshot, revision: &str) -> RepositoryResult<St
     while !suffix.is_empty() {
         let operator = suffix.as_bytes()[0];
         suffix = &suffix[1..];
+        if operator == b'^' && suffix.starts_with('{') {
+            let (kind, rest) = suffix[1..]
+                .split_once('}')
+                .ok_or("unterminated revision peel")?;
+            if !matches!(kind, "" | "commit" | "object") {
+                return Err(format!(
+                    "expected a commit revision, unsupported peel: {kind:?}"
+                ));
+            }
+            suffix = rest;
+            if !suffix.is_empty() && !suffix.starts_with(['~', '^']) {
+                return Err("invalid suffix after revision peel".into());
+            }
+            continue;
+        }
         let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
         let count = if digits == 0 {
             1
@@ -5590,13 +5668,15 @@ fn snapshot_revision(snapshot: &Snapshot, revision: &str) -> RepositoryResult<St
 }
 
 fn snapshot_base_revision(snapshot: &Snapshot, revision: &str) -> RepositoryResult<String> {
+    if let Some(id) = revision_syntax::special_revision(snapshot, revision)? {
+        return Ok(id);
+    }
     let mut candidates = Vec::new();
     if revision == "HEAD" {
         candidates.push(
             snapshot
                 .manifest
-                .refs
-                .get(&snapshot.manifest.head)
+                .tip()
                 .cloned()
                 .ok_or_else(|| format!("branch {} has no commits", snapshot.manifest.head))?,
         );
@@ -6176,6 +6256,9 @@ fn decode_bundle(bytes: &[u8]) -> RepositoryResult<Snapshot> {
     Ok(Snapshot {
         manifest,
         upstreams: BTreeMap::new(),
+        upstream_tips: BTreeMap::new(),
+        checkouts: Vec::new(),
+        head_reflog: Vec::new(),
         tracking: BTreeMap::new(),
         reflog: Vec::new(),
         encoded,
@@ -6290,15 +6373,15 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             };
             let repo = Repository::open(root)?;
             let state = repo.state()?;
-            let outcome = if no_ff.is_empty() { repo.merge_ff_only_on_branch(target,message,&state.head,state.branches.get(&state.head).map(String::as_str))? }
-            else { repo.merge_no_ff_on_branch(target,message,&state.head,state.branches.get(&state.head).map(String::as_str))? };
+            let outcome = if no_ff.is_empty() { repo.merge_ff_only_on_branch(target,message,&state.head,state.tip().map(String::as_str))? }
+            else { repo.merge_no_ff_on_branch(target,message,&state.head,state.tip().map(String::as_str))? };
             serde_json::to_string_pretty(&outcome)
                 .map_err(|e| format!("encode merge outcome: {e}"))
         }
         "merge" if args.len() == 5 && matches!(args[3].as_str(), "-m" | "--message") => {
             let repo = Repository::open(&args[1])?;
             let state = repo.state()?;
-            let outcome = repo.merge_on_branch(&args[2], &args[4], &state.head, state.branches.get(&state.head).map(String::as_str))?;
+            let outcome = repo.merge_on_branch(&args[2], &args[4], &state.head, state.tip().map(String::as_str))?;
             serde_json::to_string_pretty(&outcome)
                 .map_err(|e| format!("encode merge outcome: {e}"))
         }
@@ -6432,7 +6515,7 @@ mod tests {
         anchor: Option<&str>,
     ) -> String {
         let state = repo.state().unwrap();
-        let parent = state.branches.get(&state.head);
+        let parent = state.tip();
         let parents: Vec<_> = parent.cloned().into_iter().collect();
         repo.commit_files_on_branch(
             files,
@@ -6544,6 +6627,49 @@ mod tests {
         )
         .unwrap();
         prepared
+    }
+
+    #[test]
+    fn detached_prepared_continuation_recovers_publication_and_local_reflog_exactly_once() {
+        let temp = TempDirectory::new();
+        let (repo, head, target) = pending_fixture(&temp, "detached-recovery");
+        repo.detach_head(&head).unwrap();
+        let mut request = pending_request(&repo, "merge", &head, &target);
+        request.branch = head.clone();
+        let pending = repo.record_pending(request).unwrap();
+        let result = files(&[("a.wasm", wasm(&[0, 2, 0, 40]))]);
+        let raw = pending_index_bytes(&result, None);
+        let prepared = prepare_pending_fixture(&repo, &pending, &result, &raw);
+        let commit = prepared.prepared.as_ref().unwrap().commit.clone();
+        let objects = repo.snapshot().unwrap().encoded;
+        // Simulate interruption immediately after the true HEAD file was
+        // published, before either completion log or journal cleanup.
+        fs::write(repo.metadata.join("HEAD"), format!("{commit}\n")).unwrap();
+        fs::remove_file(repo.metadata.join("head-reflog.json")).unwrap();
+        let old_log = repo.reflog().unwrap().len();
+        let outcome = repo.continue_pending(&prepared, None).unwrap();
+        assert!(outcome.already_published && outcome.resumed_prepared);
+        assert_eq!(outcome.commit, commit);
+        assert_eq!(repo.state().unwrap().head, commit);
+        assert_eq!(repo.resolve("main").unwrap(), head);
+        assert_eq!(repo.snapshot().unwrap().encoded, objects);
+        assert_eq!(repo.reflog().unwrap().len(), old_log + 1);
+        let local_log = repo.read_head_reflog().unwrap();
+        assert_eq!(local_log.len(), 1);
+        assert_eq!(local_log[0].old.as_ref(), Some(&head));
+        assert_eq!(local_log[0].new.as_ref(), Some(&commit));
+        fs::write(
+            repo.metadata.join("pending.json"),
+            encode_pending(&prepared).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            repo.continue_pending(&prepared, None)
+                .unwrap()
+                .already_published
+        );
+        assert_eq!(repo.read_head_reflog().unwrap(), local_log);
+        assert_eq!(repo.reflog().unwrap().len(), old_log + 1);
     }
 
     #[test]
@@ -8420,6 +8546,12 @@ mod tests {
         assert_eq!(stored_state(&repo), before);
         let log = fs::read(repo.metadata.join("reflog")).unwrap();
         fs::remove_file(repo.metadata.join("reflog")).unwrap();
+        assert_eq!(
+            repo.query_objects().unwrap().root_commits,
+            report.root_commits
+        );
+        let head_log = fs::read(repo.metadata.join("head-reflog.json")).unwrap();
+        fs::remove_file(repo.metadata.join("head-reflog.json")).unwrap();
         let without_log = repo.query_objects().unwrap();
         assert_eq!(
             (without_log.root_commits, without_log.unreachable_objects),
@@ -8432,6 +8564,7 @@ mod tests {
             .iter()
             .any(|row| row.id == held));
         fs::write(repo.metadata.join("reflog"), log).unwrap();
+        fs::write(repo.metadata.join("head-reflog.json"), head_log).unwrap();
         let mut maximum = u64::MAX;
         assert!(add_query_bytes(&mut maximum, 1).is_err());
         assert_eq!(maximum, u64::MAX);

@@ -884,7 +884,7 @@ fn print_usage() {
     eprintln!("  show <DIR> <REV> [--file PATH] [--output NEW_FILE] | checkout <DIR> <REV> <NEW_FILE> [--file PATH]");
     eprintln!("  checkout <DIR> <BRANCH> | checkout <DIR> -b <NAME> [REV]");
     eprintln!("  checkout <DIR> [REV] -- <PATH>...");
-    eprintln!("  branch <DIR> [NAME [REV]] | switch <DIR> <NAME>");
+    eprintln!("  branch <DIR> [NAME [REV]|-r|-a|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]] | switch <DIR> <NAME|-> [or --detach REV|--orphan NAME]");
     eprintln!("  branch <DIR> -u <REMOTE/BRANCH> [NAME] | branch <DIR> --unset-upstream [NAME] | branch <DIR> -vv");
     eprintln!("  clone <SOURCE_DIR> <NEW_DIR> | bundle <DIR> <NEW_BUNDLE_FILE>");
     eprintln!("  unbundle <DIR> <BUNDLE> <BRANCH> | fsck <DIR>");

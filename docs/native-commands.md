@@ -41,7 +41,7 @@ wasm-git rev-list DIR A...B
 
 旧的两个裸端点形式保留“全部 base 的 JSON 数组”输出；`--text` 可明确选择逐行形式，`--json` 可为新选项形式选择 JSON。`--is-ancestor` 不输出内容，成立退出 0，不成立退出 1。新选项形式找不到 base/fork point 也退出 1，参数或对象错误退出 2；旧 JSON 形式仍以成功的空数组表示没有共同祖先。
 
-`--fork-point` 同时查看所选实际引用的当前 tip 和本机 reflog 中记录的旧/新 tip；只有唯一最佳 base 确实是某次记录的引用 tip 时才返回，不能从更早的普通共同祖先猜测。未给 TOPIC 时使用 HEAD。HEAD 在本模型中解析为当前分支的日志；远端 tracking 尚无历史 reflog，仅有当前 tip 可作为证据。所有查询都使用一个已验证快照，不移动 HEAD、index、工作字节或引用，也不创建假想 merge 对象。图语义参照 [Git merge-base](https://git-scm.com/docs/git-merge-base)，对象和日志仍采用 uwgit 原生格式。
+`--fork-point` 同时查看所选实际引用的当前 tip 和本机 reflog 中记录的旧/新 tip；只有唯一最佳 base 确实是某次记录的引用 tip 时才返回，不能从更早的普通共同祖先猜测。未给 TOPIC 时使用 HEAD。HEAD 使用当前工作树自己的 HEAD 日志；远端 tracking 尚无历史 reflog，仅有当前 tip 可作为证据。所有查询都使用一个已验证快照，不移动 HEAD、index、工作字节或引用，也不创建假想 merge 对象。图语义参照 [Git merge-base](https://git-scm.com/docs/git-merge-base)，对象和日志仍采用 uwgit 原生格式。
 
 分支、标签可使用 `feature/x` 这样的正常层级名称。空组件、`.`、`..`、`.lock` 后缀组件及 `refs/` 前缀不能作为分支名。名字最多 128 字节，使用 ASCII 字母、数字、`.`、`_`、`-`、`/`，首字符为字母或数字。名称与完整 `refs/heads/…`、`refs/tags/…`、`refs/remotes/…` 查询分别处理；同名候选有不同目标时报告歧义。
 
@@ -149,7 +149,7 @@ maintenance 支持 verify 和 gc，未实现的任务明确拒绝。所有维护
 
 ## 覆盖范围
 
-上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；仍需 detached HEAD、交互式/保留 merge 拓扑的 rebase、多目标 replay 队列、更多 pathspec 与引用事务、索引标志、浅层/稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
+上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。仍需交互式/保留 merge 拓扑的 rebase、多目标 replay 队列、更多 pathspec 与引用事务、索引标志、浅层/稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
 
 ## 合并策略
 

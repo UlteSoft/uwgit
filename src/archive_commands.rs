@@ -54,21 +54,8 @@ fn once(seen: &mut BTreeSet<String>, key: &str) -> RepositoryResult<()> {
 }
 
 fn validate_selector(value: &str) -> RepositoryResult<()> {
-    let base = value.strip_suffix('/').unwrap_or(value);
-    if base != "." {
-        repository::validate_tree_path(base)?;
-    }
+    wasm_git::pathspec::Pathspec::new(&[value.into()])?;
     Ok(())
-}
-
-fn matches_selector(path: &str, selector: &str) -> bool {
-    let directory_only = selector.ends_with('/');
-    let base = selector.strip_suffix('/').unwrap_or(selector);
-    base == "."
-        || (!directory_only && path == base)
-        || path
-            .strip_prefix(base)
-            .is_some_and(|tail| tail.starts_with('/'))
 }
 
 fn parse(args: &[String]) -> RepositoryResult<Mode> {
@@ -288,19 +275,9 @@ pub fn archive_query(args: &[String]) -> RepositoryResult<QueryOutput> {
             std::mem::take(&mut source.files)
         }
     };
-    for selector in &options.selectors {
-        if !files.keys().any(|path| matches_selector(path, selector)) {
-            return Err(format!("archive path selector has no match: {selector:?}"));
-        }
-    }
-    if !options.selectors.is_empty() {
-        files.retain(|path, _| {
-            options
-                .selectors
-                .iter()
-                .any(|selector| matches_selector(path, selector))
-        });
-    }
+    let selected =
+        wasm_git::pathspec::select(&files.keys().cloned().collect(), &options.selectors)?;
+    files.retain(|path, _| selected.contains(path));
     let archive = archive_bytes(&files, &options.prefix)?;
     let file_report: Vec<_> = files
         .iter()

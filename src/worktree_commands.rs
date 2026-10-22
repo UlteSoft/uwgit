@@ -19,6 +19,8 @@ enum Action {
         revision: Option<String>,
         #[arg(short = 'b')]
         branch: Option<String>,
+        #[arg(short = 'd', long, conflicts_with = "branch")]
+        detach: bool,
         #[arg(long)]
         legacy_path: Option<String>,
     },
@@ -71,9 +73,12 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             path,
             revision,
             branch,
+            detach,
             legacy_path,
         } => {
-            let (branch, revision) = if let Some(branch) = branch {
+            let (branch, revision) = if detach {
+                (repo.resolve(revision.as_deref().unwrap_or("HEAD"))?, None)
+            } else if let Some(branch) = branch {
                 (branch, Some(revision.unwrap_or_else(|| "HEAD".into())))
             } else if let Some(branch) = revision {
                 (branch, None)
@@ -117,12 +122,16 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
                                 "0000000000000000000000000000000000000000000000000000000000000000"
                             )
                         ),
-                        format!(
-                            "branch refs/heads/{}",
-                            worktree["branch"]
-                                .as_str()
-                                .ok_or("missing worktree branch")?
-                        ),
+                        if worktree["detached"] == true {
+                            "detached".into()
+                        } else {
+                            format!(
+                                "branch refs/heads/{}",
+                                worktree["branch"]
+                                    .as_str()
+                                    .ok_or("missing worktree branch")?
+                            )
+                        },
                     ] {
                         output.push_str(&row);
                         output.push(separator);

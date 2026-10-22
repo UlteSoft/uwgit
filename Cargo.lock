@@ -519,6 +519,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "colored",
+ "globset",
  "ignore",
  "serde",
  "serde_json",

@@ -77,12 +77,16 @@ wasm-git restore ./peer --source HEAD --staged --worktree
 | `reset DIR [REV] -- PATH...` | 从 REV（默认 HEAD）恢复所选 index 条目，保留 HEAD、工作文件和其他暂存内容；不能组合 soft/mixed/hard。 |
 | `switch DIR NAME` | 切换分支，已有 index 时同步完整文件树；要求 staged 与工作区无改动。 |
 | `switch DIR -c NAME [REV]` | 创建并切换分支；新仓库可重命名 unborn HEAD。 |
+| `switch DIR --detach [REV]` | 真实 HEAD 指向提交 ID，后续提交不移动原分支；已有 index 时同步完整树。 |
+| `switch DIR --orphan NAME` | 新 unborn 分支，清空干净的受控树与 index，保留 untracked；首个提交没有父提交。 |
+| `switch DIR -` | 返回当前工作树上一检出身份，可为分支或 detached ID。 |
 | `checkout DIR NAME`、`checkout DIR -b NAME [REV]` | 分别复用 switch 与 switch -c 的分支切换和保护。 |
 | `checkout DIR -- PATH...` | 从 index 恢复选中工作路径，index 和 HEAD 不变。 |
 | `checkout DIR REV -- PATH...` | 从 REV 按 overlay 规则恢复选中 index 与工作路径，HEAD 不变。 |
 
 restore、checkout 路径模式及 reset 路径模式支持精确文件、目录前缀和 `.`／`./`，并允许单次开头的 `./`。
-末尾单个 `/` 表示目录，只匹配后代，不匹配同名普通文件。中间空组件、`.`、`..` 与元数据路径仍被拒绝；不解释 glob 或 Git pathspec magic。
+末尾单个 `/` 表示目录，只匹配后代，不匹配同名普通文件。中间空组件、`.`、`..` 与元数据路径仍被拒绝。
+现已共享 glob/literal/icase/top/exclude 路径选择，具体规则与 HEAD/分支扩展见 [HEAD 与路径选择](head-and-pathspec.md)。
 每个显式选择器都必须匹配候选路径，任一未匹配时全部拒绝，不再无操作报告成功。显式 `--` 后必须有路径；restore 不带路径仍保持整树恢复用法。
 普通 restore 和 reset 路径模式从 index／source 并集选择，支持源树中的删除；overlay 从 source 选择，精确路径不在 source 时拒绝。
 overlay 只额外移除与所选源路径有文件／目录前缀冲突的受控条目，其他源树缺席条目保持不变；untracked 阻挡项仍会使全部操作在写入前失败。

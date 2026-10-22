@@ -53,13 +53,19 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
         Action::SymbolicRef {
             dir,
             short,
-            quiet: _,
+            quiet,
             message,
             reference,
             target,
         } => {
             if reference != "HEAD" {
                 return Err("HEAD is the native symbolic reference".into());
+            }
+            if target.is_none() && Repository::open(&dir)?.state()?.detached() {
+                if quiet {
+                    return Ok(QueryOutput::new(String::new(), 1));
+                }
+                return Err("HEAD is detached".into());
             }
             let target = target
                 .as_deref()

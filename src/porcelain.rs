@@ -22,7 +22,7 @@ pub use worktree_tools::squash_merge;
 const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
-const USAGE: &str = "tree commands: add DIR [--] FILE...; status DIR; commit DIR [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME; switch DIR -c NAME [REV]; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
+const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [--] PATHSPEC...; status DIR; commit DIR [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 type Files = BTreeMap<String, Vec<u8>>;
 type Worktree = BTreeMap<String, Option<Vec<u8>>>;
@@ -461,7 +461,7 @@ impl State {
 
     fn head(&self) -> Result<Option<String>, String> {
         let state = self.repo.state()?;
-        Ok(state.branches.get(&state.head).cloned())
+        Ok(state.tip().cloned())
     }
 
     fn save_index(&self, index: &Index) -> Result<(), String> {
@@ -907,23 +907,69 @@ fn path_operands(args: &[String]) -> Vec<String> {
     paths
 }
 fn add(state: &State, paths: &[String]) -> Result<String, String> {
-    let paths = path_operands(paths);
-    if paths.is_empty() {
+    let (mut all, mut update, mut force, mut dry_run, mut literal) =
+        (false, false, false, false, false);
+    let mut selectors = Vec::new();
+    for arg in paths {
+        if literal {
+            selectors.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => literal = true,
+            "-A" | "--all" => all = true,
+            "-u" | "--update" => update = true,
+            "-f" | "--force" => force = true,
+            "-n" | "--dry-run" => dry_run = true,
+            option if option.starts_with('-') => {
+                return Err(format!("unsupported add option: {option}"))
+            }
+            _ => selectors.push(arg.clone()),
+        }
+    }
+    if all && update {
+        return Err("add --all and --update are mutually exclusive".into());
+    }
+    if selectors.is_empty() && !all && !update {
         return Err(USAGE.into());
     }
-    let mut index = state.starting_index(paths.first().map(String::as_str))?;
-    for path in &paths {
-        validate_tree_path(path)?;
-        let bytes = state
-            .worktree(path)?
-            .ok_or_else(|| format!("file does not exist: {path}"))?;
-        validate_wasm(&bytes)?;
-        index.files.insert(path.clone(), bytes);
+    let anchor = selectors
+        .first()
+        .filter(|path| {
+            selectors.len() == 1
+                && !path.contains(['*', '?', '[', ':'])
+                && validate_tree_path(path).is_ok()
+        })
+        .map(String::as_str);
+    let mut index = state.starting_index(anchor)?;
+    let mut candidates: BTreeSet<_> = index.files.keys().cloned().collect();
+    if !update {
+        for path in worktree_tools::visible_paths(&state.repo.root, !force)? {
+            let full = state.worktree_path(&path)?;
+            if full.is_file() && has_wasm_header(&full)? {
+                candidates.insert(path);
+            }
+        }
     }
-    state.save_index(&index)?;
+    let selected = select_paths(&candidates, &selectors)?;
+    for path in &selected {
+        match state.worktree(path)? {
+            Some(bytes) => {
+                validate_wasm(&bytes)?;
+                index.files.insert(path.clone(), bytes);
+            }
+            None => {
+                index.files.remove(path);
+            }
+        }
+    }
+    if !dry_run && !selected.is_empty() {
+        state.save_index(&index)?;
+    }
     Ok(format!(
-        "staged {} paths; {} paths in index",
-        paths.len(),
+        "{} {} paths; {} paths in index",
+        if dry_run { "would stage" } else { "staged" },
+        selected.len(),
         index.files.len()
     ))
 }
@@ -986,7 +1032,7 @@ fn pending_status(
     current_head: Option<&String>,
 ) -> Value {
     let already_published = pending.prepared.as_ref().is_some_and(|prepared| {
-        current_branch == pending.branch && current_head == Some(&prepared.commit)
+        pending.matches_head_identity(current_branch) && current_head == Some(&prepared.commit)
     });
     let matches_original = current_branch == pending.branch && current_head == Some(&pending.head);
     let mut report = json!({
@@ -1036,7 +1082,7 @@ fn status(state: &State) -> Result<String, String> {
                 return Err(error);
             };
             let snapshot = state.repo.state()?;
-            let head = snapshot.branches.get(&snapshot.head);
+            let head = snapshot.tip();
             return json_text(&json!({
                 "format":2,
                 "branch":snapshot.head,
@@ -1054,7 +1100,7 @@ fn status(state: &State) -> Result<String, String> {
         }
     };
     let snapshot = state.repo.state()?;
-    let head_id = snapshot.branches.get(&snapshot.head);
+    let head_id = snapshot.tip();
     let anchor = actual.as_ref().and_then(|i| i.legacy_path.as_deref());
     let raw = head_id.map(|id| state.repo.files_at(id)).transpose()?;
     let unmapped = raw
@@ -1107,7 +1153,7 @@ fn status(state: &State) -> Result<String, String> {
     } else {
         None
     };
-    let mut report = json!({"format":2,"branch":snapshot.head,"head":head_id,"index_present":actual.is_some(),"legacy_head_unmapped":unmapped,"legacy_head_byte_len":raw.as_ref().and_then(|r|r.legacy.as_ref().map(Vec::len)),"files":rows,"untracked":untracked,"tracked":singleton,"staged":staged_any,"worktree":if modified{"modified"}else if deleted{"deleted"}else if actual.is_none()&&index.files.is_empty(){"untracked"}else{"clean"}});
+    let mut report = json!({"format":2,"branch":snapshot.head,"detached":snapshot.detached(),"head":head_id,"index_present":actual.is_some(),"legacy_head_unmapped":unmapped,"legacy_head_byte_len":raw.as_ref().and_then(|r|r.legacy.as_ref().map(Vec::len)),"files":rows,"untracked":untracked,"tracked":singleton,"staged":staged_any,"worktree":if modified{"modified"}else if deleted{"deleted"}else if actual.is_none()&&index.files.is_empty(){"untracked"}else{"clean"}});
     if let Some(pending) = pending {
         report["pending"] = pending_status(&pending, &snapshot.head, head_id);
     }
@@ -1135,7 +1181,7 @@ fn commit(state: &State, args: &[String]) -> Result<String, String> {
         cursor += 1;
     }
     let snapshot = state.repo.state()?;
-    let head = snapshot.branches.get(&snapshot.head);
+    let head = snapshot.tip();
     let previous = head.map(|id| state.repo.read_commit(id)).transpose()?;
     if amend && previous.is_none() {
         return Err("cannot amend an unborn branch".into());
@@ -1523,7 +1569,12 @@ fn change_and_sync(
     let index = clean_index(state)?;
     let old = state.head()?;
     let result = operation(&state.repo)?;
-    if !allow_branch_change && state.repo.current_branch()? != branch {
+    let current = state.repo.current_branch()?;
+    if !allow_branch_change
+        && current != branch
+        && !(crate::repository::is_detached_identity(&branch)
+            && crate::repository::is_detached_identity(&current))
+    {
         return Err("operation completed, but branch changed; index/worktree not updated".into());
     }
     let new = state
@@ -1616,8 +1667,7 @@ pub fn with_pending_index(
     let pending = state.repo.pending()?.ok_or("no pending operation")?;
     let snapshot = state.repo.state()?;
     let published = pending.prepared.as_ref().is_some_and(|prepared| {
-        snapshot.head == pending.branch
-            && snapshot.branches.get(&pending.branch) == Some(&prepared.commit)
+        pending.matches_head_identity(&snapshot.head) && snapshot.tip() == Some(&prepared.commit)
     });
     let without_resolution_index = pending.prepared.is_some()
         && pending.rebase.as_ref().is_some_and(|rebase| {
@@ -1784,7 +1834,7 @@ pub fn diff_snapshot(root: &str, cached: bool) -> Result<Vec<FileDiffSnapshot>, 
     let _lock = state.lock()?;
     let index = state.starting_index(None)?;
     let snapshot = state.repo.state()?;
-    let head = snapshot.branches.get(&snapshot.head);
+    let head = snapshot.tip();
     let (old, new, old_kind, new_kind) = if cached {
         let h = head
             .map(|id| state.revision_index(id, index.legacy_path.as_deref()))
@@ -1871,7 +1921,9 @@ fn resolve_revision(repo: &Repository, revision: &str) -> Result<String, String>
 fn branch_verbose(state: &State) -> Result<String, String> {
     let snapshot = state.repo.state()?;
     let mut names: BTreeSet<_> = snapshot.branches.keys().cloned().collect();
-    names.insert(snapshot.head.clone());
+    if !snapshot.detached() {
+        names.insert(snapshot.head.clone());
+    }
     let mut branches = Vec::new();
     for name in names {
         let upstream = crate::remote::upstream_status(&state.repo, &name)?.map(|upstream| {
@@ -1890,7 +1942,9 @@ fn branch_verbose(state: &State) -> Result<String, String> {
             "upstream":upstream
         }));
     }
-    json_text(&json!({"format":1,"branches":branches}))
+    json_text(
+        &json!({"format":1,"head":snapshot.head,"detached":snapshot.detached(),"branches":branches}),
+    )
 }
 
 fn configure_branch_upstream(
@@ -1913,6 +1967,16 @@ fn branch(state: &State, args: &[String]) -> Result<String, String> {
     match &args[2..] {
         [] => {
             let snapshot = state.repo.state()?;
+            if snapshot.detached() {
+                let mut lines = vec![format!("* (HEAD detached at {})", snapshot.head)];
+                lines.extend(
+                    snapshot
+                        .branches
+                        .iter()
+                        .map(|(name, id)| format!("  {name} {id}")),
+                );
+                return Ok(lines.join("\n"));
+            }
             if snapshot.branches.is_empty() {
                 return Ok(format!("* {} (no commits)", snapshot.head));
             }
@@ -1960,6 +2024,54 @@ fn branch(state: &State, args: &[String]) -> Result<String, String> {
             state.repo.rename_branch(old, new)?;
             Ok(format!("renamed {old} to {new}"))
         }
+        [option, name] if matches!(option.as_str(), "-M" | "-c" | "-C") => {
+            require_no_pending(&state.repo)?;
+            state.repo.rename_branch_mode(
+                &state.repo.current_branch()?,
+                name,
+                option != "-c",
+                option != "-M",
+            )?;
+            Ok(format!("branch {option} -> {name}"))
+        }
+        [option, old, new] if matches!(option.as_str(), "-M" | "-c" | "-C") => {
+            require_no_pending(&state.repo)?;
+            state
+                .repo
+                .rename_branch_mode(old, new, option != "-c", option != "-M")?;
+            Ok(format!("branch {option} {old} -> {new}"))
+        }
+        [option, name] | [option, name, _] if matches!(option.as_str(), "-f" | "--force") => {
+            require_no_pending(&state.repo)?;
+            state
+                .repo
+                .force_branch(name, args.get(4).map_or("HEAD", String::as_str))
+        }
+        [option] if matches!(option.as_str(), "-r" | "--remotes" | "-a" | "--all") => {
+            let report = state.repo.query_refs()?;
+            Ok(report
+                .refs
+                .into_iter()
+                .filter(|reference| {
+                    option == "-a"
+                        || option == "--all"
+                        || reference.name.starts_with("refs/remotes/")
+                })
+                .filter(|reference| !reference.name.starts_with("refs/tags/"))
+                .map(|reference| {
+                    format!(
+                        "{} {} {}",
+                        if reference.current { "*" } else { " " },
+                        reference
+                            .name
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(&reference.name),
+                        reference.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
         [name] if !name.starts_with('-') => state.repo.create_branch(name, "HEAD"),
         [name, revision] if !name.starts_with('-') => state.repo.create_branch(name, revision),
         _ => Err(USAGE.into()),
@@ -1967,6 +2079,55 @@ fn branch(state: &State, args: &[String]) -> Result<String, String> {
 }
 
 fn switch(state: &State, args: &[String]) -> Result<String, String> {
+    if args.get(2).is_some_and(|value| value == "-") && args.len() == 3 {
+        let previous = state.repo.previous_checkout_branch(1)?;
+        if crate::repository::is_detached_identity(&previous) {
+            return switch(
+                state,
+                &[
+                    "switch".into(),
+                    args[1].clone(),
+                    "--detach".into(),
+                    previous,
+                ],
+            );
+        }
+        return switch(state, &["switch".into(), args[1].clone(), previous]);
+    }
+    if matches!(args.get(2).map(String::as_str), Some("--detach" | "-d"))
+        && (3..=4).contains(&args.len())
+    {
+        let revision = args.get(3).map_or("HEAD", String::as_str);
+        let id = state.repo.resolve(revision)?;
+        if let Some(index) = clean_index(state)? {
+            let target = state.revision_index(&id, index.legacy_path.as_deref())?;
+            plan(state, &keys(&index.files), &files_worktree(&target.files))?;
+        }
+        return change_and_sync(state, true, |repo| {
+            repo.detach_head(&id)
+                .map(|id| format!("HEAD detached at {id}"))
+        });
+    }
+    if args.get(2).is_some_and(|value| value == "--orphan") && args.len() == 4 {
+        let index = clean_index(state)?;
+        let target = Index::empty();
+        let changes = plan(
+            state,
+            &index
+                .as_ref()
+                .map(|index| keys(&index.files))
+                .unwrap_or_default(),
+            &files_worktree(&target.files),
+        )?;
+        state.repo.orphan_head(&args[3])?;
+        apply_plan(state, &changes).map_err(|error| {
+            format!("orphan HEAD was published; worktree restoration incomplete: {error}")
+        })?;
+        state.save_index(&target).map_err(|error| {
+            format!("orphan HEAD and worktree published; index update failed: {error}")
+        })?;
+        return Ok(format!("HEAD -> {} (orphan)", args[3]));
+    }
     let (name, revision, create) = match &args[2..] {
         [name] if !name.starts_with('-') => (name, "HEAD", false),
         [op, name] if op == "-c" => (name, "HEAD", true),
@@ -2118,37 +2279,7 @@ fn select_paths(
     candidates: &BTreeSet<String>,
     selectors: &[String],
 ) -> Result<BTreeSet<String>, String> {
-    if selectors.is_empty() {
-        return Ok(candidates.clone());
-    }
-    let mut selected = BTreeSet::new();
-    for original in selectors {
-        let matched: Vec<_> = if matches!(original.as_str(), "." | "./") {
-            candidates.iter().cloned().collect()
-        } else {
-            // A single leading ./ and trailing / are selector notation only.
-            // Interior dot/empty components and repeated separators stay invalid.
-            let directory_only = original.ends_with('/');
-            let path = original.strip_prefix("./").unwrap_or(original);
-            let path = path.strip_suffix('/').unwrap_or(path);
-            validate_tree_path(path)?;
-            let prefix = format!("{path}/");
-            candidates
-                .iter()
-                .filter(|candidate| {
-                    (!directory_only && *candidate == path) || candidate.starts_with(&prefix)
-                })
-                .cloned()
-                .collect()
-        };
-        if matched.is_empty() {
-            return Err(format!(
-                "path selector did not match any tracked or source path: {original:?}"
-            ));
-        }
-        selected.extend(matched);
-    }
-    Ok(selected)
+    wasm_git::pathspec::select(candidates, selectors)
 }
 fn restore(state: &State, args: &[String]) -> Result<String, String> {
     let mut source = None;
@@ -2406,7 +2537,7 @@ fn reset(state: &State, args: &[String]) -> Result<String, String> {
     };
     let old = state.index()?;
     let s = state.repo.state()?;
-    let head = s.branches.get(&s.head);
+    let head = s.tip();
     let id = state.repo.resolve(rev)?;
     let target = if mode == "--soft" {
         None

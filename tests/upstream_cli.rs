@@ -380,6 +380,112 @@ fn unborn_and_new_branches_never_guess_an_upstream_and_help_is_readonly() {
 }
 
 #[test]
+fn branch_copy_and_forced_replacement_copy_or_clear_the_actual_upstream_binding() {
+    let fixture = Fixture::new();
+    fixture.fetch();
+    fixture.ok(&["branch", fixture.repo(), "-u", "origin/main"]);
+    fixture.ok(&["branch", fixture.repo(), "-c", "main", "copy"]);
+    assert_eq!(
+        branch(&fixture.json(&["branch", fixture.repo(), "-vv"]), "copy")["upstream"]["tracking"],
+        "origin/main"
+    );
+    fixture.ok(&["branch", fixture.repo(), "-C", "feature", "copy"]);
+    assert!(
+        branch(&fixture.json(&["branch", fixture.repo(), "-vv"]), "copy")["upstream"].is_null()
+    );
+    fixture.ok(&["branch", fixture.repo(), "-M", "main", "copy"]);
+    assert_eq!(
+        branch(&fixture.json(&["branch", fixture.repo(), "-vv"]), "copy")["upstream"]["tracking"],
+        "origin/main"
+    );
+    assert_eq!(fixture.head("HEAD"), fixture.head("copy"));
+    let remotes = fixture.ok(&["branch", fixture.repo(), "-r"]);
+    assert!(remotes.contains("refs/remotes/origin/main"));
+    assert!(!remotes.contains("refs/heads/"));
+}
+
+#[test]
+fn safe_branch_deletion_prefers_the_verified_upstream_tip_over_head() {
+    let fixture = Fixture::new();
+    run(&["switch", path(&fixture.source), "feature"]);
+    fs::write(fixture.source.join("a.wasm"), UNKNOWN).unwrap();
+    run(&["add", path(&fixture.source), "a.wasm"]);
+    run(&["commit", path(&fixture.source), "-m", "upstream change"]);
+    fixture.publish("feature");
+    fixture.fetch();
+    fixture.ok(&["branch", fixture.repo(), "topic", "origin/feature"]);
+    fixture.ok(&["branch", fixture.repo(), "-u", "origin/feature", "topic"]);
+    assert_ne!(fixture.head("topic"), fixture.head("HEAD"));
+    fixture.ok(&["branch", fixture.repo(), "-d", "topic"]);
+    fixture.reject(&["rev-parse", fixture.repo(), "topic"]);
+}
+
+#[test]
+fn network_detached_head_advertisements_fetch_and_clone_preserve_the_native_pointer() {
+    let fixture = Fixture::new();
+    run(&["switch", path(&fixture.service), "--detach", "HEAD"]);
+    let tip = run(&["rev-parse", path(&fixture.service), "HEAD"])
+        .trim()
+        .to_owned();
+    fixture.fetch();
+    let advertisement = fixture.ok(&["ls-remote", fixture.repo(), "origin", "--symref"]);
+    assert!(advertisement.contains(&format!("{tip}\tHEAD")));
+    assert!(!advertisement.contains("ref: "));
+    let destination = fixture.root.join("detached-network-clone");
+    fixture.ok(&["clone", &fixture.url, path(&destination)]);
+    assert_eq!(
+        fs::read(destination.join(".uwgit/HEAD")).unwrap(),
+        format!("{tip}\n").as_bytes()
+    );
+    let status: Value = serde_json::from_str(&run(&["status", path(&destination)])).unwrap();
+    assert_eq!(status["detached"], true);
+    assert_eq!(status["head"], tip);
+    fixture.ok(&["fsck", path(&destination)]);
+}
+
+#[test]
+fn upstream_revision_ancestry_is_shared_by_history_object_and_graph_commands() {
+    let fixture = Fixture::new();
+    let base = fixture.head("HEAD");
+    fs::write(fixture.source.join("a.wasm"), UNKNOWN).unwrap();
+    run(&["add", path(&fixture.source), "a.wasm"]);
+    run(&["commit", path(&fixture.source), "-m", "next"]);
+    fixture.publish("main");
+    fixture.fetch();
+    fixture.ok(&["branch", fixture.repo(), "-u", "origin/main"]);
+    assert_eq!(fixture.head("@{u}~1"), base);
+    assert_eq!(fixture.head("main@{UPSTREAM}^{commit}^"), base);
+    let log = fixture.json(&["log", fixture.repo(), "@{u}~1"]);
+    assert_eq!(log.as_array().unwrap().len(), 1);
+    assert_eq!(
+        fixture
+            .ok(&["cat-file", fixture.repo(), "-t", "@{U}^{commit}"])
+            .trim(),
+        "commit"
+    );
+    assert_eq!(
+        fixture
+            .ok(&["merge-base", fixture.repo(), "--text", "HEAD", "@{u}"])
+            .trim(),
+        base
+    );
+    assert_eq!(
+        fixture
+            .ok(&["rev-list", fixture.repo(), "--count", "HEAD..@{u}"])
+            .trim(),
+        "1"
+    );
+    let config = fixture.local.join(".uwgit/remotes/origin.json");
+    let original = fs::read(&config).unwrap();
+    let mut value: Value = serde_json::from_slice(&original).unwrap();
+    value["url"] = serde_json::json!("ssh://test@different-host.invalid/unused");
+    fs::write(&config, serde_json::to_vec(&value).unwrap()).unwrap();
+    fixture.reject(&["log", fixture.repo(), "@{u}~0"]);
+    fixture.ok(&["log", fixture.repo(), "HEAD"]);
+    fs::write(&config, original).unwrap();
+}
+
+#[test]
 fn upstream_resolution_reads_the_new_tracking_tip_after_fetch_without_moving_local_branch() {
     let fixture = Fixture::new();
     fixture.fetch();

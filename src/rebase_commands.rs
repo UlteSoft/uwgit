@@ -81,8 +81,7 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             porcelain::with_pending_begin(root, |repo, baseline, anchor| {
                 let state = repo.state()?;
                 let head = state
-                    .branches
-                    .get(&state.head)
+                    .tip()
                     .ok_or("recorded rebase requires a committed HEAD")?;
                 let upstream = repo.read_commit(&upstream)?.id;
                 let onto = onto
@@ -91,7 +90,7 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
                     .transpose()?
                     .unwrap_or_else(|| upstream.clone());
                 let mut report = repo.begin_rebase_pending(PendingRebaseRequest {
-                    branch: state.head,
+                    branch: state.head.clone(),
                     head: head.clone(),
                     upstream,
                     onto,

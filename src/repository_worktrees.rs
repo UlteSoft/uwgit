@@ -42,7 +42,7 @@ fn registry(common: &Path) -> RepositoryResult<Worktrees> {
     let mut paths = BTreeSet::new();
     for (id, record) in &value.entries {
         require_id(id)?;
-        validate_ref_name(&record.branch)?;
+        validate_head_identity(&record.branch)?;
         if record
             .locked
             .as_ref()
@@ -165,6 +165,9 @@ impl Repository {
     }
 
     pub fn assert_branch_available(&self, branch: &str) -> RepositoryResult<()> {
+        if valid_id(branch) {
+            return Ok(());
+        }
         let records = registry(&self.common_metadata)?;
         if records.entries.is_empty() && self.common_metadata == self.metadata {
             return Ok(());
@@ -217,7 +220,7 @@ impl Repository {
             .to_path_buf();
         let branch = parse_ref_file(&read_regular(&self.common_metadata.join("HEAD"))?, false)?;
         let mut rows = vec![
-            json!({"path":primary,"branch":branch,"head":snapshot.manifest.refs.get(&branch),"primary":true,"locked":null,"missing":false}),
+            json!({"path":primary,"branch":if valid_id(&branch) { None } else { Some(&branch) },"head":head_tip(&branch,&snapshot.manifest.refs),"detached":valid_id(&branch),"primary":true,"locked":null,"missing":false}),
         ];
         for (id, record) in records.entries {
             let missing = match fs::symlink_metadata(&record.path) {
@@ -228,7 +231,7 @@ impl Repository {
                     return Err("registered worktree path is no longer a real directory".into())
                 }
             };
-            rows.push(json!({"id":id,"path":record.path,"branch":record.branch,"head":snapshot.manifest.refs.get(&record.branch),"primary":false,"locked":record.locked,"missing":missing}));
+            rows.push(json!({"id":id,"path":record.path,"branch":if valid_id(&record.branch) { None } else { Some(&record.branch) },"head":head_tip(&record.branch,&snapshot.manifest.refs),"detached":valid_id(&record.branch),"primary":false,"locked":record.locked,"missing":missing}));
         }
         Ok(json!({"schema_version":1,"shared_objects_and_refs":true,"worktrees":rows}))
     }
@@ -240,16 +243,16 @@ impl Repository {
         revision: Option<&str>,
         legacy_path: Option<&str>,
     ) -> RepositoryResult<Value> {
-        validate_ref_name(branch)?;
+        validate_head_identity(branch)?;
         let target = destination(target)?;
         let common = canonical(&self.common_metadata)?;
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         self.assert_branch_available(branch)?;
-        if branch == snapshot.manifest.head {
+        if !valid_id(branch) && branch == snapshot.manifest.head {
             return Err("a worktree requires a different branch from the calling worktree".into());
         }
-        let create = revision.is_some();
+        let create = revision.is_some() && !valid_id(branch);
         if create && snapshot.manifest.refs.contains_key(branch) {
             return Err("worktree branch already exists".into());
         }
@@ -276,6 +279,17 @@ impl Repository {
             fs::create_dir(&metadata).map_err(|error| error.to_string())?;
             fs::create_dir(metadata.join("tmp")).map_err(|error| error.to_string())?;
             write_new_file(&metadata.join("HEAD"), format!("{branch}\n").as_bytes())?;
+            let head_log = vec![ReflogEntry {
+                sequence: 1,
+                reference: "HEAD".into(),
+                old: None,
+                new: Some(id.clone()),
+                operation: "worktree-add".into(),
+            }];
+            write_new_file(
+                &metadata.join("head-reflog.json"),
+                &serde_json::to_vec(&head_log).map_err(|error| error.to_string())?,
+            )?;
             write_new_file(
                 &metadata.join("commondir"),
                 format!(
@@ -393,11 +407,12 @@ impl Repository {
         }
         let primary_branch =
             parse_ref_file(&read_regular(&self.common_metadata.join("HEAD"))?, false)?;
-        if primary_branch == branch
-            || records
-                .entries
-                .iter()
-                .any(|(other_id, record)| other_id != &id && record.branch == branch)
+        if !valid_id(&branch)
+            && (primary_branch == branch
+                || records
+                    .entries
+                    .iter()
+                    .any(|(other_id, record)| other_id != &id && record.branch == branch))
         {
             return Err(
                 "repaired HEAD would reuse a branch checked out in another worktree".into(),

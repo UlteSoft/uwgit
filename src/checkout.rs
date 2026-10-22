@@ -3,7 +3,7 @@
 
 use crate::{command_args, porcelain, repository, tree_output};
 
-const USAGE: &str = "checkout DIR BRANCH; checkout DIR -b NAME [REV]; checkout DIR -- PATH...; checkout DIR REV -- PATH...; checkout DIR REV NEW_FILE [--file PATH]. Revision path mode restores source-present paths into index/worktree, including tracked file/directory transitions, and preserves unrelated paths absent from that revision (overlay). Detached HEAD and implicit path guessing are not supported.";
+const USAGE: &str = "checkout DIR BRANCH_OR_REV; checkout DIR --detach [REV]; checkout DIR --orphan NAME; checkout DIR -; checkout DIR -b NAME [REV]; checkout DIR -- PATH...; checkout DIR REV -- PATH...; checkout DIR REV NEW_FILE [--file PATH]. Revision path mode restores source-present paths into index/worktree, including tracked file/directory transitions, and preserves unrelated paths absent from that revision (overlay). Commit/tag checkout uses a true detached HEAD. Path replacement requires an explicit -- separator.";
 
 pub fn run(args: &[String]) -> Result<String, String> {
     if command_args::help_requested(args) {
@@ -33,8 +33,26 @@ pub fn run(args: &[String]) -> Result<String, String> {
         return porcelain::run(&forwarded);
     }
     match &args[2..] {
+        [option, rest @ ..] if matches!(option.as_str(), "--detach" | "--orphan") => {
+            let mut forwarded = vec!["switch".into(), args[1].clone(), option.clone()];
+            forwarded.extend_from_slice(rest);
+            porcelain::run(&forwarded)
+        }
+        [name] if name == "-" => porcelain::run(&["switch".into(), args[1].clone(), name.clone()]),
         [name] if !name.starts_with('-') => {
-            porcelain::run(&["switch".into(), args[1].clone(), name.clone()])
+            if repository::Repository::open(&args[1])?
+                .branches()?
+                .contains_key(name)
+            {
+                porcelain::run(&["switch".into(), args[1].clone(), name.clone()])
+            } else {
+                porcelain::run(&[
+                    "switch".into(),
+                    args[1].clone(),
+                    "--detach".into(),
+                    name.clone(),
+                ])
+            }
         }
         [option, name] if option == "-b" => {
             porcelain::run(&["switch".into(), args[1].clone(), "-c".into(), name.clone()])

@@ -164,8 +164,7 @@ pub(crate) fn apply_one_bound(
 ) -> RepositoryResult<String> {
     let state = repo.state()?;
     let head = state
-        .branches
-        .get(&state.head)
+        .tip()
         .ok_or("history replay requires a committed HEAD")?;
     if expected.is_some_and(|(branch, tip)| state.head != branch || head != tip) {
         return Err(
@@ -239,10 +238,7 @@ pub(crate) fn apply_one_bound(
 
 fn rebase(repo: &Repository, upstream: &str, onto: Option<&str>) -> RepositoryResult<String> {
     let state = repo.state()?;
-    let head = state
-        .branches
-        .get(&state.head)
-        .ok_or("rebase requires a committed HEAD")?;
+    let head = state.tip().ok_or("rebase requires a committed HEAD")?;
     let upstream = repo.resolve(upstream)?;
     let target = repo.resolve(onto.unwrap_or(&upstream))?;
     let bases = repo.merge_bases(head, &upstream)?;
@@ -358,8 +354,7 @@ fn apply_resolved_index(
         ));
     }
     let head = state
-        .branches
-        .get(branch)
+        .tip()
         .ok_or("replay resolution requires a committed HEAD")?;
     if head != review.expected_head {
         return Err(format!(

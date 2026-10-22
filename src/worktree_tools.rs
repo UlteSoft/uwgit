@@ -3,7 +3,7 @@ use super::*;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use sha2::{Digest, Sha256};
 
-fn visible_paths(root: &Path, respect_ignore: bool) -> Result<BTreeSet<String>, String> {
+pub(super) fn visible_paths(root: &Path, respect_ignore: bool) -> Result<BTreeSet<String>, String> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -88,11 +88,7 @@ pub fn clean(
     require_no_pending(&state.repo)?;
     let index = state.index()?.unwrap_or_else(Index::empty);
     state.repo.fsck()?;
-    for selector in selectors {
-        if selector != "." {
-            validate_tree_path(selector.trim_end_matches('/'))?;
-        }
-    }
+    let pathspec = wasm_git::pathspec::Pathspec::new(selectors)?;
     let every = visible_paths(&state.repo.root, false)?;
     let visible = if all {
         BTreeSet::new()
@@ -106,21 +102,14 @@ pub fn clean(
             .map_err(|error| error.to_string())?;
     }
     let ignore = ignore.build().map_err(|error| error.to_string())?;
-    let matched = |path: &str| {
-        selectors.is_empty()
-            || selectors.iter().any(|selector| {
-                selector == "."
-                    || path == selector.trim_end_matches('/')
-                    || path.starts_with(&format!("{}/", selector.trim_end_matches('/')))
-            })
-    };
+    let selected = pathspec.select(&every)?;
     let mut candidates = BTreeMap::new();
     let mut candidate_dirs = Vec::new();
     for path in &every {
         let full = state.worktree_path(path)?;
         let metadata = fs::symlink_metadata(&full).map_err(|error| error.to_string())?;
         let is_dir = metadata.is_dir();
-        if !matched(path)
+        if !selected.contains(path)
             || index.files.contains_key(path)
             || (is_dir
                 && index

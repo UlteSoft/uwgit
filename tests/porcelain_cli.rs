@@ -304,7 +304,7 @@ fn invalid_paths_and_corrupt_index_leave_repository_bytes_unchanged() {
         "../outside.wasm",
         "/tmp/outside.wasm",
         ".uwgit/format",
-        "./module.wasm",
+        "././module.wasm",
         "x/../module.wasm",
         "x\\module.wasm",
         "x//module.wasm",

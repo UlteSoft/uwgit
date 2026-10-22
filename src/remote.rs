@@ -105,7 +105,7 @@ fn validate_state(state: &RepositoryState) -> RepositoryResult<()> {
     if state.format != 1 {
         return Err("unsupported remote repository state version".into());
     }
-    branch_name(&state.head)?;
+    crate::repository::validate_head_identity(&state.head)?;
     for (reference, id) in state.branches.iter().chain(state.tags.iter()) {
         branch_name(reference)?;
         if !valid_id(id) {
@@ -291,7 +291,8 @@ fn config_lock(repo: &Repository) -> RepositoryResult<ConfigLock> {
 
 fn load(repo: &Repository, remote: &str) -> RepositoryResult<Remote> {
     name(remote)?;
-    let directory = config_dir(repo)?;
+    let directory =
+        existing_config_dir(repo)?.ok_or("remote configuration directory does not exist")?;
     let config: Remote =
         serde_json::from_slice(&regular(&directory.join(format!("{remote}.json")))?)
             .map_err(|e| format!("invalid remote configuration: {e}"))?;
@@ -303,7 +304,10 @@ fn load(repo: &Repository, remote: &str) -> RepositoryResult<Remote> {
 }
 
 fn optional_tracking(repo: &Repository, remote: &Remote) -> RepositoryResult<Option<Tracking>> {
-    let path = config_dir(repo)?.join(format!("{}.tracking.json", remote.name));
+    let Some(directory) = existing_config_dir(repo)? else {
+        return Ok(None);
+    };
+    let path = directory.join(format!("{}.tracking.json", remote.name));
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read remote tracking: {e}")),
@@ -449,8 +453,8 @@ pub fn ls_remote_query(args: &[String]) -> RepositoryResult<crate::query_command
     let tags = flags.contains("--tags");
     let all = !heads && !tags;
     let include_head = all && !flags.contains("--refs") && matches("HEAD")?;
-    let head_tip = state.branches.get(&state.head);
-    let symbolic = include_head && flags.contains("--symref");
+    let head_tip = state.tip();
+    let symbolic = include_head && flags.contains("--symref") && !state.detached();
     let mut references = Vec::new();
     let mut text = String::new();
     let symbolic_target = format!("refs/heads/{}", state.head);
@@ -520,6 +524,29 @@ fn verified_tracking_tip(
         return Err("verified remote tracking tip changed".into());
     }
     Ok(Some(tip.clone()))
+}
+
+/// Called while a repository snapshot is already locked. Verify the same
+/// remote/tracking identity without recursively acquiring the writer lock.
+pub(crate) fn snapshot_upstream_tip(
+    repo: &Repository,
+    upstream: &crate::repository::Upstream,
+    expected: Option<&String>,
+) -> RepositoryResult<String> {
+    if existing_config_dir(repo)?.is_none() {
+        return Err("upstream has no configured remote".into());
+    }
+    let remote = load(repo, &upstream.remote)?;
+    let tracking = optional_tracking(repo, &remote)?.ok_or("upstream has no fetched branch")?;
+    let tip = tracking
+        .state
+        .branches
+        .get(&upstream.branch)
+        .ok_or("upstream has no fetched branch")?;
+    if expected != Some(tip) {
+        return Err("upstream tracking changed while capturing the repository snapshot".into());
+    }
+    Ok(tip.clone())
 }
 
 /// The lock order is remote configuration, then the repository writer. No
@@ -1117,9 +1144,11 @@ fn push_command(root: &str, args: &[&str], allow_http: bool) -> RepositoryResult
         };
         Some((namespace, reference.to_owned(), Some(tip)))
     } else {
+        if local.detached() {
+            return Err("detached HEAD push requires an explicit SOURCE:DESTINATION".into());
+        }
         let source = local
-            .branches
-            .get(&local.head)
+            .tip()
             .cloned()
             .ok_or("current branch has no commits")?;
         if upstreams
@@ -1438,7 +1467,7 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
                     format!("selected remote has no branch {branch:?} for the current branch or its upstream; specify BRANCH explicitly")
                 }
             })?;
-            let expected_head = before.branches.get(&before.head).map(String::as_str);
+            let expected_head = before.tip().map(String::as_str);
             let outcome = if ff_only {
                 repo.merge_ff_only_on_branch(tip, message, &before.head, expected_head)?
             } else if no_ff {

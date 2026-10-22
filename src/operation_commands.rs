@@ -140,8 +140,7 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
         } => porcelain::with_pending_begin(root, |repo, baseline, anchor| {
             let state = repo.state()?;
             let head = state
-                .branches
-                .get(&state.head)
+                .tip()
                 .ok_or("recorded conflict operation requires a committed HEAD")?;
             let selected = repo.read_commit(&revision)?;
             let saved_message = message.clone().unwrap_or_else(|| {
@@ -186,8 +185,7 @@ pub fn run(args: &[String]) -> RepositoryResult<String> {
             let head = report["old_head"]
                 .as_str()
                 .ok_or("conflict report lacks its bound committed HEAD")?;
-            if branch != state.head || state.branches.get(branch).map(String::as_str) != Some(head)
-            {
+            if branch != state.head || state.tip().map(String::as_str) != Some(head) {
                 return Err(
                     "branch or HEAD changed during conflict computation; no operation recorded"
                         .into(),

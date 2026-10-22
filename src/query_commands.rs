@@ -1,5 +1,5 @@
 //! Read-only views bound to one verified repository snapshot per query.
-use crate::repository::{self, QueryRef, QueryRefs, Repository, RepositoryResult};
+use crate::repository::{QueryRef, QueryRefs, Repository, RepositoryResult};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -117,36 +117,24 @@ fn ls_tree(args: &[String]) -> RepositoryResult<QueryOutput> {
     if nul && !(names || objects) {
         return Err("-z requires --name-only or --object-only".into());
     }
-    let selectors: Vec<_> = paths
-        .iter()
-        .map(|path| {
-            let normalized = path.strip_suffix('/').unwrap_or(path);
-            if normalized != "." {
-                repository::validate_tree_path(normalized)?;
-            }
-            Ok(*path)
-        })
-        .collect::<RepositoryResult<_>>()?;
+    let selectors: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+    let pathspec = wasm_git::pathspec::Pathspec::new(&selectors)?;
     let mut report = Repository::open(positional[0])?.query_tree(positional[1])?;
     if !report.named && (!selectors.is_empty() || names || objects) {
         return Err(
             "legacy commit has no named tree; use JSON to inspect its actual legacy object".into(),
         );
     }
-    for selector in &selectors {
-        if !report
+    let selected = pathspec.select(
+        &report
             .entries
             .iter()
-            .any(|entry| tree_matches(&entry.path, selector))
-        {
-            return Err(format!("tree path selector has no match: {selector:?}"));
-        }
-    }
-    if !selectors.is_empty() {
-        report
-            .entries
-            .retain(|entry| selectors.iter().any(|path| tree_matches(&entry.path, path)));
-    }
+            .map(|entry| entry.path.clone())
+            .collect(),
+    )?;
+    report
+        .entries
+        .retain(|entry| selected.contains(&entry.path));
     if names || objects {
         let mut output = String::new();
         for entry in report.entries {
@@ -159,16 +147,6 @@ fn ls_tree(args: &[String]) -> RepositoryResult<QueryOutput> {
     }
 }
 
-fn tree_matches(path: &str, selector: &str) -> bool {
-    let directory_only = selector.ends_with('/');
-    let selector = selector.strip_suffix('/').unwrap_or(selector);
-    selector == "."
-        || (!directory_only && path == selector)
-        || path
-            .strip_prefix(selector)
-            .is_some_and(|tail| tail.starts_with('/'))
-}
-
 fn head_ref(report: &QueryRefs) -> Option<QueryRef> {
     report
         .refs
@@ -178,6 +156,17 @@ fn head_ref(report: &QueryRefs) -> Option<QueryRef> {
         .map(|mut reference| {
             reference.name = "HEAD".into();
             reference
+        })
+        .or_else(|| {
+            report.head_object.as_ref().map(|object| QueryRef {
+                name: "HEAD".into(),
+                id: object.object_id.clone(),
+                kind: object.kind.clone(),
+                byte_len: object.byte_len,
+                stored_byte_len: object.stored_byte_len,
+                current: true,
+                upstream: None,
+            })
         })
 }
 

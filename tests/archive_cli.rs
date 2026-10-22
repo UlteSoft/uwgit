@@ -338,7 +338,7 @@ fn selectors_match_exact_files_or_directory_descendants_and_each_must_match() {
         vec!["nested/文"],
         vec!["a.wasm", "missing"],
         vec!["nested//"],
-        vec!["./a.wasm"],
+        vec!["././a.wasm"],
         vec![".", "../bad"],
     ] {
         let output = t.base.join("absent.tar");

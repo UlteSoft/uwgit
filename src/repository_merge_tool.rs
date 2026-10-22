@@ -17,10 +17,7 @@ impl Repository {
             .ok_or("mergetool requires an explicitly recorded pending conflict")?;
         validate_pending_snapshot(&snapshot, &pending)?;
         check_expected_branch(&snapshot.manifest.head, Some(&pending.branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&pending.branch),
-            Some(&pending.head),
-        )?;
+        check_expected(snapshot.manifest.tip(), Some(&pending.head))?;
         if pending.prepared.is_some() {
             return Err(
                 "pending publication is prepared; finish --continue before running a merge tool"
@@ -126,10 +123,7 @@ impl Repository {
             );
         }
         check_expected_branch(&snapshot.manifest.head, Some(&expected.branch))?;
-        check_expected(
-            snapshot.manifest.refs.get(&expected.branch),
-            Some(&expected.head),
-        )?;
+        check_expected(snapshot.manifest.tip(), Some(&expected.head))?;
         operation()
     }
 }
@@ -151,8 +145,7 @@ impl Repository {
         let branch = snapshot.manifest.head.clone();
         let head = snapshot
             .manifest
-            .refs
-            .get(&branch)
+            .tip()
             .ok_or("--squash requires a committed HEAD")?
             .clone();
         let target = snapshot_revision(&snapshot, target)?;
@@ -201,7 +194,7 @@ impl Repository {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
         check_expected_branch(&snapshot.manifest.head, Some(branch))?;
-        check_expected(snapshot.manifest.refs.get(branch), Some(head))?;
+        check_expected(snapshot.manifest.tip(), Some(head))?;
         if self.read_pending()?.is_some() {
             return Err("a pending operation appeared during merge preparation".into());
         }

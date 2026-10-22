@@ -28,13 +28,21 @@ impl Repository {
                 )?;
                 self.record_reflog(
                     "HEAD",
-                    snapshot.manifest.refs.get(&snapshot.manifest.head).cloned(),
+                    snapshot.manifest.tip().cloned(),
+                    snapshot.manifest.refs.get(branch).cloned(),
+                    message,
+                )?;
+                self.record_head_event(
+                    snapshot.manifest.tip().cloned(),
                     snapshot.manifest.refs.get(branch).cloned(),
                     message,
                 )?;
             }
             Ok(branch.into())
         } else {
+            if valid_id(&snapshot.manifest.head) {
+                return Err("HEAD is detached".into());
+            }
             Ok(snapshot.manifest.head)
         }
     }
@@ -70,6 +78,8 @@ impl Repository {
         } else if valid_id(revision) && snapshot.objects.contains_key(revision) {
             revision.into()
         } else if revision == "HEAD"
+            || revision == "@"
+            || revision.contains("@{")
             || snapshot.manifest.refs.contains_key(revision)
             || snapshot.manifest.tags.contains_key(revision)
             || snapshot.tracking.contains_key(revision)
@@ -116,11 +126,15 @@ impl Repository {
                 snapshot
                     .reflog
                     .iter()
+                    .chain(&snapshot.head_reflog)
                     .flat_map(|entry| entry.old.iter().chain(&entry.new)),
             )
             .chain(extra_roots.iter())
             .cloned()
             .collect();
+        if valid_id(&snapshot.manifest.head) {
+            roots.insert(snapshot.manifest.head.clone());
+        }
         roots.extend(super::notes_storage::retention_roots(&snapshot)?);
         // Fetched remote-only tags are validated by snapshot(), but are not
         // exposed as tracking branches. They still protect recovery objects.
@@ -135,6 +149,9 @@ impl Repository {
                 {
                     let value: Value = serde_json::from_slice(&read_regular(&entry.path())?)
                         .map_err(|error| error.to_string())?;
+                    if let Some(head) = value["state"]["head"].as_str().filter(|id| valid_id(id)) {
+                        roots.insert(head.into());
+                    }
                     if let Some(tags) = value["state"]["tags"].as_object() {
                         for id in tags.values() {
                             roots.insert(id.as_str().ok_or("invalid remote tag root")?.into());
@@ -373,6 +390,37 @@ impl Repository {
         let mut expanded = Vec::new();
         let mut excludes = excludes.to_vec();
         for revision in includes {
+            if let Some(base) = revision
+                .strip_suffix("^@")
+                .or_else(|| revision.strip_suffix("^!"))
+            {
+                let id = snapshot_revision(&snapshot, base)?;
+                let Some(Object::Commit(commit)) = snapshot.objects.get(&id) else {
+                    return Err("revision set requires a commit".into());
+                };
+                if revision.ends_with("^!") {
+                    expanded.push(id);
+                    excludes.extend(commit.parents.iter().cloned());
+                } else {
+                    expanded.extend(commit.parents.iter().cloned());
+                }
+                continue;
+            }
+            if let Some((base, number)) = revision.rsplit_once("^-") {
+                let number = if number.is_empty() {
+                    1
+                } else {
+                    number
+                        .parse::<usize>()
+                        .map_err(|_| "invalid parent exclusion")?
+                };
+                if number == 0 {
+                    return Err("parent exclusion must be positive".into());
+                }
+                expanded.push(snapshot_revision(&snapshot, base)?);
+                excludes.push(snapshot_revision(&snapshot, &format!("{base}^{number}"))?);
+                continue;
+            }
             if let Some((left, right)) = revision.split_once("...") {
                 if right.contains("..") || left.contains("..") {
                     return Err("invalid symmetric revision range".into());
@@ -386,6 +434,9 @@ impl Repository {
             } else {
                 expanded.push(revision.clone());
             }
+        }
+        if !all && !includes.is_empty() && expanded.is_empty() {
+            return Ok(Vec::new());
         }
         walk_snapshot(&snapshot, &expanded, &excludes, all, first_parent)
     }
@@ -405,8 +456,12 @@ impl Repository {
             };
             let (reference, tip) = fork_reference(&snapshot, reference)?;
             let derived = snapshot_revision(&snapshot, derived)?;
-            let mut tips: BTreeSet<_> = snapshot
-                .reflog
+            let log = if reference == "HEAD" {
+                &snapshot.head_reflog
+            } else {
+                &snapshot.reflog
+            };
+            let mut tips: BTreeSet<_> = log
                 .iter()
                 .filter(|entry| entry.reference == reference)
                 .flat_map(|entry| entry.old.iter().chain(&entry.new))
@@ -476,6 +531,16 @@ impl Repository {
 }
 
 fn fork_reference(snapshot: &Snapshot, reference: &str) -> RepositoryResult<(String, String)> {
+    if reference == "HEAD" {
+        return Ok((
+            "HEAD".into(),
+            snapshot
+                .manifest
+                .tip()
+                .ok_or("fork-point requires a committed HEAD")?
+                .clone(),
+        ));
+    }
     let reference = if reference == "HEAD" {
         format!("refs/heads/{}", snapshot.manifest.head)
     } else {
@@ -530,6 +595,9 @@ pub(super) fn walk_snapshot(
         .map(|revision| snapshot_revision(snapshot, revision))
         .collect::<RepositoryResult<_>>()?;
     if all {
+        if valid_id(&snapshot.manifest.head) {
+            tips.push(snapshot.manifest.head.clone());
+        }
         tips.extend(snapshot.manifest.refs.values().cloned());
         tips.extend(snapshot.manifest.tags.values().cloned());
         tips.extend(snapshot.tracking.values().cloned());

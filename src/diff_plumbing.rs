@@ -133,23 +133,13 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
     if options.nul && !(options.name_only || options.name_status) {
         return Err("-z requires --name-only or --name-status".into());
     }
-    for selector in &options.paths {
-        if selector != "." {
-            crate::repository::validate_tree_path(selector.trim_end_matches('/'))?;
-        }
-        if !rows.iter().any(|row| matches(&row.path, selector)) {
-            return Err(format!("diff path selector has no match: {selector:?}"));
-        }
-    }
+    let selected = wasm_git::pathspec::select(
+        &rows.iter().map(|row| row.path.clone()).collect(),
+        &options.paths,
+    )?;
     let rows: Vec<_> = rows
         .into_iter()
-        .filter(|row| {
-            options.paths.is_empty()
-                || options
-                    .paths
-                    .iter()
-                    .any(|selector| matches(&row.path, selector))
-        })
+        .filter(|row| selected.contains(&row.path))
         .collect();
     let changed = rows.iter().any(|row| row.old != row.new);
     let output = if options.quiet {
@@ -193,9 +183,4 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             0
         },
     ))
-}
-fn matches(path: &str, selector: &str) -> bool {
-    let directory = selector.ends_with('/');
-    let selector = selector.trim_end_matches('/');
-    selector == "." || (!directory && path == selector) || path.starts_with(&format!("{selector}/"))
 }
