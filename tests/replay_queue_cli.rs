@@ -415,12 +415,23 @@ fn skip_restores_the_original_sparse_omission_and_index_flags_after_conflict_exp
     fs::remove_file(t.0.join("a.wasm")).unwrap();
     let baseline = t.index();
     stop(&["cherry-pick", r, "--sequence", &first], "conflict");
+    let stopped: Value = serde_json::from_slice(&t.index()[9..]).unwrap();
     t.assert_file("a.wasm", 3);
     t.write("a.wasm", 9);
     ok(&["add", r, "a.wasm"]);
     value(&["cherry-pick", r, "--skip"]);
     assert_eq!(t.head(), ours);
-    assert_eq!(t.index(), baseline);
+    // Skip restores every original image and sparse flag. The explicit add
+    // also saved real conflict sides, which remain in the version 5 extension.
+    let mut expected: Value = serde_json::from_slice(&baseline[9..]).unwrap();
+    expected["format"] = serde_json::json!(5);
+    expected["resolve_undo"] = stopped["conflicts"].clone();
+    let raw = t.index();
+    assert!(raw.starts_with(b"UWGITIDX\x05"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw[9..]).unwrap(),
+        expected
+    );
     assert!(!t.0.join("a.wasm").exists());
     assert!(ok(&["ls-files", r, "-t"]).contains("S a.wasm"));
     t.no_pending();

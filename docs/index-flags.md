@@ -3,6 +3,7 @@
 这些入口直接操作 uwgit 的完整 Wasm 原字节索引；不调用 Git，也不创建 Git blob、stat cache 或外部监控进程。
 新编码 `UWGITIDX` version 4 在原有文件图像、legacy 路径和冲突 stages 之外保存路径标志与无图像的意向条目。
 旧 version 1/2/3 继续可读；只有需要新字段时升级。清除最后一个标志仍保留合法的 version 4，避免悄悄降级。
+保存冲突解决的原侧时升级为 version 5，标志及意向条目继续有效，后续修改不降级；见[索引撤回记录](index-stages.md#解决记录与索引撤回)。
 
 ```sh
 wasm-git update-index DIR --assume-unchanged modules/a.wasm

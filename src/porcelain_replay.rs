@@ -7,6 +7,7 @@ fn result_index(images: &ReplayImages, anchor: Option<&str>, old: &Index) -> Res
     index.format = old.format;
     index.files = images.files.clone();
     index.legacy_path = anchor.map(str::to_owned);
+    index.resolve_undo = old.resolve_undo.clone();
     index.conflicts = images
         .conflicts
         .iter()
@@ -84,7 +85,7 @@ fn checkpoint(
                     flag.fsmonitor_valid = None;
                 }
                 target.flags.insert(path.clone(), flag);
-                target.format = 4;
+                target.format = target.format.max(4);
             }
         }
     }
@@ -454,4 +455,76 @@ pub fn try_replay_control(
         );
     }
     replay_control(root, operation, action).map(Some)
+}
+
+#[cfg(test)]
+mod undo_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_recovery_preserves_v5_undo_at_every_physical_write_prefix() {
+        for cut in 0..=3 {
+            let root = std::env::temp_dir().join(format!(
+                "uwgit-undo-checkpoint-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            Repository::init(&root).unwrap();
+            let state = State::open(root.to_str().unwrap()).unwrap();
+            let _lock = state.lock().unwrap();
+            let mut before = Index::empty();
+            before.format = 5;
+            before.files.insert("a.wasm".into(), WASM.to_vec());
+            before.files.insert("b.wasm".into(), WASM.to_vec());
+            before.resolve_undo.insert(
+                "old.wasm".into(),
+                ConflictStages {
+                    ours: Some(WASM.to_vec()),
+                    ..ConflictStages::default()
+                },
+            );
+            let mut after = before.clone();
+            let unknown = [WASM.as_slice(), &[255, 1, 254]].concat();
+            after.files.insert("a.wasm".into(), unknown.clone());
+            after.files.insert("b.wasm".into(), unknown);
+            let checkpoint = ReplayCheckpoint {
+                action: "continue".into(),
+                index_before: Some(index_bytes(&before).unwrap()),
+                index_after: index_bytes(&after).unwrap(),
+                work_before: files_worktree(&before.files),
+                work_after: files_worktree(&after.files),
+                owned_before: keys(&before.files),
+            };
+            let images = ReplayImages {
+                files: after.files.clone(),
+                conflicts: BTreeMap::new(),
+            };
+            validate_replay_checkpoint(&checkpoint, &images, None, None).unwrap();
+            state.save_index(&before).unwrap();
+            for (path, bytes) in &before.files {
+                fs::write(root.join(path), bytes).unwrap();
+            }
+            for (path, bytes) in checkpoint.work_after.iter().take(cut.min(2)) {
+                fs::write(root.join(path), bytes.as_ref().unwrap()).unwrap();
+            }
+            if cut == 3 {
+                state.write("index", &checkpoint.index_after).unwrap();
+            }
+            apply_checkpoint(&state, &checkpoint).unwrap();
+            apply_checkpoint(&state, &checkpoint).unwrap();
+            assert_eq!(state.index().unwrap(), Some(after));
+            assert_eq!(
+                state.snapshot_worktree(keys(&before.files)).unwrap(),
+                checkpoint.work_after
+            );
+            // A later edit must stop recovery before it changes the other file
+            // or consumes any saved side in the already published index.
+            fs::write(root.join("a.wasm"), b"later private editor bytes").unwrap();
+            let old_index = regular(&state.metadata.join("index")).unwrap();
+            assert!(apply_checkpoint(&state, &checkpoint).is_err());
+            assert_eq!(regular(&state.metadata.join("index")).unwrap(), old_index);
+            drop(_lock);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

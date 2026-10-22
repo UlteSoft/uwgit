@@ -64,7 +64,7 @@ wasm-git ls-files DIR --format='%(objecttype) %(objectname) %(stage)%x09%(path)'
 这个只读查询合同不放宽 add/restore/read-tree 等写命令的严格选择规则。
 `--format` 支持 objectmode、objecttype、objectname、objectsize、stage、path，及 `%%`、ASCII `%xNN`；
 objecttype 是真实的 wasm。未知字段或 modifier 拒绝，不生成 EOL/作者等不存在的信息。
-它不能组合 stage/unmerged、others/killed、标签或 JSON 输出。
+它不能组合 stage/unmerged、others/killed、resolve-undo、标签或 JSON 输出。
 
 ## 从索引物化及导出
 
@@ -142,10 +142,58 @@ clean 将未解决路径视为受控文件，不能当作 untracked 删除。
 首次使用扩展字段时将 index 升级为 `UWGITIDX` 格式 3，解决后保留该版本；正常旧 index 格式 1/2 仍可读取。
 老客户端不认识格式 3 时必须拒绝，不能丢弃 stages。不可变 Wasm/tree/commit 对象编码和 ID 不变。
 
-本次 stages 由 read-tree 或 update-index 显式建立。`merge/cherry-pick/revert/rebase --record-conflict`
-仍使用原有冻结 pending 记录，尚未自动将合并中间结果写入该索引扩展；其完整树审阅和显式续作合同保持。
-索引 flags、intent-to-add、稀疏 index、ls-files 的 directory/abbrev/EOL/resolve-undo 等剩余选项仍见[能力矩阵](git-command-coverage.md)。
+stages 可由 read-tree、update-index 或录制的 merge/pick/revert/rebase 队列建立。
+索引 flags、intent-to-add 见[索引标志](index-flags.md)；稀疏 index、ls-files 的 directory/abbrev/EOL 等剩余选项仍见[能力矩阵](git-command-coverage.md)。
 接口参考 [Git ls-files](https://git-scm.com/docs/git-ls-files) 与 [Git checkout-index](https://git-scm.com/docs/git-checkout-index)，对象及数据持久化继续使用 uwgit。
 
 索引 version 4、assume/skip/图像有效性标志、intent-to-add 与 commit -a 见[原生索引标志](index-flags.md)。
 已有 index 的 merge/pick/revert/rebase 录制及多目标 pick/revert 自动建立上述 stages，并带可恢复的工作区检查点；见[录制冲突](pending.md)、[rebase](rebase-pending.md)及[原生队列](replay-queue.md)。
+
+## 解决记录与索引撤回
+
+```sh
+wasm-git add DIR modules/a.wasm
+wasm-git ls-files DIR --resolve-undo
+wasm-git ls-files DIR --resolve-undo --json
+wasm-git update-index DIR --unresolve modules/a.wasm
+wasm-git restore DIR --ours -- modules/a.wasm
+printf 'modules/a.wasm\0' | wasm-git update-index DIR --unresolve --stdin -z
+wasm-git update-index DIR --clear-resolve-undo
+```
+
+解决未合并路径时，索引 version 5 的 `resolve_undo` 保存移除前完整 stage 1/2/3 的原始 Wasm 字节。
+add、rm、update-index 的工作路径/cacheinfo/index-info、staged restore、merge-index 和 mergetool 暂存均使用同一规则。
+删除解决也保留原侧；原来不存在的一侧仍为 null。普通 stage 0 修改不会替换上一次保存的冲突。
+预检错误或 dry-run 不生成撤回记录，也不先发布前面的批量修改；merge-index 仍可在退出 2 时保留本次成功解决的路径。
+
+`ls-files --resolve-undo` 默认只列撤回记录，每个现存侧输出 `100644 NATIVE_ID STAGE<TAB>PATH`。
+`-t/-v/-f` 的记录标签为 `U`；`-z`、路径选择器可用，`--deduplicate` 不折叠这些 stages。
+显式 cached/stage 等来源仍可同时查询，普通来源先于撤回记录输出。
+JSON 的记录含 `resolve_undo: true`、`reason: "U"` 和真实原生 ID；该 ID 所指图像可能只存在于 index 中。
+撤回记录不继承当前 stage 0 的 assume/skip/fsmonitor/intent 标志。没有 `--resolve-undo` 时，旧列表行为不变。
+
+`update-index --unresolve` 使用精确路径，或 `--stdin [-z]` 的精确路径列表。
+整批先验证，移除所选 stage 0/intent/标志，再重建已保存的原侧并消费对应撤回记录。
+已经 unmerged 的路径保持现有 sides；没有记录的合法路径和空列表不做修改。
+它只改 index，不移动 HEAD、不写工作文件、不安装对象，也不从当前 HEAD 或 pending 猜测丢失的侧。
+随后可显式 restore --ours/--theirs 或再次编辑、add/rm；未解决状态重新阻止 write-tree、commit 和 replay continue。
+它没有实现 checkout -m/restore --merge 的自动工作文件恢复入口。
+
+文件/目录组必须选出足以组成合法完整 index 的路径集合。单独撤回父路径会与已解决子路径碰撞时，整批拒绝；
+一起选择相关父子路径可以恢复真实的跨 stage 分歧。不同历史步骤的撤回记录不必彼此构成同一棵树。
+`--clear-resolve-undo` 只清除全部撤回记录，保留现存 stages、文件图像、标志和工作副本。
+两个控制与内容更新/refresh/标志修改互斥；clear 不接受路径或 stdin。两者都支持 dry-run、遵守 index 锁。
+
+version 1/2/3/4 索引继续可读，原编码没有新增空字段；第一次保存撤回记录时升级为 `UWGITIDX\x05`。
+清除最后一个记录后保留 version 5，后续标志修改不能降级或丢记录。索引元数据与图像通过同一次 canonical 写入发布。
+未知字段、错误 magic/version、非法路径、空记录或非 Wasm 原侧均拒绝。不可变 Wasm/tree/commit 编码和 ID 不变。
+
+完整 read-tree、switch、mixed/hard reset 等整树替换建立新的 index 并清除旧撤回记录；read-tree prefix 保留现有记录。
+普通 commit 保留 index，stash 保存并恢复记录。linked worktree 的记录各自独立。
+replay continue/skip 的检查点保留当时的记录并验证它与原 index 一致；skip 允许修复损坏 index 时无法恢复已损坏的撤回信息。
+abort 恢复原 index 的完整原编码，包含原来的 version 5 记录。撤回记录只描述保存的历史 sides，不表示当前步骤仍然 pending。
+
+回归见 [index_resolve_undo_cli.rs](../tests/index_resolve_undo_cli.rs)、
+[编码与校验](../src/index_resolve_undo.rs)、[检查点恢复](../src/porcelain_replay.rs) 和独立 [Git 对照](../tests/git_reference_cli.rs)。
+选项参考 [Git update-index](https://git-scm.com/docs/git-update-index)、[Git ls-files](https://git-scm.com/docs/git-ls-files)；
+这里继续使用原生 Wasm 编码、原图像校验与批量失败保持合同。

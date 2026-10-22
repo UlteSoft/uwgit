@@ -23,6 +23,8 @@ mod index_plumbing;
 pub use index_plumbing::{index_command, index_command_handles};
 #[path = "index_flags.rs"]
 mod index_flags;
+#[path = "index_resolve_undo.rs"]
+mod index_resolve_undo;
 #[path = "porcelain_replay.rs"]
 mod replay_worktree;
 pub use replay_worktree::{replay_control, replay_start, try_replay_control};
@@ -31,6 +33,7 @@ const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
 const STAGED_MAGIC: &[u8; 9] = b"UWGITIDX\x03";
 const FLAGS_MAGIC: &[u8; 9] = b"UWGITIDX\x04";
+const RESOLVE_MAGIC: &[u8; 9] = b"UWGITIDX\x05";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
 const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [-N|--intent-to-add] [--sparse] [--] PATHSPEC...; status DIR; commit DIR [-a|--all] [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--ignore-skip-worktree-bits] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -49,6 +52,8 @@ struct Index {
     flags: BTreeMap<String, IndexFlags>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     intents: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resolve_undo: BTreeMap<String, ConflictStages>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +91,14 @@ impl ConflictStages {
     }
 }
 impl Index {
+    /// Keep the complete original sides when an explicit resolution removes
+    /// unmerged entries. Ordinary edits of stage zero leave this record alone.
+    fn resolve_path(&mut self, path: &str) {
+        if let Some(stages) = self.conflicts.remove(path) {
+            self.resolve_undo.insert(path.to_owned(), stages);
+            self.format = self.format.max(5);
+        }
+    }
     fn hidden(&self, path: &str) -> bool {
         self.flags.get(path).is_some_and(IndexFlags::hidden)
     }
@@ -107,6 +120,7 @@ impl Index {
             conflicts: BTreeMap::new(),
             flags: BTreeMap::new(),
             intents: BTreeSet::new(),
+            resolve_undo: BTreeMap::new(),
         }
     }
 }
@@ -208,9 +222,10 @@ fn validate_files(files: &Files) -> Result<(), String> {
     Ok(())
 }
 fn validate_index(index: &Index) -> Result<(), String> {
-    if !matches!(index.format, 2..=4)
+    if !matches!(index.format, 2..=5)
         || (index.format == 2 && !index.conflicts.is_empty())
-        || (index.format != 4 && (!index.flags.is_empty() || !index.intents.is_empty()))
+        || (index.format < 4 && (!index.flags.is_empty() || !index.intents.is_empty()))
+        || (index.format < 5 && !index.resolve_undo.is_empty())
     {
         return Err("unsupported index format".into());
     }
@@ -256,6 +271,18 @@ fn validate_index(index: &Index) -> Result<(), String> {
             validate_wasm(bytes)?;
         }
     }
+    // Undo records can describe resolutions from different steps, so their
+    // paths need not form a single tree. Reinstating a selection validates the
+    // resulting complete index before publication, including D/F conflicts.
+    for (path, stages) in &index.resolve_undo {
+        validate_tree_path(path)?;
+        if stages.base.is_none() && stages.ours.is_none() && stages.theirs.is_none() {
+            return Err("resolve-undo record must retain at least one original stage".into());
+        }
+        for bytes in stages.base.iter().chain(&stages.ours).chain(&stages.theirs) {
+            validate_wasm(bytes)?;
+        }
+    }
     // A directory/file conflict may span different stages, but each original
     // side together with the resolved entries must still be a valid tree.
     for stage in 1..=3 {
@@ -290,13 +317,17 @@ fn validate_index(index: &Index) -> Result<(), String> {
 fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
     let mut normalized = index.clone();
     normalized.tidy();
-    if !normalized.flags.is_empty() || !normalized.intents.is_empty() {
-        normalized.format = 4;
+    if !normalized.resolve_undo.is_empty() {
+        normalized.format = normalized.format.max(5);
+    } else if !normalized.flags.is_empty() || !normalized.intents.is_empty() {
+        normalized.format = normalized.format.max(4);
     } else if !normalized.conflicts.is_empty() && normalized.format < 3 {
         normalized.format = 3;
     }
     validate_index(&normalized)?;
-    let mut bytes = if normalized.format == 4 {
+    let mut bytes = if normalized.format == 5 {
+        RESOLVE_MAGIC
+    } else if normalized.format == 4 {
         FLAGS_MAGIC
     } else if normalized.format == 3 {
         STAGED_MAGIC
@@ -308,6 +339,14 @@ fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 fn decode_index(bytes: &[u8]) -> Result<Index, String> {
+    if let Some(payload) = bytes.strip_prefix(RESOLVE_MAGIC) {
+        let index: Index = decode_canonical(payload)?;
+        if index.format != 5 {
+            return Err("resolve-undo index magic/format mismatch".into());
+        }
+        validate_index(&index)?;
+        return Ok(index);
+    }
     if let Some(payload) = bytes.strip_prefix(FLAGS_MAGIC) {
         let index: Index = decode_canonical(payload)?;
         if index.format != 4 {
@@ -355,6 +394,7 @@ fn decode_index(bytes: &[u8]) -> Result<Index, String> {
         conflicts: BTreeMap::new(),
         flags: BTreeMap::new(),
         intents: BTreeSet::new(),
+        resolve_undo: BTreeMap::new(),
     };
     validate_index(&index)?;
     Ok(index)
@@ -455,6 +495,9 @@ pub fn validate_replay_checkpoint(
         Err(_) if checkpoint.action == "skip" => Index::empty(),
         Err(e) => return Err(e),
     };
+    if after.resolve_undo != before.resolve_undo {
+        return Err("replay checkpoint changed its saved resolve-undo images".into());
+    }
     let scope: BTreeSet<_> = checkpoint
         .owned_before
         .iter()
@@ -812,6 +855,7 @@ impl State {
             conflicts: BTreeMap::new(),
             flags: BTreeMap::new(),
             intents: BTreeSet::new(),
+            resolve_undo: BTreeMap::new(),
         };
         validate_index(&index)?;
         Ok(index)
@@ -916,6 +960,7 @@ impl State {
                                 conflicts: BTreeMap::new(),
                                 flags: BTreeMap::new(),
                                 intents: BTreeSet::new(),
+                                resolve_undo: BTreeMap::new(),
                             },
                             worktree: BTreeMap::from([(p, e.worktree)]),
                         }
@@ -1085,6 +1130,7 @@ pub fn encode_worktree_index(files: &Files, legacy_path: Option<&str>) -> Result
         conflicts: BTreeMap::new(),
         flags: BTreeMap::new(),
         intents: BTreeSet::new(),
+        resolve_undo: BTreeMap::new(),
     })
 }
 
@@ -1182,6 +1228,7 @@ pub fn read_tree(root: &str, revision: Option<&str>) -> Result<String, String> {
             conflicts: BTreeMap::new(),
             flags: BTreeMap::new(),
             intents: BTreeSet::new(),
+            resolve_undo: BTreeMap::new(),
         }
     } else {
         Index::empty()
@@ -1338,13 +1385,13 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
         if intent && index.files.contains_key(path) {
             continue;
         }
-        index.conflicts.remove(path);
+        index.resolve_path(path);
         match state.worktree_module(path)? {
             Some(bytes) => {
                 validate_wasm(&bytes)?;
                 if intent {
                     index.intents.insert(path.clone());
-                    index.format = 4;
+                    index.format = index.format.max(4);
                 } else {
                     index.files.insert(path.clone(), bytes);
                     index.intents.remove(path);
@@ -1575,7 +1622,7 @@ fn status(state: &State) -> Result<String, String> {
         modified |= matches!(work, "modified" | "added");
         deleted |= work == "deleted";
         let mut row = json!({"path":p,"staged":change,"worktree":work});
-        if index.format == 4 {
+        if index.format >= 4 {
             row["intent_to_add"] = json!(index.intents.contains(&p));
             row["assume_unchanged"] =
                 json!(index.flags.get(&p).is_some_and(|f| f.assume_unchanged));
@@ -2765,7 +2812,7 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
     };
     for p in &paths {
         index.files.remove(p);
-        index.conflicts.remove(p);
+        index.resolve_path(p);
         index.intents.remove(p);
         index.flags.remove(p);
     }
@@ -3035,7 +3082,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
         if target.conflicts.contains_key(p) {
             return Err("restore of unmerged paths requires --ours or --theirs".into());
         }
-        replacement.conflicts.remove(p);
+        replacement.resolve_path(p);
         replacement.intents.remove(p);
         let write_work = work && (ignore_skip || !replacement.skipped(p));
         if replacement.files.get(p) != target.files.get(p) {
@@ -3349,8 +3396,13 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
                 conflicts: BTreeMap::new(),
             flags: BTreeMap::new(),
             intents: BTreeSet::new(),
+            resolve_undo: BTreeMap::new(),
             };
             index_flags::inherit(&mut target,&e.index);
+            target.resolve_undo = e.index.resolve_undo.clone();
+            if !target.resolve_undo.is_empty() {
+                target.format = target.format.max(5);
+            }
             validate_index(&target)?;
             let changes = plan(state, &keys(&current.files), &worktree)?;
             apply_plan(state, &changes)?;

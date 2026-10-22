@@ -64,6 +64,146 @@ fn wasm(value: u8) -> Vec<u8> {
     [b"\0asm\x01\0\0\0".as_slice(), &[0, 3, 1, b'x', value]].concat()
 }
 
+#[test]
+fn native_resolve_undo_matches_git_for_all_original_side_masks_and_deleted_resolutions() {
+    fn input(root: &Path, native: bool, args: &[&str], bytes: &[u8]) -> Output {
+        let mut command = if native {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
+            command.args([args[0], p(root)]).args(&args[1..]);
+            command
+        } else {
+            let mut command = Command::new("git");
+            command.args(["-C", p(root)]).args(args);
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            command
+        };
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait_with_output().unwrap()
+    }
+    fn command(root: &Path, native: bool, args: &[&str]) -> Output {
+        if native {
+            let mut native_args = vec![args[0], p(root)];
+            native_args.extend_from_slice(&args[1..]);
+            uw(&native_args)
+        } else {
+            git(root, args)
+        }
+    }
+    fn normalize(bytes: Vec<u8>, ids: &[String]) -> String {
+        let mut text = String::from_utf8(bytes).unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            text = text.replace(id, &format!("IMAGE{}", n + 1));
+        }
+        text
+    }
+    let temp = Temp::new();
+    for mask in 1..=7 {
+        for deleted in [false, true] {
+            let native = temp.path(&format!("native-undo-{mask}-{deleted}"));
+            let reference = temp.path(&format!("git-undo-{mask}-{deleted}"));
+            success(uw(&["init", p(&native)]));
+            fs::create_dir(&reference).unwrap();
+            success(git(&reference, &["init", "-b", "main"]));
+            let mut outcomes = Vec::new();
+            for (root, is_native) in [(&native, true), (&reference, false)] {
+                let ids: Vec<_> = (1..=3)
+                    .map(|n| {
+                        String::from_utf8(success(input(
+                            root,
+                            is_native,
+                            &["hash-object", "-w", "--stdin"],
+                            &wasm(n),
+                        )))
+                        .unwrap()
+                        .trim()
+                        .to_owned()
+                    })
+                    .collect();
+                let nul = mask % 2 == 0;
+                let separator = if nul { '\0' } else { '\n' };
+                let mut records = String::new();
+                for stage in 1..=3 {
+                    if mask & (1 << (stage - 1)) != 0 {
+                        records.push_str(&format!(
+                            "100644 {} {stage}\ta.wasm{separator}",
+                            ids[stage - 1]
+                        ));
+                    }
+                }
+                let args = if nul {
+                    vec!["update-index", "-z", "--index-info"]
+                } else {
+                    vec!["update-index", "--index-info"]
+                };
+                success(input(root, is_native, &args, records.as_bytes()));
+                let original =
+                    normalize(success(command(root, is_native, &["ls-files", "-u"])), &ids);
+                fs::write(root.join("a.wasm"), wasm(9)).unwrap();
+                let resolve = || {
+                    if deleted {
+                        command(
+                            root,
+                            is_native,
+                            &["update-index", "--force-remove", "a.wasm"],
+                        )
+                    } else {
+                        command(root, is_native, &["add", "a.wasm"])
+                    }
+                };
+                success(resolve());
+                let mut results = Vec::new();
+                for query in [
+                    vec!["ls-files", "--resolve-undo"],
+                    vec!["ls-files", "--resolve-undo", "-t", "-z"],
+                    vec!["ls-files", "--resolve-undo", "--deduplicate"],
+                    vec!["ls-files", "--resolve-undo", "-u"],
+                ] {
+                    results.push(normalize(success(command(root, is_native, &query)), &ids));
+                }
+                assert_eq!(results[0], original);
+                success(command(
+                    root,
+                    is_native,
+                    &["update-index", "--unresolve", "a.wasm"],
+                ));
+                assert_eq!(
+                    normalize(success(command(root, is_native, &["ls-files", "-u"])), &ids),
+                    original
+                );
+                assert!(
+                    success(command(root, is_native, &["ls-files", "--resolve-undo"])).is_empty()
+                );
+                success(resolve());
+                success(command(
+                    root,
+                    is_native,
+                    &["update-index", "--clear-resolve-undo"],
+                ));
+                success(command(
+                    root,
+                    is_native,
+                    &["update-index", "--unresolve", "a.wasm", "absent.wasm"],
+                ));
+                assert!(success(command(root, is_native, &["ls-files", "-u"])).is_empty());
+                assert!(
+                    success(command(root, is_native, &["ls-files", "--resolve-undo"])).is_empty()
+                );
+                assert_eq!(fs::read(root.join("a.wasm")).unwrap(), wasm(9));
+                outcomes.push(results);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "mask {mask}, deleted {deleted}");
+        }
+    }
+}
+
 fn reference_updates(
     root: &Path,
     native: bool,

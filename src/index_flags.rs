@@ -127,7 +127,7 @@ impl Options {
         }
         index.tidy();
         if !index.flags.is_empty() || !index.intents.is_empty() {
-            index.format = 4;
+            index.format = index.format.max(4);
         }
         validate_index(index)?;
         Ok(checked)
@@ -209,6 +209,6 @@ pub(super) fn inherit(target: &mut Index, old: &Index) {
         .filter(|(_, flag)| !flag.empty())
         .collect();
     if !target.flags.is_empty() {
-        target.format = 4;
+        target.format = target.format.max(4);
     }
 }

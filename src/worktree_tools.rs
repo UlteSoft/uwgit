@@ -337,7 +337,7 @@ pub fn mergetool(
     if stage {
         let index = index.as_mut().ok_or("missing resolution index")?;
         for (path, bytes) in resolutions {
-            index.conflicts.remove(&path);
+            index.resolve_path(&path);
             index.intents.remove(&path);
             index.flags.remove(&path);
             if let Some(bytes) = bytes {
@@ -390,6 +390,7 @@ pub fn squash_merge(root: &str, target: &str, message: Option<&str>) -> Result<S
             conflicts: BTreeMap::new(),
             flags: BTreeMap::new(),
             intents: BTreeSet::new(),
+            resolve_undo: BTreeMap::new(),
         };
         let empty = Index::empty();
         let original = tracked.as_ref().unwrap_or(&empty);

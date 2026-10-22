@@ -37,6 +37,10 @@ enum Action {
         dir: String,
         #[command(flatten)]
         flags: index_flags::Options,
+        #[arg(long, conflicts_with_all=["clear_resolve_undo","add","remove","force_remove","index_info","cacheinfo"])]
+        unresolve: bool,
+        #[arg(long, conflicts_with_all=["unresolve","add","remove","force_remove","index_info","cacheinfo","stdin","paths"])]
+        clear_resolve_undo: bool,
         #[arg(long)]
         add: bool,
         #[arg(long, conflicts_with_all = ["force_remove","index_info","cacheinfo"])]
@@ -244,7 +248,7 @@ fn set_entry(
     }
     if mode == "0" {
         index.files.remove(path);
-        index.conflicts.remove(path);
+        index.resolve_path(path);
         index.intents.remove(path);
         index.flags.remove(path);
         return Ok(());
@@ -256,7 +260,7 @@ fn set_entry(
     index.intents.remove(path);
     index.flags.remove(path);
     if stage == 0 {
-        index.conflicts.remove(path);
+        index.resolve_path(path);
         index.files.insert(path.into(), bytes);
     } else {
         index.format = index.format.max(3);
@@ -599,6 +603,8 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
         }
         Action::UpdateIndex {
             flags,
+            unresolve,
+            clear_resolve_undo,
             add,
             remove,
             force_remove,
@@ -614,6 +620,29 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                 return Err("-z requires --stdin or --index-info".into());
             }
             let mut index = state.index()?.unwrap_or_else(Index::empty);
+            if unresolve || clear_resolve_undo {
+                if flags.enabled() {
+                    return Err("resolve-undo controls cannot combine index flags/refresh".into());
+                }
+                let original = index.clone();
+                if stdin {
+                    paths = input(nul)?;
+                }
+                let restored = if unresolve {
+                    index_resolve_undo::unresolve(&mut index, &paths)?
+                } else {
+                    index.resolve_undo.clear();
+                    Vec::new()
+                };
+                validate_index(&index)?;
+                let updated = index != original;
+                if !dry_run && updated {
+                    state.save_index(&index)?;
+                }
+                return QueryOutput::json(
+                    json!({"status":if unresolve {"index_unresolved"} else {"resolve_undo_cleared"},"dry_run":dry_run,"restored":restored,"resolve_undo_remaining":index.resolve_undo.keys().collect::<Vec<_>>(),"index_updated":updated&&!dry_run,"worktree_updated":false,"head_updated":false}),
+                );
+            }
             if flags.enabled() {
                 if add || remove || force_remove || index_info || !cacheinfo.is_empty() {
                     return Err("index flags/refresh cannot combine content update modes".into());
@@ -679,7 +708,7 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                     validate_tree_path(&path)?;
                     if force_remove {
                         index.files.remove(&path);
-                        index.conflicts.remove(&path);
+                        index.resolve_path(&path);
                         index.intents.remove(&path);
                         continue;
                     }
@@ -694,13 +723,13 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                         Some(bytes) => {
                             validate_wasm(&bytes)?;
                             index.files.insert(path.clone(), bytes);
-                            index.conflicts.remove(&path);
+                            index.resolve_path(&path);
                             index.intents.remove(&path);
                             index.flags.remove(&path);
                         }
                         None if remove => {
                             index.files.remove(&path);
-                            index.conflicts.remove(&path);
+                            index.resolve_path(&path);
                             index.intents.remove(&path);
                         }
                         None => return Err(format!("missing index input path: {path:?}")),
@@ -750,7 +779,7 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                         } else {
                             index.files.remove(&path);
                         }
-                        index.conflicts.remove(&path);
+                        index.resolve_path(&path);
                         resolved.push(path);
                     }
                     Err(error) => unresolved.push(json!({"path":path,"reason":error})),
@@ -773,9 +802,17 @@ pub fn index_command(args: &[String]) -> Result<QueryOutput, String> {
                 }
                 index.files.remove(path);
                 index.conflicts.insert(path.clone(), original.conflicts[path].clone());
+                if let Some(stages) = original.resolve_undo.get(path) {
+                    index.resolve_undo.insert(path.clone(), stages.clone());
+                } else {
+                    index.resolve_undo.remove(path);
+                }
                 unresolved.push(json!({"path":path,"reason":"file/directory conflict requires an explicit tree resolution"}));
                 false
             });
+            if resolved.is_empty() {
+                index.format = original.format;
+            }
             validate_index(&index)?;
             if !dry_run {
                 state.save_index(&index)?;

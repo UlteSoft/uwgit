@@ -20,6 +20,8 @@ pub(super) struct Args {
     ignored: bool,
     #[arg(short = 'k', long)]
     killed: bool,
+    #[arg(long)]
+    resolve_undo: bool,
     #[arg(short = 't')]
     tags: bool,
     #[arg(short = 'v', conflicts_with_all=["tags","monitor_tags","format"])]
@@ -40,7 +42,7 @@ pub(super) struct Args {
     exclude_per_directory: Vec<String>,
     #[arg(short = 'z')]
     nul: bool,
-    #[arg(long, conflicts_with_all=["stage","unmerged","others","killed","tags","json"])]
+    #[arg(long, conflicts_with_all=["stage","unmerged","others","killed","resolve_undo","tags","json"])]
     format: Option<String>,
     #[arg(long)]
     json: bool,
@@ -160,6 +162,7 @@ struct Row<'a> {
     stage: Option<u8>,
     bytes: Option<&'a Vec<u8>>,
     reason: char,
+    undo: bool,
 }
 #[derive(Clone)]
 enum Field {
@@ -233,7 +236,11 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
     let cached = !options.unmerged
         && (options.cached
             || options.stage
-            || !(options.deleted || options.modified || options.others || options.killed));
+            || !(options.deleted
+                || options.modified
+                || options.others
+                || options.killed
+                || options.resolve_undo));
     let mut rows = Vec::new();
     for path in &controlled {
         if !pathspec.matches(path) || (options.ignored && !rules.excluded(state, path)?) {
@@ -272,6 +279,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     } else {
                         'H'
                     },
+                    undo: false,
                 });
             }
             if options.deleted && current.is_none() {
@@ -280,6 +288,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: Some(stage),
                     bytes: Some(bytes),
                     reason: 'R',
+                    undo: false,
                 });
             }
             if options.modified && current.as_ref() != Some(bytes) {
@@ -288,6 +297,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: Some(stage),
                     bytes: Some(bytes),
                     reason: 'C',
+                    undo: false,
                 });
             }
         }
@@ -298,6 +308,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: Some(0),
                     bytes: None,
                     reason: if index.skipped(path) { 'S' } else { 'H' },
+                    undo: false,
                 });
             }
             if options.deleted && current.is_none() && !index.hidden(path) {
@@ -306,6 +317,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: Some(0),
                     bytes: None,
                     reason: 'R',
+                    undo: false,
                 });
             }
             if options.modified && current.is_some() && !index.hidden(path) {
@@ -314,6 +326,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: Some(0),
                     bytes: None,
                     reason: 'C',
+                    undo: false,
                 });
             }
         }
@@ -337,6 +350,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: None,
                     bytes: None,
                     reason: '?',
+                    undo: false,
                 });
             }
             if options.killed
@@ -350,17 +364,42 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     stage: None,
                     bytes: None,
                     reason: 'K',
+                    undo: false,
                 });
             }
         }
     }
-    rows.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stage.cmp(&b.stage)));
+    if options.resolve_undo {
+        for (path, stages) in &index.resolve_undo {
+            if !pathspec.matches(path) || (options.ignored && !rules.excluded(state, path)?) {
+                continue;
+            }
+            for stage in 1..=3 {
+                if let Some(bytes) = stages.image(stage) {
+                    rows.push(Row {
+                        path: path.clone(),
+                        stage: Some(stage),
+                        bytes: Some(bytes),
+                        reason: 'U',
+                        undo: true,
+                    });
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.undo
+            .cmp(&b.undo)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.stage.cmp(&b.stage))
+    });
     if options.deduplicate
         && !(options.stage
             || options.unmerged
             || options.tags
             || options.assume_tags
             || options.monitor_tags
+            || options.resolve_undo
             || format.is_some())
     {
         rows.dedup_by(|a, b| a.path == b.path);
@@ -372,12 +411,19 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
             .bytes
             .map(|bytes| state.repo.hash_payload("wasm", bytes, false))
             .transpose()?;
-        let monitor = index_flags::monitor_valid(state, &index, &row.path)?;
-        let assume = index
-            .flags
-            .get(&row.path)
-            .is_some_and(|flag| flag.assume_unchanged);
-        json_rows.push(json!({"path":row.path,"stage":row.stage,"object_id":id,"kind":row.bytes.map(|_|"wasm"),"byte_len":row.bytes.map(Vec::len),"reason":row.reason.to_string(),"object_may_be_unpublished":row.bytes.is_some(),"intent_to_add":index.intents.contains(&row.path),"assume_unchanged":assume,"skip_worktree":index.skipped(&row.path),"fsmonitor_valid":monitor}));
+        let monitor = !row.undo && index_flags::monitor_valid(state, &index, &row.path)?;
+        let assume = !row.undo
+            && index
+                .flags
+                .get(&row.path)
+                .is_some_and(|flag| flag.assume_unchanged);
+        let mut json_row = json!({"path":row.path,"stage":row.stage,"object_id":id,"kind":row.bytes.map(|_|"wasm"),"byte_len":row.bytes.map(Vec::len),"reason":row.reason.to_string(),"object_may_be_unpublished":row.bytes.is_some(),"intent_to_add":index.intents.contains(&row.path),"assume_unchanged":assume,"skip_worktree":index.skipped(&row.path),"fsmonitor_valid":monitor});
+        if row.undo {
+            json_row["resolve_undo"] = json!(true);
+            json_row["intent_to_add"] = json!(false);
+            json_row["skip_worktree"] = json!(false);
+        }
+        json_rows.push(json_row);
         if let Some(fields) = &format {
             for field in fields {
                 match field {
@@ -411,11 +457,11 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                 });
                 output.push(' ');
             }
-            if options.stage || options.unmerged {
+            if options.stage || options.unmerged || row.undo {
                 if let (Some(id), Some(stage)) = (&id, row.stage) {
                     output.push_str(&format!("100644 {id} {stage}\t"));
                 }
-                if index.intents.contains(&row.path) {
+                if !row.undo && index.intents.contains(&row.path) {
                     output.push_str("100644 - 0\t");
                 }
             }
