@@ -71,6 +71,17 @@ fn reference_updates(
     nul: bool,
     allow_failures: bool,
 ) -> Output {
+    reference_updates_with_flags(root, native, records, nul, allow_failures, false)
+}
+
+fn reference_updates_with_flags(
+    root: &Path,
+    native: bool,
+    records: &str,
+    nul: bool,
+    allow_failures: bool,
+    no_deref: bool,
+) -> Output {
     let mut command = if native {
         let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
         command.args(["update-ref", p(root), "--stdin"]);
@@ -85,6 +96,9 @@ fn reference_updates(
     };
     if allow_failures {
         command.arg("--batch-updates");
+    }
+    if no_deref {
+        command.arg("--no-deref");
     }
     if nul {
         command.arg("-z");
@@ -358,6 +372,177 @@ fn native_partial_reference_batches_match_git_rejections_control_and_final_ref_v
             };
             observations.push((normalize(outcome.stdout), normalize(refs)));
             assert_eq!(fs::read(root.join("a.wasm")).unwrap(), wasm(2));
+        }
+        assert_eq!(observations[0], observations[1], "{case}");
+    }
+}
+
+#[test]
+fn native_head_transactions_match_git_symbolic_oid_leases_and_pointer_only_outcomes() {
+    let temp = Temp::new();
+    let native = temp.path("native-head-refs");
+    let reference = temp.path("git-head-refs");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    let (mut native_ids, mut git_ids) = (Vec::new(), Vec::new());
+    for value in [1, 2] {
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(value)).unwrap();
+        }
+        success(uw(&["add", p(&native), "a.wasm"]));
+        success(uw(&[
+            "commit",
+            p(&native),
+            "-m",
+            &format!("head value {value}"),
+        ]));
+        native_ids.push(
+            String::from_utf8(success(uw(&["rev-parse", p(&native), "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+        success(git(&reference, &["add", "a.wasm"]));
+        success(git(
+            &reference,
+            &["commit", "-m", &format!("head value {value}")],
+        ));
+        git_ids.push(
+            String::from_utf8(success(git(&reference, &["rev-parse", "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+    }
+    let cases=[
+        ("target-lease","symbolic","symref-update HEAD refs/heads/topic ref refs/heads/main\n",false,true,true),
+        ("oid-lease","symbolic","symref-update HEAD refs/heads/topic oid SECOND\n",false,true,true),
+        ("wrong-target","symbolic","symref-update HEAD refs/heads/topic ref refs/heads/wrong\n",false,true,true),
+        ("wrong-oid","symbolic","symref-update HEAD refs/heads/topic oid FIRST\n",false,true,true),
+        ("verify","symbolic","symref-verify HEAD refs/heads/main\n",false,true,true),
+        ("verify-wrong","symbolic","symref-verify HEAD refs/heads/topic\n",false,true,true),
+        ("verify-detached","detached","symref-verify HEAD refs/heads/main\n",false,true,true),
+        ("detached-target","detached","symref-update HEAD refs/heads/topic ref refs/heads/main\n",false,true,true),
+        ("reattach-oid","detached","symref-update HEAD refs/heads/topic oid FIRST\n",false,true,true),
+        ("detach","symbolic","update HEAD FIRST SECOND\n",false,true,true),
+        ("verify-oid","symbolic","verify HEAD SECOND\n",false,true,true),
+        ("unborn-verify","unborn","verify HEAD ZERO\n",false,true,true),
+        ("unborn-attach","unborn","symref-update HEAD refs/heads/topic oid ZERO\n",false,true,true),
+        ("unborn-retarget","unborn","symref-update HEAD refs/heads/another ref refs/heads/unborn\n",false,true,true),
+        ("create-and-attach","symbolic","create refs/heads/reviewed FIRST\nsymref-update HEAD refs/heads/reviewed ref refs/heads/main\n",false,true,true),
+        ("final-destination-tip","symbolic","update refs/heads/topic SECOND FIRST\nsymref-update HEAD refs/heads/topic ref refs/heads/main\n",false,true,true),
+        ("abort","symbolic","start\ncreate refs/tags/reviewed FIRST\nsymref-update HEAD refs/heads/topic ref refs/heads/main\nprepare\nabort\n",false,true,true),
+        ("prepared-eof","symbolic","create refs/tags/reviewed FIRST\nsymref-update HEAD refs/heads/topic ref refs/heads/main\nprepare\n",false,true,true),
+        ("partial-commit","symbolic","start\ncreate refs/tags/reviewed FIRST\nsymref-update HEAD refs/heads/topic ref refs/heads/wrong\nprepare\ncommit\n",false,true,true),
+        ("nul-target","symbolic","symref-update HEAD\0refs/heads/topic\0ref\0refs/heads/main\0",true,true,true),
+        ("nul-unleased","symbolic","symref-update HEAD\0refs/heads/topic\0\0\0",true,true,true),
+        ("one-option","symbolic","option no-deref\nsymref-update HEAD refs/heads/topic ref refs/heads/main\n",false,true,false),
+        ("bad-mode","symbolic","create refs/tags/reviewed FIRST\nsymref-update HEAD refs/heads/topic invalid refs/heads/main\n",false,false,true),
+        ("verify-needs-no-deref","symbolic","symref-verify HEAD refs/heads/main\n",false,false,false),
+    ];
+    for (case, initial, template, nul, expected_success, no_deref) in cases {
+        let mut observations = Vec::new();
+        for (root, is_native, ids, width) in [
+            (&native, true, &native_ids, 64),
+            (&reference, false, &git_ids, 40),
+        ] {
+            if is_native {
+                success(uw(&["symbolic-ref", p(root), "HEAD", "refs/heads/main"]));
+            } else {
+                success(git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]));
+            }
+            let refs = if is_native {
+                success(uw(&["show-ref", p(root)]))
+            } else {
+                success(git(root, &["show-ref"]))
+            };
+            for line in String::from_utf8(refs).unwrap().lines() {
+                let name = line.split_once(' ').unwrap().1;
+                if name == "refs/heads/main" {
+                    continue;
+                }
+                if is_native {
+                    success(uw(&["update-ref", p(root), "-d", name]));
+                } else {
+                    success(git(root, &["update-ref", "-d", name]));
+                }
+            }
+            if is_native {
+                success(uw(&["update-ref", p(root), "refs/heads/topic", &ids[0]]));
+            } else {
+                success(git(root, &["update-ref", "refs/heads/topic", &ids[0]]));
+            }
+            if initial == "detached" {
+                if is_native {
+                    success(uw(&["update-ref", p(root), "--no-deref", "HEAD", &ids[0]]));
+                } else {
+                    success(git(root, &["update-ref", "--no-deref", "HEAD", &ids[0]]));
+                }
+            } else if initial == "unborn" {
+                if is_native {
+                    success(uw(&["symbolic-ref", p(root), "HEAD", "refs/heads/unborn"]));
+                } else {
+                    success(git(root, &["symbolic-ref", "HEAD", "refs/heads/unborn"]));
+                }
+            }
+            let native_index = if is_native {
+                Some(fs::read(root.join(".uwgit/index")).unwrap())
+            } else {
+                None
+            };
+            let records = template
+                .replace("FIRST", &ids[0])
+                .replace("SECOND", &ids[1])
+                .replace("ZERO", &"0".repeat(width));
+            let output =
+                reference_updates_with_flags(root, is_native, &records, nul, true, no_deref);
+            assert_eq!(
+                output.status.success(),
+                expected_success,
+                "{case}, native={is_native}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let response = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    if line.starts_with("rejected ") {
+                        let fields = line.splitn(5, ' ').collect::<Vec<_>>();
+                        format!("rejected {} {}", fields[1], fields[4])
+                    } else {
+                        line.into()
+                    }
+                })
+                .collect::<Vec<String>>();
+            let head = fs::read_to_string(root.join(if is_native {
+                ".uwgit/HEAD"
+            } else {
+                ".git/HEAD"
+            }))
+            .unwrap();
+            let head = head.trim();
+            let identity = if is_native && !ids.iter().any(|id| id == head) {
+                format!("refs/heads/{head}")
+            } else {
+                head.strip_prefix("ref: ").unwrap_or(head).into()
+            };
+            let refs = if is_native {
+                success(uw(&["show-ref", p(root)]))
+            } else {
+                success(git(root, &["show-ref"]))
+            };
+            let normalize =
+                |value: String| value.replace(&ids[0], "FIRST").replace(&ids[1], "SECOND");
+            observations.push((
+                response,
+                normalize(identity),
+                normalize(String::from_utf8(refs).unwrap()),
+            ));
+            assert_eq!(fs::read(root.join("a.wasm")).unwrap(), wasm(2));
+            if let Some(index) = native_index {
+                assert_eq!(fs::read(root.join(".uwgit/index")).unwrap(), index);
+            }
         }
         assert_eq!(observations[0], observations[1], "{case}");
     }

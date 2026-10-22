@@ -46,6 +46,37 @@ impl PendingOperation {
                     .is_some_and(|prepared| prepared.commit == identity))
     }
 }
+pub(super) fn decode_head_reflog(bytes: Option<&[u8]>) -> RepositoryResult<Vec<ReflogEntry>> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() as u64 > MAX_PENDING_BYTES {
+        return Err("HEAD reflog exceeds its size limit".into());
+    }
+    let entries: Vec<ReflogEntry> =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if entries.len() > 4096
+        || serde_json::to_vec(&entries).map_err(|error| error.to_string())? != bytes
+    {
+        return Err("noncanonical or oversized HEAD reflog".into());
+    }
+    let mut previous: Option<u64> = None;
+    for entry in &entries {
+        if entry.reference != "HEAD"
+            || entry.sequence == 0
+            || entry.operation.is_empty()
+            || previous.is_some_and(|old| old.checked_add(1) != Some(entry.sequence))
+        {
+            return Err("invalid HEAD reflog entry".into());
+        }
+        for id in entry.old.iter().chain(&entry.new) {
+            require_id(id)?;
+        }
+        previous = Some(entry.sequence);
+    }
+    Ok(entries)
+}
+
 impl Repository {
     pub(super) fn read_head_reflog(&self) -> RepositoryResult<Vec<ReflogEntry>> {
         let path = self.metadata.join("head-reflog.json");
@@ -61,28 +92,7 @@ impl Repository {
             return Err("HEAD reflog must be a bounded regular file".into());
         }
         let bytes = read_regular(&path)?;
-        let entries: Vec<ReflogEntry> =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        if entries.len() > 4096
-            || serde_json::to_vec(&entries).map_err(|error| error.to_string())? != bytes
-        {
-            return Err("noncanonical or oversized HEAD reflog".into());
-        }
-        let mut previous: Option<u64> = None;
-        for entry in &entries {
-            if entry.reference != "HEAD"
-                || entry.sequence == 0
-                || entry.operation.is_empty()
-                || previous.is_some_and(|old| old.checked_add(1) != Some(entry.sequence))
-            {
-                return Err("invalid HEAD reflog entry".into());
-            }
-            for id in entry.old.iter().chain(&entry.new) {
-                require_id(id)?;
-            }
-            previous = Some(entry.sequence);
-        }
-        Ok(entries)
+        decode_head_reflog(Some(&bytes))
     }
     pub(super) fn record_head_event(
         &self,

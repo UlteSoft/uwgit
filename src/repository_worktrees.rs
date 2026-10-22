@@ -15,15 +15,10 @@ struct WorktreeRecord {
     locked: Option<String>,
 }
 
-fn registry(common: &Path) -> RepositoryResult<Worktrees> {
+fn registry_image(common: &Path) -> RepositoryResult<Option<Vec<u8>>> {
     let path = common.join("worktrees.json");
     let bytes = match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Worktrees {
-                version: 1,
-                entries: BTreeMap::new(),
-            })
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
         Ok(metadata)
             if metadata.is_file()
@@ -34,7 +29,20 @@ fn registry(common: &Path) -> RepositoryResult<Worktrees> {
         }
         Ok(_) => return Err("worktree registry must be a regular file of at most 4 MiB".into()),
     };
-    let value: Worktrees = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(Some(bytes))
+}
+
+fn decode_registry(bytes: Option<&[u8]>) -> RepositoryResult<Worktrees> {
+    let Some(bytes) = bytes else {
+        return Ok(Worktrees {
+            version: 1,
+            entries: BTreeMap::new(),
+        });
+    };
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("worktree registry exceeds 4 MiB".into());
+    }
+    let value: Worktrees = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if value.version != 1 || serde_json::to_vec(&value).map_err(|error| error.to_string())? != bytes
     {
         return Err("invalid, duplicate-key, or non-canonical worktree registry".into());
@@ -58,6 +66,10 @@ fn registry(common: &Path) -> RepositoryResult<Worktrees> {
         }
     }
     Ok(value)
+}
+
+fn registry(common: &Path) -> RepositoryResult<Worktrees> {
+    decode_registry(registry_image(common)?.as_deref())
 }
 
 pub(super) fn has_entries(common: &Path) -> RepositoryResult<bool> {
@@ -140,9 +152,7 @@ pub(super) fn open_common(root: &Path, metadata: &Path) -> RepositoryResult<Path
                 .entries
                 .get(&id)
                 .ok_or("linked worktree is not registered; use worktree repair")?;
-            if canonical(root)? != Path::new(&record.path)
-                || parse_ref_file(&read_regular(&metadata.join("HEAD"))?, false)? != record.branch
-            {
+            if canonical(root)? != Path::new(&record.path) {
                 return Err("linked worktree registration differs from its path or HEAD; use worktree repair".into());
             }
             Ok(common)
@@ -151,6 +161,41 @@ pub(super) fn open_common(root: &Path, metadata: &Path) -> RepositoryResult<Path
 }
 
 impl Repository {
+    pub(super) fn validate_registered_head(&self) -> RepositoryResult<()> {
+        if self.common_metadata == self.metadata {
+            return Ok(());
+        }
+        let id = marker(&self.metadata.join("worktree-id"))?;
+        let records = registry(&self.common_metadata)?;
+        let record = records
+            .entries
+            .get(&id)
+            .ok_or("linked worktree is not registered; use worktree repair")?;
+        if canonical(&self.root)? != Path::new(&record.path)
+            || self.current_branch()? != record.branch
+        {
+            return Err(
+                "linked worktree registration differs from its path or HEAD; use worktree repair"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn reference_head_registry(
+        &self,
+    ) -> RepositoryResult<(Option<String>, Option<Vec<u8>>)> {
+        self.validate_registered_head()?;
+        let image = registry_image(&self.common_metadata)?;
+        decode_registry(image.as_deref())?;
+        let id = if self.common_metadata == self.metadata {
+            None
+        } else {
+            Some(marker(&self.metadata.join("worktree-id"))?)
+        };
+        Ok((id, image))
+    }
+
     pub fn common_metadata(&self) -> &Path {
         &self.common_metadata
     }
@@ -541,4 +586,87 @@ impl Repository {
         self.write_worktrees(&records)?;
         Ok(json!({"status":"removed","path":target,"branch_removed":false,"objects_removed":false}))
     }
+}
+
+// Resolve only a registered worktree ID or the primary checkout. Journal data
+// never supplies an unchecked destination path for HEAD publication.
+pub(super) fn reference_head_origin(
+    common: &Path,
+    id: Option<&str>,
+    image: Option<&[u8]>,
+) -> RepositoryResult<Repository> {
+    let common = canonical(common)?;
+    let records = decode_registry(image)?;
+    let root = if let Some(id) = id {
+        require_id(id)?;
+        PathBuf::from(
+            &records
+                .entries
+                .get(id)
+                .ok_or("HEAD transaction worktree is not registered")?
+                .path,
+        )
+    } else {
+        common
+            .parent()
+            .ok_or("common metadata has no primary worktree")?
+            .to_path_buf()
+    };
+    if canonical(&root)? != root {
+        return Err(
+            "HEAD transaction worktree moved; restore its registered path before recovery".into(),
+        );
+    }
+    let metadata = root.join(".uwgit");
+    require_directory(&metadata)?;
+    require_directory(&metadata.join("tmp"))?;
+    if read_regular(&metadata.join("format"))? != FORMAT {
+        return Err("invalid HEAD transaction repository format".into());
+    }
+    if let Some(id) = id {
+        if marker(&metadata.join("worktree-id"))? != id
+            || marker(&metadata.join("commondir"))?
+                != common.to_str().ok_or("common metadata requires UTF-8")?
+        {
+            return Err(
+                "HEAD transaction worktree markers differ from the frozen registration".into(),
+            );
+        }
+    } else if metadata != common {
+        return Err("HEAD transaction primary metadata differs from its common directory".into());
+    }
+    Ok(Repository {
+        root,
+        metadata,
+        common_metadata: common,
+    })
+}
+
+pub(super) fn reference_registry_after(
+    id: Option<&str>,
+    image: Option<&[u8]>,
+    before: &str,
+    after: &str,
+) -> RepositoryResult<Option<Vec<u8>>> {
+    let mut records = decode_registry(image)?;
+    let Some(id) = id else {
+        return Ok(image.map(<[u8]>::to_vec));
+    };
+    require_id(id)?;
+    let record = records
+        .entries
+        .get_mut(id)
+        .ok_or("HEAD transaction worktree registration is missing")?;
+    if record.branch != before {
+        return Err("HEAD transaction preimage differs from its worktree registration".into());
+    }
+    if before == after {
+        return Ok(image.map(<[u8]>::to_vec));
+    }
+    record.branch = after.into();
+    let bytes = serde_json::to_vec(&records).map_err(|error| error.to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("worktree registry exceeds 4 MiB".into());
+    }
+    Ok(Some(bytes))
 }

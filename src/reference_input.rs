@@ -1,6 +1,8 @@
 //! Streaming update-ref input. Prepared transactions keep the shared writer
 //! lock until commit/abort/EOF; acknowledgements are flushed immediately.
-use crate::repository::{ReferenceEdit, ReferenceEditKind, Repository, RepositoryResult};
+use crate::repository::{
+    ReferenceEdit, ReferenceEditKind, ReferenceExpectation, Repository, RepositoryResult,
+};
 use std::io::{BufRead, Read, Write};
 
 const MAX_FIELD: u64 = 8192;
@@ -97,7 +99,8 @@ fn record(input: &mut impl BufRead, nul: bool) -> RepositoryResult<Option<Vec<St
     let mut fields = line.splitn(2, ' ').map(str::to_owned).collect::<Vec<_>>();
     let needed = match fields[0].as_str() {
         "update" => 2,
-        "create" | "delete" | "verify" => 1,
+        "symref-update" => 3,
+        "create" | "delete" | "verify" | "symref-verify" => 1,
         "option" | "start" | "prepare" | "commit" | "abort" => 0,
         _ => return Err("unsupported update-ref input command".into()),
     };
@@ -107,50 +110,90 @@ fn record(input: &mut impl BufRead, nul: bool) -> RepositoryResult<Option<Vec<St
     Ok(Some(fields))
 }
 
-fn edit(fields: &[String], nul: bool) -> RepositoryResult<ReferenceEdit> {
+fn edit(fields: &[String], nul: bool, no_deref: bool) -> RepositoryResult<ReferenceEdit> {
+    let old_oid = |value: &str| {
+        if nul && value.is_empty() {
+            None
+        } else {
+            Some(ReferenceExpectation::Oid(value.into()))
+        }
+    };
     let (kind, new, expected) = match fields {
         [command, _, new] if command == "update" => {
             (ReferenceEditKind::Update, Some(new.clone()), None)
         }
-        [command, _, new, old] if command == "update" => (
-            ReferenceEditKind::Update,
-            Some(new.clone()),
-            if nul && old.is_empty() {
-                None
-            } else {
-                Some(old.clone())
-            },
-        ),
+        [command, _, new, old] if command == "update" => {
+            (ReferenceEditKind::Update, Some(new.clone()), old_oid(old))
+        }
         [command, _, new] if command == "create" => {
             (ReferenceEditKind::Create, Some(new.clone()), None)
         }
         [command, _] if command == "delete" => (ReferenceEditKind::Delete, None, None),
-        [command, _, old] if command == "delete" => (
-            ReferenceEditKind::Delete,
-            None,
-            if nul && old.is_empty() {
-                None
-            } else {
-                Some(old.clone())
-            },
-        ),
+        [command, _, old] if command == "delete" => (ReferenceEditKind::Delete, None, old_oid(old)),
         [command, _] if command == "verify" => (ReferenceEditKind::Verify, None, None),
-        [command, _, old] if command == "verify" => (
-            ReferenceEditKind::Verify,
+        [command, _, old] if command == "verify" => (ReferenceEditKind::Verify, None, old_oid(old)),
+        [command, _, new] if command == "symref-update" => {
+            (ReferenceEditKind::SymrefUpdate, Some(new.clone()), None)
+        }
+        [command, _, new, mode, old] if command == "symref-update" => {
+            let expected = match mode.as_str() {
+                "ref" if !old.is_empty() => Some(ReferenceExpectation::Target(old.clone())),
+                "oid" if !old.is_empty() => Some(ReferenceExpectation::Oid(old.clone())),
+                "" if nul && old.is_empty() => None,
+                _ => return Err("symref-update requires ref OLD_TARGET or oid OLD_ID".into()),
+            };
+            (ReferenceEditKind::SymrefUpdate, Some(new.clone()), expected)
+        }
+        [command, _] if command == "symref-verify" => (ReferenceEditKind::SymrefVerify, None, None),
+        [command, _, old] if command == "symref-verify" => (
+            ReferenceEditKind::SymrefVerify,
             None,
-            if nul && old.is_empty() {
+            if old.is_empty() {
                 None
             } else {
-                Some(old.clone())
+                Some(ReferenceExpectation::Target(old.clone()))
             },
         ),
         _ => return Err("invalid update-ref command or field count".into()),
     };
+    let symbolic = matches!(
+        kind,
+        ReferenceEditKind::SymrefUpdate | ReferenceEditKind::SymrefVerify
+    );
+    if symbolic && !no_deref {
+        return Err("native symref HEAD commands require --no-deref or option no-deref".into());
+    }
+    if fields[1] == "HEAD" {
+        if symbolic {
+            for value in new
+                .iter()
+                .chain(expected.iter().filter_map(|expected| match expected {
+                    ReferenceExpectation::Target(value) => Some(value),
+                    _ => None,
+                }))
+            {
+                let branch = value
+                    .strip_prefix("refs/heads/")
+                    .ok_or("native symbolic HEAD requires refs/heads/NAME")?;
+                crate::repository::validate_ref_name(branch)?;
+            }
+        }
+    } else {
+        if symbolic {
+            return Err("HEAD is the native symbolic reference".into());
+        }
+        let name = fields[1]
+            .strip_prefix("refs/heads/")
+            .or_else(|| fields[1].strip_prefix("refs/tags/"))
+            .ok_or("update-ref requires refs/heads/NAME or refs/tags/NAME")?;
+        crate::repository::validate_ref_name(name)?;
+    }
     Ok(ReferenceEdit {
         kind,
         reference: fields[1].clone(),
         new,
         expected,
+        no_deref,
     })
 }
 
@@ -158,12 +201,14 @@ pub(super) fn run(
     repo: &Repository,
     nul: bool,
     allow_failures: bool,
+    no_deref: bool,
     message: &str,
 ) -> RepositoryResult<()> {
     run_stream(
         repo,
         nul,
         allow_failures,
+        no_deref,
         message,
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
@@ -174,6 +219,7 @@ fn run_stream(
     repo: &Repository,
     nul: bool,
     allow_failures: bool,
+    no_deref: bool,
     message: &str,
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -246,7 +292,7 @@ fn run_stream(
                         "cannot queue references in a closed or prepared transaction".into(),
                     );
                 }
-                let edit = edit(&fields, nul)?;
+                let edit = edit(&fields, nul, no_deref || option_pending)?;
                 if !names.insert(edit.reference.clone()) {
                     return Err("duplicate reference in transaction".into());
                 }

@@ -27,6 +27,8 @@ linked worktree 可以同时 detached 在同一提交；这不占用任何分支
 
 HEAD 切换、提交和恢复使用各工作树自己的 `head-reflog.json`；上一检出身份使用各自的 `checkouts.json`。两者为有界、规范编码的本地恢复记录，各保留最近 4096 项，不进入 bundle。共享分支日志仍在原来的 reflog 中。写入故障会明确指出 HEAD 是否已经发布；prepared 冲突续作可补齐缺失的完成日志，重试不重复创建提交或完成事件。
 
+HEAD 的批量 `symref-update/verify`、ref/oid 租约、显式 no-deref update 和 version 2 原子恢复见[引用事务](ref-transactions.md)。单独 symbolic-ref 同样使用该事务，保持原有指针操作语义及 index/工作字节。
+
 ## 修订与分支选项
 
 ```sh

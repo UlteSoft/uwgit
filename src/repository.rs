@@ -36,7 +36,7 @@ mod plumbing_storage;
 pub use plumbing_storage::MergeBaseMode;
 #[path = "repository_ref_transactions.rs"]
 mod ref_transactions;
-pub use ref_transactions::{ReferenceEdit, ReferenceEditKind};
+pub use ref_transactions::{ReferenceEdit, ReferenceEditKind, ReferenceExpectation};
 #[path = "repository_head.rs"]
 mod head_storage;
 #[path = "repository_revisions.rs"]
@@ -812,7 +812,9 @@ impl Repository {
             metadata,
             common_metadata,
         };
+        repo.recover_reference_transaction_on_open()?;
         repo.current_branch()?;
+        repo.validate_registered_head()?;
         Ok(repo)
     }
 
@@ -3897,12 +3899,13 @@ impl Repository {
     }
 
     fn snapshot(&self) -> RepositoryResult<Snapshot> {
-        self.snapshot_with_reference_state(None)
+        self.snapshot_with_reference_state(None, None)
     }
 
     fn snapshot_with_reference_state(
         &self,
         state: Option<&ref_transactions::ReferenceState>,
+        head_image: Option<(&str, Option<&[u8]>)>,
     ) -> RepositoryResult<Snapshot> {
         let tags = if let Some(state) = state {
             state.tags.clone()
@@ -3911,7 +3914,11 @@ impl Repository {
         };
         let manifest = Manifest {
             format: if tags.is_empty() { 1 } else { 2 },
-            head: self.current_branch()?,
+            head: if let Some((identity, _)) = head_image {
+                identity.into()
+            } else {
+                self.current_branch()?
+            },
             refs: if let Some(state) = state {
                 state.refs.clone()
             } else {
@@ -3941,7 +3948,11 @@ impl Repository {
         } else {
             self.read_reflog()?
         };
-        let head_reflog = self.read_head_reflog()?;
+        let head_reflog = if let Some((_, bytes)) = head_image {
+            head_storage::decode_head_reflog(bytes)?
+        } else {
+            self.read_head_reflog()?
+        };
         for entry in reflog.iter().chain(&head_reflog) {
             for id in entry.old.iter().chain(entry.new.iter()) {
                 if !matches!(objects.get(id), Some(Object::Commit(_))) {

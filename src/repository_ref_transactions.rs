@@ -1,6 +1,9 @@
 //! Shared-lock reference transactions. A durable commit decision is rolled
 //! forward before any later locked operation can observe the repository.
 use super::*;
+#[path = "repository_ref_head.rs"]
+mod head_transaction;
+use head_transaction::{ReferenceHead, ResolvedHeadEdit};
 
 const JOURNAL: &str = "ref-transaction.json";
 const MAX_TRANSACTION_BYTES: u64 = 64 * 1024 * 1024;
@@ -12,13 +15,21 @@ pub enum ReferenceEditKind {
     Create,
     Delete,
     Verify,
+    SymrefUpdate,
+    SymrefVerify,
+}
+
+pub enum ReferenceExpectation {
+    Oid(String),
+    Target(String),
 }
 
 pub struct ReferenceEdit {
     pub kind: ReferenceEditKind,
     pub reference: String,
     pub new: Option<String>,
-    pub expected: Option<String>,
+    pub expected: Option<ReferenceExpectation>,
+    pub no_deref: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +40,8 @@ enum RejectionReason {
     InvalidNew,
     NameConflict,
     CheckedOut,
+    ExpectedSymbolic,
+    RequiredHead,
 }
 
 impl std::fmt::Display for RejectionReason {
@@ -40,6 +53,8 @@ impl std::fmt::Display for RejectionReason {
             Self::InvalidNew => "invalid new value provided",
             Self::NameConflict => "refname conflict",
             Self::CheckedOut => "reference is checked out in a worktree",
+            Self::ExpectedSymbolic => "expected symref but found regular ref",
+            Self::RequiredHead => "native HEAD cannot be deleted",
         })
     }
 }
@@ -112,6 +127,8 @@ struct ReferencePlan {
     message: String,
     before: ReferenceState,
     changes: Vec<ReferenceChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head: Option<ReferenceHead>,
 }
 
 pub struct PreparedReferences<'a> {
@@ -135,6 +152,16 @@ fn reference_parts(reference: &str) -> RepositoryResult<(&str, &str)> {
     Ok((namespace, name))
 }
 
+fn resolve_reference_oid(snapshot: &Snapshot, value: &str) -> RepositoryResult<Option<String>> {
+    if value.is_empty() || (value.len() == 64 && value.bytes().all(|byte| byte == b'0')) {
+        return Ok(None);
+    }
+    if valid_id(value) {
+        return Ok(Some(value.into()));
+    }
+    snapshot_revision(snapshot, value).map(Some)
+}
+
 fn resolve_reference_edit(
     snapshot: &Snapshot,
     edit: &ReferenceEdit,
@@ -146,18 +173,17 @@ fn resolve_reference_edit(
         &snapshot.manifest.tags
     };
     let old = refs.get(name).cloned();
-    let resolve = |value: &str| -> RepositoryResult<Option<String>> {
-        if value.is_empty() || (value.len() == 64 && value.bytes().all(|byte| byte == b'0')) {
-            return Ok(None);
-        }
-        // A syntactically valid full ID can name an absent or wrong-type object.
-        // Classify that at prepare, separately from an unparseable revision.
-        if valid_id(value) {
-            return Ok(Some(value.into()));
-        }
-        snapshot_revision(snapshot, value).map(Some)
-    };
-    let mut expected = edit.expected.as_deref().map(resolve).transpose()?;
+    let resolve = |value: &str| resolve_reference_oid(snapshot, value);
+    let mut expected = edit
+        .expected
+        .as_ref()
+        .map(|expected| match expected {
+            ReferenceExpectation::Oid(value) => resolve(value),
+            ReferenceExpectation::Target(_) => {
+                Err("direct references require an old object ID".into())
+            }
+        })
+        .transpose()?;
     let requested_new = match edit.kind {
         ReferenceEditKind::Update | ReferenceEditKind::Create => resolve(
             edit.new
@@ -289,7 +315,9 @@ impl ReferenceState {
 
 impl ReferencePlan {
     fn after(&self) -> RepositoryResult<ReferenceState> {
-        if self.version != 1 || self.message.is_empty() || self.changes.len() > MAX_REFERENCE_EDITS
+        if self.version != if self.head.is_some() { 2 } else { 1 }
+            || self.message.is_empty()
+            || self.changes.len() + usize::from(self.head.is_some()) > MAX_REFERENCE_EDITS
         {
             return Err("invalid reference transaction version, message or size".into());
         }
@@ -337,6 +365,17 @@ impl ReferencePlan {
         }
         validate_prefixes(&after.refs)?;
         validate_prefixes(&after.tags)?;
+        if let Some(head) = &self.head {
+            head.validate_images(&self.before, &after, &self.message)?;
+            if head.changed() {
+                let sequence = u64::try_from(reflog.len())
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or("reflog sequence overflow")?;
+                reflog.push(head.event(&self.before, &after, &self.message, sequence));
+                changed = true;
+            }
+        }
         if upstreams
             != decode_upstreams_optional(self.before.upstreams.as_deref(), &self.before.refs)?
         {
@@ -386,12 +425,37 @@ impl Repository {
         // Metadata damage is fatal even if every requested branch is rejected.
         linked_worktrees::has_entries(&self.common_metadata)?;
         let mut names = BTreeSet::new();
+        let mut physical_names = BTreeSet::new();
         let mut resolved = Vec::new();
+        let mut resolved_head = None;
         for edit in edits {
             if !names.insert(&edit.reference) {
                 return Err("duplicate reference in transaction".into());
             }
-            resolved.push(resolve_reference_edit(&snapshot, edit)?);
+            let physical = if edit.reference == "HEAD"
+                && !edit.no_deref
+                && !valid_id(&snapshot.manifest.head)
+                && !matches!(
+                    edit.kind,
+                    ReferenceEditKind::SymrefUpdate | ReferenceEditKind::SymrefVerify
+                ) {
+                format!("refs/heads/{}", snapshot.manifest.head)
+            } else {
+                edit.reference.clone()
+            };
+            if !physical_names.insert(physical) {
+                return Err("duplicate reference after HEAD dereference".into());
+            }
+            if edit.reference == "HEAD"
+                || matches!(
+                    edit.kind,
+                    ReferenceEditKind::SymrefUpdate | ReferenceEditKind::SymrefVerify
+                )
+            {
+                resolved_head = Some(ResolvedHeadEdit::resolve(self, &snapshot, edit)?);
+            } else {
+                resolved.push(resolve_reference_edit(&snapshot, edit)?);
+            }
         }
         let mut reasons = Vec::new();
         for edit in &resolved {
@@ -416,9 +480,22 @@ impl Repository {
                 changes.push(edit.change);
             }
         }
+        let head = if let Some(head) = resolved_head {
+            if let Some(rejection) = head.rejection {
+                if !allow_failures {
+                    return Err(rejection.to_string());
+                }
+                rejections.push(rejection);
+                None
+            } else {
+                Some(ReferenceHead::capture(self, &snapshot, head.after)?)
+            }
+        } else {
+            None
+        };
         rejections.sort_by(|left, right| left.reference.cmp(&right.reference));
         let plan = ReferencePlan {
-            version: 1,
+            version: if head.is_some() { 2 } else { 1 },
             message: message.into(),
             before: ReferenceState {
                 refs: snapshot.manifest.refs,
@@ -427,6 +504,7 @@ impl Repository {
                 reflog: optional_file(&self.common_metadata.join("reflog"))?,
             },
             changes,
+            head,
         };
         self.validate_reference_plan(&plan)?;
         plan.bytes()?;
@@ -476,10 +554,25 @@ impl Repository {
         // Disk refs/upstreams/reflog may be between writes during recovery.
         // Verify the complete immutable store and other metadata using the saved
         // preimage, then independently verify the resulting reference graph.
-        let snapshot = self.snapshot_with_reference_state(Some(&plan.before))?;
+        let origin = plan
+            .head
+            .as_ref()
+            .map(|head| head.origin(self))
+            .transpose()?;
+        let repository = origin.as_ref().unwrap_or(self);
+        let snapshot = repository.snapshot_with_reference_state(
+            Some(&plan.before),
+            plan.head
+                .as_ref()
+                .map(|head| (head.before.as_str(), head.head_reflog.as_deref())),
+        )?;
+        let after_head = plan
+            .head
+            .as_ref()
+            .map_or_else(|| snapshot.manifest.head.clone(), |head| head.after.clone());
         let manifest = Manifest {
-            format: manifest_format(&snapshot.manifest.head, &after.tags, &snapshot.objects),
-            head: snapshot.manifest.head.clone(),
+            format: manifest_format(&after_head, &after.tags, &snapshot.objects),
+            head: after_head,
             refs: after.refs.clone(),
             tags: after.tags.clone(),
         };
@@ -492,7 +585,12 @@ impl Repository {
                         "update-ref refuses the checked-out branch; use commit or reset".into(),
                     );
                 }
-                self.assert_branch_available(name)?;
+                repository.assert_branch_available(name)?;
+            }
+        }
+        if let Some(head) = &plan.head {
+            if head.changed() && !valid_id(&head.after) {
+                repository.assert_branch_available(&head.after)?;
             }
         }
         Ok(after)
@@ -524,6 +622,9 @@ impl Repository {
                     "{name} differs from both transaction images; restore it before recovery"
                 ));
             }
+        }
+        if let Some(head) = &plan.head {
+            head.check_preimages(self, &plan.before, after, &plan.message)?;
         }
         Ok(())
     }
@@ -631,6 +732,9 @@ impl Repository {
             )?;
             checkpoint()?;
         }
+        if let Some(head) = &plan.head {
+            head.apply(self, &plan.before, after, &plan.message, &mut checkpoint)?;
+        }
         if after.reflog != plan.before.reflog {
             self.atomic_write(
                 &self.common_metadata.join("reflog"),
@@ -644,6 +748,17 @@ impl Repository {
     fn clear_reference_transaction(&self) -> RepositoryResult<()> {
         fs::remove_file(self.common_metadata.join(JOURNAL)).map_err(|error| error.to_string())?;
         sync_directory(&self.common_metadata)
+    }
+
+    pub(super) fn recover_reference_transaction_on_open(&self) -> RepositoryResult<()> {
+        match fs::symlink_metadata(self.common_metadata.join(JOURNAL)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+            Ok(_) => {
+                let _lock = self.lock()?;
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn recover_reference_transaction(&self) -> RepositoryResult<()> {
@@ -677,12 +792,16 @@ impl Repository {
 impl PreparedReferences<'_> {
     pub fn commit(self) -> RepositoryResult<ReferenceCommitOutcome> {
         let after = self.plan.after()?;
-        let reports = self.plan.changes.iter().map(|change| json!({"reference":change.reference,"old":change.old,"new":change.new,"updated":change.old != change.new})).collect();
-        if self
-            .plan
-            .changes
-            .iter()
-            .all(|change| change.old == change.new)
+        let mut reports: Vec<Value> = self.plan.changes.iter().map(|change| json!({"reference":change.reference,"old":change.old,"new":change.new,"updated":change.old != change.new})).collect();
+        if let Some(head) = &self.plan.head {
+            reports.push(head.report(&self.plan.before, &after));
+        }
+        if !self.plan.head.as_ref().is_some_and(ReferenceHead::changed)
+            && self
+                .plan
+                .changes
+                .iter()
+                .all(|change| change.old == change.new)
         {
             return Ok(ReferenceCommitOutcome {
                 updates: reports,
@@ -722,6 +841,7 @@ mod tests {
             reference: reference.into(),
             new: new.map(str::to_owned),
             expected: None,
+            no_deref: false,
         }
     }
     fn fixture(temp: &Temp) -> (Repository, ReferencePlan, ReferenceState) {
@@ -932,7 +1052,7 @@ mod tests {
             let first = &original.before.refs["topic"];
             let second = &original.before.refs["main"];
             let mut missing = edit(ReferenceEditKind::Update, "refs/heads/missing", Some(first));
-            missing.expected = Some(second.clone());
+            missing.expected = Some(ReferenceExpectation::Oid(second.clone()));
             let prepared = repo
                 .prepare_reference_batch(
                     &[
@@ -987,6 +1107,346 @@ mod tests {
             persist(&repo, &plan);
             repo.branches().unwrap();
             assert_eq!(repo.read_reflog().unwrap(), log);
+        }
+    }
+
+    fn head_fixture(
+        temp: &Temp,
+        linked: bool,
+    ) -> (
+        Repository,
+        Repository,
+        Repository,
+        ReferencePlan,
+        ReferenceState,
+    ) {
+        let primary = Repository::init(temp.0.join("primary")).unwrap();
+        let first = primary.commit(WASM_HEADER, "head first").unwrap();
+        let second = primary
+            .commit(
+                &[WASM_HEADER.as_slice(), &[0, 2, 0, 1]].concat(),
+                "head second",
+            )
+            .unwrap();
+        primary.create_branch("peer", &first).unwrap();
+        primary.create_branch("retired", &first).unwrap();
+        primary
+            .atomic_write(
+                &primary.common_metadata.join("upstreams.json"),
+                &encode_upstreams(&BTreeMap::from([(
+                    "retired".into(),
+                    Upstream {
+                        remote: "origin".into(),
+                        branch: "retired".into(),
+                    },
+                )]))
+                .unwrap(),
+            )
+            .unwrap();
+        primary
+            .add_linked_worktree(&temp.0.join("peer"), "peer", None, Some("a.wasm"))
+            .unwrap();
+        let peer = Repository::open(temp.0.join("peer")).unwrap();
+        let origin = Repository::open(if linked { &peer.root } else { &primary.root }).unwrap();
+        let mut head = edit(
+            ReferenceEditKind::SymrefUpdate,
+            "HEAD",
+            Some("refs/heads/reviewed"),
+        );
+        head.no_deref = true;
+        head.expected = Some(ReferenceExpectation::Target(format!(
+            "refs/heads/{}",
+            origin.current_branch().unwrap()
+        )));
+        let prepared = origin
+            .prepare_reference_edits(
+                &[
+                    edit(ReferenceEditKind::Delete, "refs/heads/retired", None),
+                    edit(
+                        ReferenceEditKind::Create,
+                        "refs/heads/reviewed",
+                        Some(&second),
+                    ),
+                    edit(ReferenceEditKind::Create, "refs/tags/release", Some(&first)),
+                    head,
+                ],
+                "recover HEAD batch",
+            )
+            .unwrap();
+        let plan = prepared.plan.clone();
+        let after = plan.after().unwrap();
+        drop(prepared);
+        (primary, peer, origin, plan, after)
+    }
+
+    #[test]
+    fn every_head_publication_prefix_reopens_and_recovers_from_either_worktree() {
+        for linked in [false, true] {
+            for open_origin in [false, true] {
+                let writes = if linked { 8 } else { 7 };
+                for stop in 0..=writes {
+                    let temp = Temp::new();
+                    let (primary, peer, origin, plan, after) = head_fixture(&temp, linked);
+                    assert_eq!(plan.version, 2);
+                    let head = plan.head.as_ref().unwrap();
+                    let other = if linked { &primary } else { &peer };
+                    let other_log =
+                        optional_file(&other.metadata.join("head-reflog.json")).unwrap();
+                    let work = optional_file(&origin.root.join("a.wasm")).unwrap();
+                    let index = optional_file(&origin.metadata.join("index")).unwrap();
+                    persist(&primary, &plan);
+                    if stop > 0 {
+                        let mut count = 0;
+                        assert!(origin
+                            .apply_reference_plan(&plan, &after, || {
+                                count += 1;
+                                if count == stop {
+                                    Err("injected HEAD publication interruption".into())
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .is_err());
+                    }
+                    let entry = if open_origin {
+                        &origin.root
+                    } else {
+                        &other.root
+                    };
+                    Repository::open(entry).unwrap().state().unwrap();
+                    let recovered = Repository::open(&origin.root).unwrap();
+                    assert_eq!(recovered.current_branch().unwrap(), "reviewed");
+                    assert_eq!(primary.read_refs().unwrap(), after.refs);
+                    assert_eq!(primary.read_named_refs("tags", true).unwrap(), after.tags);
+                    assert_eq!(
+                        optional_file(&primary.common_metadata.join("reflog")).unwrap(),
+                        after.reflog
+                    );
+                    assert_eq!(
+                        optional_file(&primary.common_metadata.join("upstreams.json")).unwrap(),
+                        after.upstreams
+                    );
+                    let old =
+                        head_storage::decode_head_reflog(head.head_reflog.as_deref()).unwrap();
+                    let events = recovered.read_head_reflog().unwrap();
+                    assert_eq!(events.len(), old.len() + 1);
+                    assert_eq!(events.last().unwrap().operation, "recover HEAD batch");
+                    assert_eq!(
+                        optional_file(&other.metadata.join("head-reflog.json")).unwrap(),
+                        other_log
+                    );
+                    assert_eq!(optional_file(&origin.root.join("a.wasm")).unwrap(), work);
+                    assert_eq!(
+                        optional_file(&origin.metadata.join("index")).unwrap(),
+                        index
+                    );
+                    assert!(!primary.common_metadata.join(JOURNAL).exists());
+                    recovered.validate_registered_head().unwrap();
+                    Repository::open(&primary.root).unwrap().state().unwrap();
+                    Repository::open(&peer.root).unwrap().state().unwrap();
+                    persist(&primary, &plan);
+                    Repository::open(&other.root).unwrap();
+                    assert_eq!(recovered.read_head_reflog().unwrap(), events);
+                    assert_eq!(
+                        optional_file(&primary.common_metadata.join("reflog")).unwrap(),
+                        after.reflog
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detached_and_symbolic_manifest_transitions_recover_each_publication_prefix() {
+        for linked in [false, true] {
+            for attach in [false, true] {
+                for stop in 0..=if linked { 5 } else { 4 } {
+                    let temp = Temp::new();
+                    let (primary, _peer, origin, original, _) = head_fixture(&temp, linked);
+                    let selected = original.before.refs["main"].clone();
+                    let original_branch = origin.current_branch().unwrap();
+                    if attach {
+                        origin
+                            .update_reference(
+                                "HEAD",
+                                Some(&selected),
+                                None,
+                                "prepare detached fixture",
+                                true,
+                            )
+                            .unwrap();
+                    }
+                    let mut change = if attach {
+                        let mut change = edit(
+                            ReferenceEditKind::SymrefUpdate,
+                            "HEAD",
+                            Some(&format!("refs/heads/{original_branch}")),
+                        );
+                        change.expected = Some(ReferenceExpectation::Oid(selected.clone()));
+                        change
+                    } else {
+                        let mut change = edit(ReferenceEditKind::Update, "HEAD", Some(&selected));
+                        change.expected = Some(ReferenceExpectation::Oid(
+                            origin.state().unwrap().tip().unwrap().clone(),
+                        ));
+                        change
+                    };
+                    change.no_deref = true;
+                    let prepared = origin
+                        .prepare_reference_edits(
+                            &[
+                                edit(
+                                    ReferenceEditKind::Create,
+                                    "refs/tags/format-transition",
+                                    Some(&selected),
+                                ),
+                                change,
+                            ],
+                            "recover HEAD format transition",
+                        )
+                        .unwrap();
+                    let plan = prepared.plan.clone();
+                    let after = plan.after().unwrap();
+                    drop(prepared);
+                    persist(&primary, &plan);
+                    if stop > 0 {
+                        let mut count = 0;
+                        assert!(origin
+                            .apply_reference_plan(&plan, &after, || {
+                                count += 1;
+                                if count == stop {
+                                    Err("injected HEAD format interruption".into())
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .is_err());
+                    }
+                    let recovered = Repository::open(&origin.root).unwrap();
+                    let state = recovered.state().unwrap();
+                    assert_eq!(state.detached(), !attach);
+                    assert_eq!(
+                        state.head,
+                        if attach {
+                            original_branch.clone()
+                        } else {
+                            selected.clone()
+                        }
+                    );
+                    assert_eq!(
+                        optional_file(&primary.common_metadata.join("reflog")).unwrap(),
+                        after.reflog
+                    );
+                    let events = recovered.read_head_reflog().unwrap();
+                    persist(&primary, &plan);
+                    Repository::open(&primary.root).unwrap();
+                    assert_eq!(recovered.read_head_reflog().unwrap(), events);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn third_head_registry_log_or_marker_images_block_recovery_before_ref_writes() {
+        for damage in ["head", "head-log", "registry", "ref", "marker"] {
+            let temp = Temp::new();
+            let (primary, _peer, origin, plan, _) = head_fixture(&temp, true);
+            let head = plan.head.as_ref().unwrap();
+            persist(&primary, &plan);
+            let path = match damage {
+                "head" => origin.metadata.join("HEAD"),
+                "head-log" => origin.metadata.join("head-reflog.json"),
+                "registry" => primary.common_metadata.join("worktrees.json"),
+                "marker" => origin.metadata.join("worktree-id"),
+                _ => primary.common_metadata.join("refs/later"),
+            };
+            let bytes = match damage {
+                "head" | "ref" => format!("{}\n", plan.before.refs["main"]).into_bytes(),
+                "head-log" => b"later HEAD log bytes".to_vec(),
+                "marker" => format!("{}\n", "f".repeat(64)).into_bytes(),
+                _ => String::from_utf8(head.worktrees.as_ref().unwrap().clone())
+                    .unwrap()
+                    .replace("\"locked\":null", "\"locked\":\"manual lock edit\"")
+                    .into_bytes(),
+            };
+            fs::write(&path, &bytes).unwrap();
+            if damage == "registry" {
+                assert!(linked_worktrees::has_entries(&primary.common_metadata).unwrap());
+            }
+            assert!(Repository::open(&primary.root).is_err(), "{damage}");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(!primary.common_metadata.join("refs/reviewed").exists());
+            assert!(primary.common_metadata.join("refs/retired").is_file());
+            assert_eq!(
+                optional_file(&primary.common_metadata.join("reflog")).unwrap(),
+                plan.before.reflog
+            );
+            assert_eq!(
+                optional_file(&primary.common_metadata.join("upstreams.json")).unwrap(),
+                plan.before.upstreams
+            );
+            assert_eq!(
+                fs::read(primary.common_metadata.join(JOURNAL)).unwrap(),
+                plan.bytes().unwrap()
+            );
+            assert!(!primary.common_metadata.join("write.lock").exists());
+        }
+    }
+
+    #[test]
+    fn stale_writer_lock_is_preserved_until_explicit_removal_before_head_recovery() {
+        let temp = Temp::new();
+        let (primary, peer, origin, plan, _) = head_fixture(&temp, true);
+        persist(&primary, &plan);
+        let lock = primary.common_metadata.join("write.lock");
+        fs::write(&lock, b"crashed writer marker\n").unwrap();
+        assert!(Repository::open(&peer.root).is_err());
+        assert_eq!(fs::read(&lock).unwrap(), b"crashed writer marker\n");
+        assert_eq!(
+            origin.current_branch().unwrap(),
+            plan.head.as_ref().unwrap().before
+        );
+        fs::remove_file(lock).unwrap();
+        Repository::open(&peer.root).unwrap();
+        assert_eq!(origin.current_branch().unwrap(), "reviewed");
+    }
+
+    #[test]
+    fn old_ref_journals_remain_canonical_and_invalid_head_versions_or_origins_fail_closed() {
+        let temp = Temp::new();
+        let (repo, legacy, after) = fixture(&temp);
+        assert_eq!(legacy.version, 1);
+        assert!(serde_json::from_slice::<Value>(&legacy.bytes().unwrap())
+            .unwrap()
+            .get("head")
+            .is_none());
+        persist(&repo, &legacy);
+        Repository::open(&repo.root).unwrap();
+        assert_eq!(repo.read_refs().unwrap(), after.refs);
+        for damage in ["version", "origin", "unknown-field"] {
+            let temp = Temp::new();
+            let (primary, _peer, _origin, mut plan, _) = head_fixture(&temp, true);
+            if damage == "version" {
+                plan.version = 1;
+            } else if damage == "origin" {
+                plan.head.as_mut().unwrap().worktree = Some("f".repeat(64));
+            }
+            let mut value = serde_json::to_value(&plan).unwrap();
+            if damage == "unknown-field" {
+                value["head"]["output_path"] = json!("/tmp/unrelated");
+            }
+            primary
+                .atomic_write(
+                    &primary.common_metadata.join(JOURNAL),
+                    &serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+            assert!(Repository::open(&primary.root).is_err(), "{damage}");
+            assert_eq!(primary.read_refs().unwrap(), plan.before.refs);
+            assert_eq!(
+                optional_file(&primary.common_metadata.join("reflog")).unwrap(),
+                plan.before.reflog
+            );
         }
     }
 }

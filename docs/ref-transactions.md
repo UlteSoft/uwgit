@@ -1,6 +1,6 @@
 # 原生引用事务
 
-`update-ref` 只发布 uwgit 已验证的实际 commit；Wasm、tree、commit 和 SHA-256 对象格式保持原样。单引用入口与批量入口使用同一套持久化事务。HEAD、index 和工作文件不会被这个命令物化或切换。
+`update-ref` 只发布 uwgit 已验证的实际 commit；Wasm、tree、commit 和 SHA-256 对象格式保持原样。单引用入口与批量入口使用同一套持久化事务。显式 HEAD 操作可以改变当前工作树的指针，index 和工作文件始终保持原字节；需要切换工作文件时使用 switch。
 
 ```sh
 wasm-git update-ref DIR refs/heads/topic NEW_ID EXPECTED_OLD_ID
@@ -20,7 +20,7 @@ EOF
 
 文本输入逐行接受 `update REF NEW [OLD]`、`create REF NEW`、`delete REF [OLD]`、`verify REF [OLD]`，以及 `start`、`prepare`、`commit`、`abort`。字段可使用 C 字符串引号和三位八进制转义。空行、错误字段数、同一事务内重复引用、无效 UTF-8、不完整记录和未知命令都会失败。
 
-引用限于 `refs/heads/NAME` 和 `refs/tags/NAME`。NEW/OLD 可以使用受支持的 commit 修订语法，全部在准备时的同一个已验证快照中解析。前一行排队的新值不会改变后一行修订的含义。64 个零或文本中的 `""` 表示零值；零 NEW 的 update 删除引用，零 OLD 要求引用不存在。create 要求不存在且 NEW 非零；delete 的显式 OLD 不能为零；verify 省略 OLD 时要求不存在。
+普通引用使用 `refs/heads/NAME` 和 `refs/tags/NAME`；HEAD 的附加规则见下节。NEW/OLD 可以使用受支持的 commit 修订语法，全部在准备时的同一个已验证快照中解析。前一行排队的新值不会改变后一行修订的含义。64 个零或文本中的 `""` 表示零值；零 NEW 的 update 删除普通引用，零 OLD 要求旧 oid 不存在。create 要求不存在且 NEW 非零；delete 的显式 OLD 不能为零；verify 省略 OLD 时要求旧 oid 不存在。
 
 `-z` 使用以下 NUL 字段，省略的 OLD 也必须提供一个空字段。空 OLD 表示没有提供该条件；verify 仍检查不存在。create 没有 OLD 字段。控制命令的响应总是逐行文本。
 
@@ -35,9 +35,35 @@ commit NUL
 abort NUL
 ```
 
-每条记录/字段最多 8192 字节，每个事务最多 4096 个引用；持久记录最多 64 MiB。`--no-deref` 及逐条 `option no-deref` 适用于这里的直接引用；不将文件系统符号链接解释成引用。`--create-reflog` 可用，原生模型本来就为所有实际引用变更记录日志。同值 update 和 verify 不追加日志。
+每条记录/字段最多 8192 字节，每个事务最多 4096 个引用；持久记录最多 64 MiB。`--no-deref` 及逐条 `option no-deref` 选择 HEAD 本身；普通分支和标签本来就是直接引用。`--deref` 恢复默认，命令行相反开关以后一个为准，逐条 option 只作用于下一条引用指令。不将文件系统符号链接解释成引用。`--create-reflog` 可用，原生模型本来就为所有实际引用变更记录日志。同值 update 和 verify 不追加日志。
 
 默认在准备时同时检查所有旧值、目标 commit 类型及完整对象图、引用名称和最终文件/目录前缀冲突、当前及其他已注册 worktree 的分支占用。任意一项不成立时，整批都不发布。删除 `topic` 并创建 `topic/child`，或相反，可以在同一事务完成；删除的分支同时清理其 upstream 关联。
+
+## 原生 HEAD 的符号引用事务
+
+```sh
+wasm-git update-ref DIR --stdin --no-deref -m 'attach reviewed HEAD' <<EOF
+start
+create refs/heads/reviewed EXISTING_COMMIT_ID
+symref-update HEAD refs/heads/reviewed ref refs/heads/main
+prepare
+commit
+EOF
+wasm-git update-ref DIR --stdin --no-deref <<EOF
+symref-verify HEAD refs/heads/reviewed
+EOF
+wasm-git update-ref DIR --no-deref HEAD EXISTING_COMMIT_ID EXPECTED_OLD_COMMIT_ID
+```
+
+`symref-update HEAD NEW_TARGET [ref OLD_TARGET | oid OLD_ID]` 和 `symref-verify HEAD [OLD_TARGET]` 接入同一事务。目标仅为正常 `refs/heads/NAME`；可指向尚无提交的 unborn 分支。ref 租约要求 HEAD 确实是所给符号目标，detached HEAD 失败；oid 租约比较当前真实 tip，也可将 detached HEAD 按预期 oid 重新附着。没有 tip 时用 64 个零检查。verify 省略目标要求符号引用不存在，uwgit 正常仓库的 HEAD 因而会拒绝这一条件。
+
+这两条符号指令要求全局 `--no-deref` 或前一条 `option no-deref`。同一事务可创建或更新目标分支，再一次性发布 HEAD；oid 修订仍从事务准备时的原快照解析，HEAD 完成日志使用最终目标分支的实际 tip。默认普通 HEAD update 仍保护已检出分支；显式 `--no-deref` 的普通 update 将 HEAD 切到真实 commit，进入 detached 状态。原生 HEAD 必须存在，删除 HEAD 和任意符号别名的创建/删除仍不在当前模型中。
+
+NUL 输入为 `symref-update SP HEAD NUL TARGET NUL MODE NUL OLD NUL`，不提供旧值时 MODE 和 OLD 均为空字段；MODE 只能为 ref 或 oid。`symref-verify SP HEAD NUL OLD_TARGET NUL` 的空字段表示未提供目标。HEAD 与其默认解引用分支不能在同一批次重复指定；`--no-deref` 操作 HEAD 本身时，可与普通分支更新并列。HEAD 的 JSON 报告明确区分 symbolic/commit 身份及实际 old_commit/new_commit，不把分支名当作提交 ID。
+
+单独 `symbolic-ref HEAD TARGET` 也使用相同事务。HEAD 身份真正变化时，共享日志和该工作树自己的 HEAD 日志各记一次；prepare、abort、EOF 丢弃和同身份操作不追加。`checkouts.json` 保持原样，因为这些入口只修改指针。索引、Wasm 工作副本和其他工作树的 HEAD 日志不变。
+
+包含 HEAD 的事务使用 journal version 2，记录 origin 的已注册 worktree ID（primary 使用空 ID）、HEAD 原/新身份、原始 worktree 注册和本地 HEAD 日志。仅更新普通引用的 version 1 编码保持兼容。恢复目标从注册 ID 或 primary 的实际目录解析，journal 不能直接指定任意输出路径。恢复前同时核对 HEAD、注册、两个日志及全部引用的原/新像；linked worktree 打开时先完成持久事务恢复，再核对注册一致性，允许修复两次写入之间的合法中断。任何第三种人工编辑都先失败保持。
 
 ## 逐项拒绝模式
 
@@ -72,6 +98,8 @@ commit 先同步 `.uwgit/ref-transaction.json`，保存完整引用前像、逐�
 
 回归覆盖混合更新/创建/删除/校验、旧值失败整批保持、同快照修订解析、NUL 与 C 引号、交互 prepare 的真实锁、EOF/abort、跨 worktree 保护、两向前缀替换和多笔事务。恢复测试在配置、删除、引用写入及 reflog 每个检查点中断，再从普通查询恢复，并验证引用、upstream 和日志原字节；完整安装后再次恢复也只保留一次日志。损坏记录、重复项、缺失对象和第三种人工编辑必须失败保持。
 
+HEAD 测试覆盖主/linked worktree 从任一入口打开恢复、符号与 detached 两向格式转换、第三种规范编码注册/HEAD/日志内容的失败保持、旧 journal 兼容及 stale writer 锁的人工处理。24 组独立 Git 对照检查 ref/oid 租约、detached/unborn、NUL 和指针操作后的引用值及原字节。
+
 逐项模式另覆盖成功/拒绝混合、全拒绝保持、只为接受项记日志、原生分支保护、选项覆盖、交互拒绝输出时机，以及过滤后的接受子集逐写入前缀恢复。独立 Git 仓库对照语义拒绝、名称冲突、prepare/abort/EOF/commit、NUL、格式错误及最终引用值；Wasm 原字节、index 和工作树也必须保持。
 
-协议语义参考 [Git update-ref](https://git-scm.com/docs/git-update-ref)，实际实现和恢复记录均为 uwgit 原生。本轮不包含 HEAD 或其他符号引用的批量 `symref-*`、任意引用命名空间及网络多引用原子推送；这些仍在能力矩阵中列为剩余项。
+协议语义参考 [Git update-ref](https://git-scm.com/docs/git-update-ref)，实际实现和恢复记录均为 uwgit 原生。本轮仍不包含任意符号别名及 `symref-create/delete`、任意引用命名空间、网络多引用原子推送；这些仍在能力矩阵中列为剩余项。

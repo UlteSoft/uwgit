@@ -84,8 +84,10 @@ enum Command {
         #[arg(long, overrides_with = "batch_updates")]
         no_batch_updates: bool,
         /// Native direct refs never dereference a symbolic link.
-        #[arg(long)]
+        #[arg(long, overrides_with = "deref")]
         no_deref: bool,
+        #[arg(long, overrides_with = "no_deref")]
+        deref: bool,
         /// Native references always record changes in the shared reflog.
         #[arg(long)]
         create_reflog: bool,
@@ -210,7 +212,8 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             nul,
             batch_updates,
             no_batch_updates: _,
-            no_deref: _,
+            no_deref,
+            deref: _,
             create_reflog: _,
             reference,
             values,
@@ -223,7 +226,7 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             }
             if stdin {
                 crate::porcelain::with_no_pending(&dir, |repo| {
-                    reference_input::run(repo, nul, batch_updates, &message)?;
+                    reference_input::run(repo, nul, batch_updates, no_deref, &message)?;
                     Ok(String::new())
                 })?;
                 return Ok(QueryOutput::new(String::new(), 0));
@@ -237,7 +240,7 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
                 _ => return Err("update-ref DIR [-d] [-m MESSAGE] REF [NEW] [OLD]".into()),
             };
             crate::porcelain::with_no_pending(&dir, |repo| {
-                repo.update_reference(&reference, new, expected, &message)
+                repo.update_reference(&reference, new, expected, &message, no_deref)
                     .and_then(|report| {
                         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
                     })

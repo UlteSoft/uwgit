@@ -52,7 +52,7 @@ wasm-git symbolic-ref DIR HEAD refs/heads/topic
 wasm-git check-ref-format --branch feature/x
 ```
 
-`symbolic-ref` 只改变 HEAD 指针；不切换工作文件或 index，也不创建目标引用。它可指向尚未出生的新分支。需要同步工作区时使用 switch。跨工作树占用保护与 pending 操作保护同样适用。
+`symbolic-ref` 使用与批量 `symref-update/verify HEAD` 相同的持久事务，统一保护 HEAD、worktree 注册和双日志；只改变 HEAD 指针；不切换工作文件或 index，也不创建目标引用。它可指向尚未出生的新分支。需要同步工作区时使用 switch。跨工作树占用保护与 pending 操作保护同样适用。
 
 ## 批量读取原始对象
 
@@ -149,7 +149,7 @@ maintenance 支持 verify 和 gc，未实现的任务明确拒绝。所有维护
 
 ## 覆盖范围
 
-上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。已增加[索引标志与意向条目](index-flags.md)和[多目标 replay 队列](replay-queue.md)。仍需交互式/保留 merge 拓扑的 rebase、更多 pathspec、批量符号引用及任意命名空间、浅层/完整稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
+上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。已增加[索引标志与意向条目](index-flags.md)和[多目标 replay 队列](replay-queue.md)。仍需交互式/保留 merge 拓扑的 rebase、更多 pathspec、任意符号别名及创建/删除、任意命名空间、浅层/完整稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
 
 ## 合并策略
 

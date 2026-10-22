@@ -12,34 +12,23 @@ pub enum MergeBaseMode {
 
 impl Repository {
     pub fn symbolic_head(&self, new: Option<&str>, message: &str) -> RepositoryResult<String> {
-        let _lock = self.lock()?;
-        let snapshot = self.snapshot()?;
         if let Some(branch) = new {
-            if message.is_empty() {
-                return Err("symbolic-ref message must not be empty".into());
-            }
             validate_ref_name(branch)?;
-            self.assert_branch_available(branch)?;
-            if branch != snapshot.manifest.head {
-                self.register_selected_branch(branch)?;
-                self.atomic_write(
-                    &self.metadata.join("HEAD"),
-                    format!("{branch}\n").as_bytes(),
-                )?;
-                self.record_reflog(
-                    "HEAD",
-                    snapshot.manifest.tip().cloned(),
-                    snapshot.manifest.refs.get(branch).cloned(),
-                    message,
-                )?;
-                self.record_head_event(
-                    snapshot.manifest.tip().cloned(),
-                    snapshot.manifest.refs.get(branch).cloned(),
-                    message,
-                )?;
-            }
+            self.prepare_reference_edits(
+                &[ReferenceEdit {
+                    kind: ReferenceEditKind::SymrefUpdate,
+                    reference: "HEAD".into(),
+                    new: Some(format!("refs/heads/{branch}")),
+                    expected: None,
+                    no_deref: true,
+                }],
+                message,
+            )?
+            .commit()?;
             Ok(branch.into())
         } else {
+            let _lock = self.lock()?;
+            let snapshot = self.snapshot()?;
             if valid_id(&snapshot.manifest.head) {
                 return Err("HEAD is detached".into());
             }
@@ -329,6 +318,7 @@ impl Repository {
         new: Option<&str>,
         expected: Option<&str>,
         message: &str,
+        no_deref: bool,
     ) -> RepositoryResult<Value> {
         let edit = ReferenceEdit {
             kind: if new.is_some() {
@@ -338,7 +328,8 @@ impl Repository {
             },
             reference: reference.into(),
             new: new.map(str::to_owned),
-            expected: expected.map(str::to_owned),
+            expected: expected.map(|value| ReferenceExpectation::Oid(value.into())),
+            no_deref,
         };
         self.prepare_reference_edits(&[edit], message)?
             .commit()?
