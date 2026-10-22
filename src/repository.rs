@@ -34,6 +34,9 @@ mod merge_tool_storage;
 #[path = "repository_plumbing.rs"]
 mod plumbing_storage;
 pub use plumbing_storage::MergeBaseMode;
+#[path = "repository_ref_transactions.rs"]
+mod ref_transactions;
+pub use ref_transactions::{ReferenceEdit, ReferenceEditKind};
 #[path = "repository_head.rs"]
 mod head_storage;
 #[path = "repository_revisions.rs"]
@@ -3240,7 +3243,9 @@ impl Repository {
     }
 
     fn lock(&self) -> RepositoryResult<WriteLock> {
-        self.lock_named("write.lock")
+        let lock = self.lock_named("write.lock")?;
+        self.recover_reference_transaction()?;
+        Ok(lock)
     }
 
     fn lock_named(&self, name: &str) -> RepositoryResult<WriteLock> {
@@ -3477,22 +3482,7 @@ impl Repository {
         if bytes.len() as u64 > MAX_UPSTREAM_BYTES {
             return Err("upstream configuration exceeds the 1 MiB limit".into());
         }
-        let record: UpstreamFile = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("invalid upstream configuration: {e}"))?;
-        if record.version != 1 {
-            return Err("unsupported upstream configuration version".into());
-        }
-        if encode_upstreams(&record.branches)? != bytes {
-            return Err("non-canonical or duplicate-key upstream configuration".into());
-        }
-        for local in record.branches.keys() {
-            if !branches.contains_key(local) {
-                return Err(format!(
-                    "upstream association refers to missing or unborn local branch {local}"
-                ));
-            }
-        }
-        Ok(record.branches)
+        decode_upstreams(&bytes, branches)
     }
 
     /// A failed atomic write can have reached rename or directory sync. Never
@@ -3760,41 +3750,7 @@ impl Repository {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(io_error("inspect reflog", &path, e)),
         };
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let body = bytes
-            .strip_suffix(b"\n")
-            .ok_or("reflog has an incomplete trailing entry")?;
-        let mut entries = Vec::new();
-        for line in body.split(|byte| *byte == b'\n') {
-            let entry: ReflogEntry =
-                serde_json::from_slice(line).map_err(|e| format!("invalid reflog entry: {e}"))?;
-            if serde_json::to_vec(&entry).map_err(|e| format!("encode reflog entry: {e}"))? != line
-            {
-                return Err("non-canonical or duplicate-key reflog entry".into());
-            }
-            let sequence = u64::try_from(entries.len())
-                .ok()
-                .and_then(|n| n.checked_add(1))
-                .ok_or("reflog sequence overflow")?;
-            if entry.sequence != sequence || entry.operation.is_empty() {
-                return Err("invalid reflog sequence or operation".into());
-            }
-            if entry.reference != "HEAD" {
-                let name = entry
-                    .reference
-                    .strip_prefix("refs/heads/")
-                    .or_else(|| entry.reference.strip_prefix("refs/tags/"))
-                    .ok_or("invalid reflog reference namespace")?;
-                validate_ref_name(name)?;
-            }
-            for id in entry.old.iter().chain(entry.new.iter()) {
-                require_id(id)?;
-            }
-            entries.push(entry);
-        }
-        Ok(entries)
+        decode_reflog(&bytes)
     }
 
     fn record_reflog(
@@ -3941,11 +3897,26 @@ impl Repository {
     }
 
     fn snapshot(&self) -> RepositoryResult<Snapshot> {
-        let tags = self.read_named_refs("tags", true)?;
+        self.snapshot_with_reference_state(None)
+    }
+
+    fn snapshot_with_reference_state(
+        &self,
+        state: Option<&ref_transactions::ReferenceState>,
+    ) -> RepositoryResult<Snapshot> {
+        let tags = if let Some(state) = state {
+            state.tags.clone()
+        } else {
+            self.read_named_refs("tags", true)?
+        };
         let manifest = Manifest {
             format: if tags.is_empty() { 1 } else { 2 },
             head: self.current_branch()?,
-            refs: self.read_refs()?,
+            refs: if let Some(state) = state {
+                state.refs.clone()
+            } else {
+                self.read_refs()?
+            },
             tags,
         };
         let mut encoded = BTreeMap::new();
@@ -3965,7 +3936,11 @@ impl Repository {
         let mut manifest = manifest;
         manifest.format = manifest_format(&manifest.head, &manifest.tags, &objects);
         validate_snapshot(&manifest, &objects)?;
-        let reflog = self.read_reflog()?;
+        let reflog = if let Some(state) = state {
+            decode_reflog(state.reflog.as_deref().unwrap_or_default())?
+        } else {
+            self.read_reflog()?
+        };
         let head_reflog = self.read_head_reflog()?;
         for entry in reflog.iter().chain(&head_reflog) {
             for id in entry.old.iter().chain(entry.new.iter()) {
@@ -3977,7 +3952,11 @@ impl Repository {
             }
         }
         let tracking = self.read_tracking(&objects)?;
-        let upstreams = self.read_upstreams(&manifest.refs)?;
+        let upstreams = if let Some(state) = state {
+            decode_upstreams_optional(state.upstreams.as_deref(), &manifest.refs)?
+        } else {
+            self.read_upstreams(&manifest.refs)?
+        };
         let upstream_tips = revision_syntax::upstream_tips(self, &upstreams, &tracking);
         let checkouts = self.checkout_history()?;
         Ok(Snapshot {
@@ -4690,6 +4669,78 @@ fn validate_upstream_remote_name(name: &str) -> RepositoryResult<()> {
         return Err(format!("invalid upstream remote name {name:?}: use 1-64 ASCII letters, digits, '_' or '-', starting with a letter or digit"));
     }
     Ok(())
+}
+
+fn decode_upstreams_optional(
+    bytes: Option<&[u8]>,
+    branches: &BTreeMap<String, String>,
+) -> RepositoryResult<BTreeMap<String, Upstream>> {
+    bytes
+        .map(|bytes| decode_upstreams(bytes, branches))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn decode_upstreams(
+    bytes: &[u8],
+    branches: &BTreeMap<String, String>,
+) -> RepositoryResult<BTreeMap<String, Upstream>> {
+    if bytes.len() as u64 > MAX_UPSTREAM_BYTES {
+        return Err("upstream configuration exceeds the 1 MiB limit".into());
+    }
+    let record: UpstreamFile = serde_json::from_slice(bytes)
+        .map_err(|e| format!("invalid upstream configuration: {e}"))?;
+    if record.version != 1 {
+        return Err("unsupported upstream configuration version".into());
+    }
+    if encode_upstreams(&record.branches)? != bytes {
+        return Err("non-canonical or duplicate-key upstream configuration".into());
+    }
+    for local in record.branches.keys() {
+        if !branches.contains_key(local) {
+            return Err(format!(
+                "upstream association refers to missing or unborn local branch {local}"
+            ));
+        }
+    }
+    Ok(record.branches)
+}
+
+fn decode_reflog(bytes: &[u8]) -> RepositoryResult<Vec<ReflogEntry>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = bytes
+        .strip_suffix(b"\n")
+        .ok_or("reflog has an incomplete trailing entry")?;
+    let mut entries = Vec::new();
+    for line in body.split(|byte| *byte == b'\n') {
+        let entry: ReflogEntry =
+            serde_json::from_slice(line).map_err(|e| format!("invalid reflog entry: {e}"))?;
+        if serde_json::to_vec(&entry).map_err(|e| format!("encode reflog entry: {e}"))? != line {
+            return Err("non-canonical or duplicate-key reflog entry".into());
+        }
+        let sequence = u64::try_from(entries.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("reflog sequence overflow")?;
+        if entry.sequence != sequence || entry.operation.is_empty() {
+            return Err("invalid reflog sequence or operation".into());
+        }
+        if entry.reference != "HEAD" {
+            let name = entry
+                .reference
+                .strip_prefix("refs/heads/")
+                .or_else(|| entry.reference.strip_prefix("refs/tags/"))
+                .ok_or("invalid reflog reference namespace")?;
+            validate_ref_name(name)?;
+        }
+        for id in entry.old.iter().chain(entry.new.iter()) {
+            require_id(id)?;
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn encode_upstreams(branches: &BTreeMap<String, Upstream>) -> RepositoryResult<Vec<u8>> {

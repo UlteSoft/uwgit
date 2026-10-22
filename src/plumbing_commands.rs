@@ -4,6 +4,8 @@ use crate::repository::{Repository, RepositoryResult};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::io::Read;
+#[path = "reference_input.rs"]
+mod reference_input;
 
 #[derive(Parser)]
 #[command(
@@ -60,14 +62,25 @@ enum Command {
         #[arg(short = 'm', action = clap::ArgAction::Append, required = true, allow_hyphen_values = true)]
         messages: Vec<String>,
     },
-    /// Compare-and-swap a non-current native branch or tag.
+    /// Compare-and-swap native references, optionally as one stdin transaction.
     UpdateRef {
         dir: String,
         #[arg(short = 'd')]
         delete: bool,
         #[arg(short = 'm', default_value = "update-ref", allow_hyphen_values = true)]
         message: String,
-        reference: String,
+        #[arg(long, conflicts_with_all = ["reference", "values", "delete"])]
+        stdin: bool,
+        #[arg(short = 'z', requires = "stdin")]
+        nul: bool,
+        /// Native direct refs never dereference a symbolic link.
+        #[arg(long)]
+        no_deref: bool,
+        /// Native references always record changes in the shared reflog.
+        #[arg(long)]
+        create_reflog: bool,
+        #[arg(required_unless_present = "stdin")]
+        reference: Option<String>,
         values: Vec<String>,
     },
     /// List unique commits in deterministic child-before-parent order.
@@ -183,9 +196,21 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             dir,
             delete,
             message,
+            stdin,
+            nul,
+            no_deref: _,
+            create_reflog: _,
             reference,
             values,
         } => {
+            if stdin {
+                crate::porcelain::with_no_pending(&dir, |repo| {
+                    reference_input::run(repo, nul, &message)?;
+                    Ok(String::new())
+                })?;
+                return Ok(QueryOutput::new(String::new(), 0));
+            }
+            let reference = reference.ok_or("missing reference")?;
             let (new, expected) = match (delete, values.as_slice()) {
                 (false, [new]) => (Some(new.as_str()), None),
                 (false, [new, old]) => (Some(new.as_str()), Some(old.as_str())),

@@ -2,8 +2,9 @@
 //! The uwgit process never invokes Git; only this independent reference test does.
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct Temp(PathBuf);
@@ -61,6 +62,166 @@ fn success(output: Output) -> Vec<u8> {
 }
 fn wasm(value: u8) -> Vec<u8> {
     [b"\0asm\x01\0\0\0".as_slice(), &[0, 3, 1, b'x', value]].concat()
+}
+
+#[test]
+fn native_reference_transaction_leases_and_control_match_independent_git_fixtures() {
+    fn input(root: &Path, native: bool, records: &str, nul: bool) -> Output {
+        let mut command = if native {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
+            command.args(["update-ref", p(root), "--stdin"]);
+            command
+        } else {
+            let mut command = Command::new("git");
+            command.args(["-C", p(root), "update-ref", "--stdin"]);
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            command
+        };
+        if nul {
+            command.arg("-z");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(records.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+    let temp = Temp::new();
+    let native = temp.path("native-refs");
+    let reference = temp.path("git-refs");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    let (mut native_ids, mut git_ids) = (Vec::new(), Vec::new());
+    for value in [1, 2] {
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(value)).unwrap();
+        }
+        success(uw(&["add", p(&native), "a.wasm"]));
+        success(uw(&["commit", p(&native), "-m", &format!("value {value}")]));
+        native_ids.push(
+            String::from_utf8(success(uw(&["rev-parse", p(&native), "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+        success(git(&reference, &["add", "a.wasm"]));
+        success(git(
+            &reference,
+            &["commit", "-m", &format!("value {value}")],
+        ));
+        git_ids.push(
+            String::from_utf8(success(git(&reference, &["rev-parse", "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+    }
+    for (root, is_native, ids, zero) in [
+        (&native, true, &native_ids, "0".repeat(64)),
+        (&reference, false, &git_ids, "0".repeat(40)),
+    ] {
+        success(input(
+            root,
+            is_native,
+            &format!(
+                "create refs/heads/topic {}\ncreate refs/tags/old {}\n",
+                ids[0], ids[0]
+            ),
+            false,
+        ));
+        let output = success(input(root, is_native, &format!("start\nupdate refs/heads/topic {} {}\ncreate refs/tags/release {}\ndelete refs/tags/old {}\nverify refs/heads/main {}\nprepare\ncommit\n", ids[1], ids[0], ids[1], ids[0], ids[1]), false));
+        assert_eq!(output, b"start: ok\nprepare: ok\ncommit: ok\n");
+        let failed = input(
+            root,
+            is_native,
+            &format!(
+                "create refs/tags/rejected {}\nupdate refs/heads/topic {} {}\n",
+                ids[0], ids[0], ids[0]
+            ),
+            false,
+        );
+        assert!(!failed.status.success());
+        // EOF after explicit prepare and explicit abort both leave no ref.
+        success(input(
+            root,
+            is_native,
+            &format!("start\ncreate refs/tags/uncommitted {}\nprepare\n", ids[0]),
+            false,
+        ));
+        success(input(
+            root,
+            is_native,
+            &format!(
+                "start\ncreate refs/tags/aborted {}\nprepare\nabort\n",
+                ids[0]
+            ),
+            false,
+        ));
+        success(input(
+            root,
+            is_native,
+            &format!(
+                "update refs/tags/release\0{}\0{}\0verify refs/tags/missing\0\0",
+                ids[0], ids[1]
+            ),
+            true,
+        ));
+        success(input(
+            root,
+            is_native,
+            &format!("update refs/tags/release {zero} {}\n", ids[0]),
+            false,
+        ));
+        let query = |name: &str| {
+            if is_native {
+                uw(&["rev-parse", p(root), name])
+            } else {
+                git(root, &["rev-parse", "--verify", name])
+            }
+        };
+        for name in [
+            "refs/tags/old",
+            "refs/tags/rejected",
+            "refs/tags/uncommitted",
+            "refs/tags/aborted",
+            "refs/tags/release",
+        ] {
+            assert!(!query(name).status.success(), "{name}");
+        }
+        assert_eq!(
+            String::from_utf8(success(query("refs/heads/topic")))
+                .unwrap()
+                .trim(),
+            ids[1]
+        );
+        // Compare actual original Wasm bytes, not unrelated native/Git hashes.
+        if is_native {
+            let exported = temp.path("exported.wasm");
+            success(uw(&[
+                "show",
+                p(root),
+                "topic",
+                "--file",
+                "a.wasm",
+                "--output",
+                p(&exported),
+            ]));
+            assert_eq!(fs::read(exported).unwrap(), wasm(2));
+        } else {
+            assert_eq!(success(git(root, &["show", "topic:a.wasm"])), wasm(2));
+        }
+    }
 }
 
 #[test]

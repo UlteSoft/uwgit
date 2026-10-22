@@ -330,51 +330,20 @@ impl Repository {
         expected: Option<&str>,
         message: &str,
     ) -> RepositoryResult<Value> {
-        let (namespace, name) = if let Some(name) = reference.strip_prefix("refs/heads/") {
-            ("refs", name)
-        } else if let Some(name) = reference.strip_prefix("refs/tags/") {
-            ("tags", name)
-        } else {
-            return Err("update-ref requires refs/heads/NAME or refs/tags/NAME".into());
-        };
-        validate_ref_name(name)?;
-        if message.is_empty() {
-            return Err("reference update message must not be empty".into());
-        }
-        let _lock = self.lock()?;
-        let snapshot = self.snapshot()?;
-        let refs = if namespace == "refs" {
-            &snapshot.manifest.refs
-        } else {
-            &snapshot.manifest.tags
-        };
-        let old = refs.get(name).map(String::as_str);
-        if let Some(expected) = expected {
-            require_id(expected)?;
-            let expected = if expected.bytes().all(|byte| byte == b'0') {
-                None
+        let edit = ReferenceEdit {
+            kind: if new.is_some() {
+                ReferenceEditKind::Update
             } else {
-                Some(expected)
-            };
-            if old != expected {
-                return Err("reference old-value lease does not match".into());
-            }
-        }
-        if let Some(new) = new {
-            require_id(new)?;
-            if !matches!(snapshot.objects.get(new), Some(Object::Commit(_))) {
-                return Err("reference target must be an existing commit object".into());
-            }
-        }
-        if namespace == "refs" && name == snapshot.manifest.head && old != new {
-            return Err("update-ref refuses the checked-out branch; use commit or reset".into());
-        }
-        match (old, new) {
-            (Some(old), None) => self.remove_named_ref(namespace, name, old, message)?,
-            (_, Some(new)) => self.write_named_ref(namespace, name, new, message)?,
-            (None, None) => {}
-        }
-        Ok(json!({"reference":reference,"old":old,"new":new,"updated":old != new}))
+                ReferenceEditKind::Delete
+            },
+            reference: reference.into(),
+            new: new.map(str::to_owned),
+            expected: expected.map(str::to_owned),
+        };
+        self.prepare_reference_edits(&[edit], message)?
+            .commit()?
+            .pop()
+            .ok_or("missing reference update report".into())
     }
 
     /// A single verified snapshot supplies the whole walk and every exclusion.

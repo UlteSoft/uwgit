@@ -24,7 +24,7 @@ wasm-git rev-list DIR --count OLD..NEW
 
 `write-tree` 从完整且没有未解决项的 index 发布不可变对象，不移动 HEAD 或修改 index。`read-tree` 默认只替换 index；另支持 `-m BASE [OURS] THEIRS` 原生 stages、`--prefix`、`-u` 和 dry-run。`ls-files` 筛选/格式、`checkout-index` 原字节物化与临时侧图像、`update-index`、原生 `merge-index` 及 `restore/checkout --ours/--theirs` 的完整合同见[索引与冲突 stages](index-stages.md)。旧未命名模块需先通过现有 restore 流程建立明确路径。
 
-`commit-tree` 不更新引用；可重复 `-p`、`-m`，消息之间保留空行。`update-ref` 的旧值是原子比较条件；64 个零代表要求引用不存在。引用必须指向实际 commit；已检出的分支受保护。引用发布后的日志/目录同步失败会明确报告可能已完成的范围。
+`commit-tree` 不更新引用；可重复 `-p`、`-m`，消息之间保留空行。`update-ref` 的旧值是原子比较条件；64 个零代表要求引用不存在。引用必须指向实际 commit；已检出的分支受保护。单引用和 `--stdin` 批量更新都使用共享锁下的持久事务；支持 update/create/delete/verify、NUL、start/prepare/commit/abort，以及中断后的引用/upstream/reflog 幂等恢复。完整协议、限制与验证见[引用事务](ref-transactions.md)。
 
 `rev-list` 支持 `--all`、`--parents`、`--count`、`--first-parent`、`--reverse`、`-n/--max-count`、`A..B`、对称范围 `A...B` 和 `^REV` 排除。对称范围从两个端点可达集合中排除所有最佳共同祖先的闭包，不能在 criss-cross 历史中随意选一个 base。省略任一范围端点表示 HEAD。排序为确定的子先父后拓扑顺序，不依据不存在的作者时间。
 
@@ -149,7 +149,7 @@ maintenance 支持 verify 和 gc，未实现的任务明确拒绝。所有维护
 
 ## 覆盖范围
 
-上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。已增加[索引标志与意向条目](index-flags.md)和[多目标 replay 队列](replay-queue.md)。仍需交互式/保留 merge 拓扑的 rebase、更多 pathspec 与引用事务、浅层/完整稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
+上述各入口是明确的原生 Wasm 语义子集。全部 Git 选项和全部 plumbing 尚未完成；detached HEAD、orphan、reflog 序号和共享 pathspec 已补充，见 [HEAD 与路径选择](head-and-pathspec.md)。已增加[索引标志与意向条目](index-flags.md)和[多目标 replay 队列](replay-queue.md)。仍需交互式/保留 merge 拓扑的 rebase、更多 pathspec、批量符号引用及逐项拒绝模式、浅层/完整稀疏操作、签名、pack 与其他底层命令。准确状态持续记录在[命令能力矩阵](git-command-coverage.md)。
 
 ## 合并策略
 
