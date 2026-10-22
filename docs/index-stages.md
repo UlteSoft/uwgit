@@ -172,8 +172,41 @@ wasm-git write-tree DIR
 restore/checkout 选择 stage 2 或 3，只修改显式选择的工作文件；缺席侧表示删除。
 index 中原始 stages 保留，需再显式 add/rm 或 update-index 才算解决。
 目录/文件转换应选择完整冲突组，例如 `-- .`；未选择路径的工作字节保持。
-普通 restore 从未解决 index 读取该路径时要求明确选择一侧。
+普通 restore 从未解决 index 读取该路径时要求显式选择冲突处理方式。
 从指定的已提交树恢复暂存项可以直接替换 stages。
+
+### 重建冲突工作副本
+
+```sh
+wasm-git restore DIR --merge -- modules/a.wasm
+wasm-git checkout DIR -m -- modules/a.wasm
+wasm-git restore DIR --ignore-unmerged -- .
+wasm-git checkout DIR -m --ignore-skip-worktree-bits -- modules/a.wasm
+```
+
+`restore --merge/-m` 与 checkout 的显式路径模式 `--merge/-m -- PATHSPEC...` 从现有 index 重建合并工作文件。
+已解决路径有 resolve-undo 时，先在内存恢复并消费所选原始 stages；没有撤回记录的 stage 0 按原图像恢复。
+已处于 unmerged 的路径以当前 stages 为准，不被旧撤回记录替换。选择器共用 glob/literal/icase/top/exclude；
+每个正选择器必须匹配，撤回记录也在 merge 模式的候选集合中。需要显式路径，不能从 source 修订、staged 或独占导出混用这些冲突选项。
+
+冲突路径要求 stage 2 和 3 都存在；base 可以缺席。先使用原生 Wasm 三方合并器，能合成时物化经过校验的模块，
+无法合成时保留 ours 的完整原始字节并在输出中逐路径报告原因。成功仅表示工作文件已重建：
+包括成功合成的路径在内，原始 stages 都继续处于 unmerged，仍须审阅后 add/rm 才能提交。
+原图像中的未知内容继续保留；不会向 Wasm 插入文本冲突标记。Git 的文本 conflict style 选项尚未实现。
+
+缺少任一现存侧、无图像 intent、非法或未匹配选择器、索引/目录结构冲突及工作区障碍，均在写入前使整批失败。
+文件/目录冲突通常没有同一路径的两个现存侧，merge 模式拒绝；可选完整冲突组后使用 ours/theirs 或显式树解决。
+恢复已删除路径时，旧撤回记录不授予覆盖后来 untracked 文件的权限；需先移开该文件。
+skip-worktree 路径默认连同撤回记录保持，`--ignore-skip-worktree-bits` 在 merge 模式显式恢复后才消费记录并移除其旧 flags。
+HEAD、pending 队列、其他撤回记录和不可变对象不变；linked worktree 各自处理自己的索引。
+
+ours/theirs 同时选择 stage 0 普通路径时按该原图像恢复。`restore --ignore-unmerged` 只恢复选中的普通路径，
+保留 unmerged 路径的工作字节和 stages；不会从撤回记录重新建立冲突。工作文件恢复也可显式写 `--worktree/-W`。
+上述命令沿用 index 锁、完整目标校验和工作区二次预检；发布 I/O 失败会报告已完成范围。
+工作区与索引不承诺跨文件断电事务；工作文件已经恢复但索引保存失败时明确报告，撤回记录仍可用于重试。
+
+接口参考 [Git restore](https://git-scm.com/docs/git-restore) 和 [Git checkout](https://git-scm.com/docs/git-checkout)。
+Git 二进制回退、stages/撤回生命周期及缺失侧拒绝有独立对照；原生 Wasm 结构组合与批量失败保持另有专门回归。
 
 `merge-index` 使用 uwgit 的 Wasm 三方合并器，不调用外部 Git 程序。
 必须给 `--all/-a` 或 `--` 后的 pathspec；可合成的路径进入 stage 0，仍有冲突的路径保留原图像。
@@ -184,7 +217,7 @@ status 明确标出未解决路径及现存 stage。commit、write-tree、stash 
 拒绝未解决 index；当前 diff-files/diff-index/diff-worktree 也明确拒绝，尚未实现 combined diff。
 clean 将未解决路径视为受控文件，不能当作 untracked 删除。
 
-首次使用扩展字段时将 index 升级为 `UWGITIDX` 格式 3，解决后保留该版本；正常旧 index 格式 1/2 仍可读取。
+首次保存 stages 时 index 至少为 `UWGITIDX` 格式 3；解决路径生成撤回记录时升级为格式 5。正常旧 index 格式 1/2 仍可读取。
 老客户端不认识格式 3 时必须拒绝，不能丢弃 stages。不可变 Wasm/tree/commit 对象编码和 ID 不变。
 
 stages 可由 read-tree、update-index 或录制的 merge/pick/revert/rebase 队列建立。
@@ -222,7 +255,7 @@ JSON 的记录含 `resolve_undo: true`、`reason: "U"` 和真实原生 ID；该 
 已经 unmerged 的路径保持现有 sides；没有记录的合法路径和空列表不做修改。
 它只改 index，不移动 HEAD、不写工作文件、不安装对象，也不从当前 HEAD 或 pending 猜测丢失的侧。
 随后可显式 restore --ours/--theirs 或再次编辑、add/rm；未解决状态重新阻止 write-tree、commit 和 replay continue。
-它没有实现 checkout -m/restore --merge 的自动工作文件恢复入口。
+需同时重建工作文件时，可用上述 checkout -m/restore --merge 入口；它保留未解决状态，直到显式审定暂存。
 
 文件/目录组必须选出足以组成合法完整 index 的路径集合。单独撤回父路径会与已解决子路径碰撞时，整批拒绝；
 一起选择相关父子路径可以恢复真实的跨 stage 分歧。不同历史步骤的撤回记录不必彼此构成同一棵树。

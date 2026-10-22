@@ -181,44 +181,6 @@ fn temporary_images(
     }
     result
 }
-pub(super) fn restore_side(state: &State, args: &[String]) -> Result<String, String> {
-    let mut side = None;
-    let mut literal = false;
-    let mut paths = Vec::new();
-    for value in &args[2..] {
-        if literal {
-            paths.push(value.clone());
-            continue;
-        }
-        match value.as_str() {
-            "--" => literal = true,
-            "--ours" if side.is_none() => side = Some(2),
-            "--theirs" if side.is_none() => side = Some(3),
-            "--worktree" => {}
-            option if option.starts_with('-') => {
-                return Err(format!("unsupported unmerged restore option: {option}"))
-            }
-            _ => paths.push(value.clone()),
-        }
-    }
-    if paths.is_empty() {
-        return Err("unmerged restore requires explicit path selectors".into());
-    }
-    let side = side.ok_or("choose --ours or --theirs")?;
-    let index = state.index()?.ok_or("no unmerged index")?;
-    let selected = select_paths(&index.conflicts.keys().cloned().collect(), &paths)?;
-    let owned = controlled_paths(&index);
-    let mut work = state.snapshot_worktree(owned.iter().cloned())?;
-    for path in &selected {
-        work.insert(path.clone(), index.conflicts[path].image(side).cloned());
-    }
-    let changes = plan(state, &owned, &work)?;
-    apply_plan(state, &changes)?;
-    Ok(format!(
-        "restored {} unmerged work paths from stage {side}; index stages preserved",
-        selected.len()
-    ))
-}
 fn wasm_object(repo: &Repository, id: &str) -> Result<Vec<u8>, String> {
     if id.len() != 64
         || !id

@@ -64,6 +64,207 @@ fn wasm(value: u8) -> Vec<u8> {
     [b"\0asm\x01\0\0\0".as_slice(), &[0, 3, 1, b'x', value]].concat()
 }
 
+fn conflict_reference_input(root: &Path, native: bool, args: &[&str], bytes: &[u8]) -> Vec<u8> {
+    let mut command = if native {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wasm-git"));
+        command.args([args[0], p(root)]).args(&args[1..]);
+        command
+    } else {
+        let mut command = Command::new("git");
+        command.args(["-C", p(root)]).args(args);
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
+    };
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    success(child.wait_with_output().unwrap())
+}
+
+fn conflict_reference_command(root: &Path, native: bool, args: &[&str]) -> Output {
+    if native {
+        let mut native_args = vec![args[0], p(root)];
+        native_args.extend_from_slice(&args[1..]);
+        uw(&native_args)
+    } else {
+        git(root, args)
+    }
+}
+
+#[test]
+fn merge_restore_matches_git_binary_side_stage_and_undo_rules_for_all_side_masks() {
+    let temp = Temp::new();
+    for command in ["checkout", "restore"] {
+        for mask in 1..=7 {
+            for resolved in [false, true] {
+                let mut results = Vec::new();
+                for native in [true, false] {
+                    let root = temp.path(&format!("merge-{command}-{mask}-{resolved}-{native}"));
+                    if native {
+                        success(uw(&["init", p(&root)]));
+                    } else {
+                        fs::create_dir(&root).unwrap();
+                        success(git(&root, &["init", "-b", "main"]));
+                    }
+                    let ids: Vec<_> = (1..=3)
+                        .map(|n| {
+                            String::from_utf8(conflict_reference_input(
+                                &root,
+                                native,
+                                &["hash-object", "-w", "--stdin"],
+                                &wasm(n),
+                            ))
+                            .unwrap()
+                            .trim()
+                            .to_owned()
+                        })
+                        .collect();
+                    let records = (1..=3)
+                        .filter(|n| mask & (1 << (n - 1)) != 0)
+                        .map(|n| format!("100644 {} {n}\ta.wasm\n", ids[n - 1]))
+                        .collect::<String>();
+                    conflict_reference_input(
+                        &root,
+                        native,
+                        &["update-index", "--index-info"],
+                        records.as_bytes(),
+                    );
+                    fs::write(root.join("a.wasm"), wasm(9)).unwrap();
+                    if resolved {
+                        success(conflict_reference_command(
+                            &root,
+                            native,
+                            &["add", "a.wasm"],
+                        ));
+                    }
+                    let index_path = root.join(if native { ".uwgit/index" } else { ".git/index" });
+                    let before = fs::read(&index_path).unwrap();
+                    let result =
+                        conflict_reference_command(&root, native, &[command, "-m", "--", "a.wasm"]);
+                    let accepted = mask >= 6;
+                    assert_eq!(
+                        result.status.success(),
+                        accepted,
+                        "{command}, mask {mask}, resolved {resolved}, native {native}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let mut stages = String::from_utf8(success(conflict_reference_command(
+                        &root,
+                        native,
+                        &["ls-files", "-u"],
+                    )))
+                    .unwrap();
+                    let mut undo = String::from_utf8(success(conflict_reference_command(
+                        &root,
+                        native,
+                        &["ls-files", "--resolve-undo"],
+                    )))
+                    .unwrap();
+                    for (n, id) in ids.iter().enumerate() {
+                        stages = stages.replace(id, &format!("IMAGE{}", n + 1));
+                        undo = undo.replace(id, &format!("IMAGE{}", n + 1));
+                    }
+                    let work = fs::read(root.join("a.wasm")).unwrap();
+                    assert_eq!(work, wasm(if accepted { 2 } else { 9 }));
+                    if !accepted || !resolved {
+                        assert_eq!(fs::read(index_path).unwrap(), before);
+                    }
+                    results.push((result.status.success(), stages, undo, work));
+                }
+                assert_eq!(
+                    results[0], results[1],
+                    "{command}, mask {mask}, resolved {resolved}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn conflict_restore_mixed_paths_and_ignore_unmerged_match_git_without_changing_index() {
+    let temp = Temp::new();
+    for mode in ["--ours", "--theirs", "--merge", "--ignore-unmerged"] {
+        let mut results = Vec::new();
+        for native in [true, false] {
+            let root = temp.path(&format!("mixed-{mode}-{native}"));
+            if native {
+                success(uw(&["init", p(&root)]));
+            } else {
+                fs::create_dir(&root).unwrap();
+                success(git(&root, &["init", "-b", "main"]));
+            }
+            fs::write(root.join("regular.wasm"), wasm(8)).unwrap();
+            success(conflict_reference_command(
+                &root,
+                native,
+                &["add", "regular.wasm"],
+            ));
+            let ids: Vec<_> = (1..=3)
+                .map(|n| {
+                    String::from_utf8(conflict_reference_input(
+                        &root,
+                        native,
+                        &["hash-object", "-w", "--stdin"],
+                        &wasm(n),
+                    ))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+                })
+                .collect();
+            let records = ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| format!("100644 {id} {}\ta.wasm\n", n + 1))
+                .collect::<String>();
+            conflict_reference_input(
+                &root,
+                native,
+                &["update-index", "--index-info"],
+                records.as_bytes(),
+            );
+            fs::write(root.join("regular.wasm"), b"unfinished regular edit").unwrap();
+            fs::write(root.join("a.wasm"), b"unfinished conflict edit").unwrap();
+            let index_path = root.join(if native { ".uwgit/index" } else { ".git/index" });
+            let before = fs::read(&index_path).unwrap();
+            let stage_before = success(conflict_reference_command(
+                &root,
+                native,
+                &["ls-files", "--stage"],
+            ));
+            success(conflict_reference_command(
+                &root,
+                native,
+                &["restore", mode, "--", "."],
+            ));
+            // Git refreshes stat data for materialized regular files. Compare
+            // its actual indexed images/stages; uwgit has no such stat cache.
+            assert_eq!(
+                success(conflict_reference_command(
+                    &root,
+                    native,
+                    &["ls-files", "--stage"]
+                )),
+                stage_before
+            );
+            if native {
+                assert_eq!(fs::read(index_path).unwrap(), before);
+            }
+            let work = fs::read(root.join("a.wasm")).unwrap();
+            let regular = fs::read(root.join("regular.wasm")).unwrap();
+            assert_eq!(regular, wasm(8));
+            results.push((work, regular));
+        }
+        assert_eq!(results[0], results[1], "mode {mode}");
+    }
+}
+
 #[test]
 fn native_directory_listing_and_selection_match_independent_git_worktrees() {
     let temp = Temp::new();

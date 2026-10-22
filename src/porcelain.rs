@@ -25,6 +25,8 @@ pub use index_plumbing::{index_command, index_command_handles};
 mod index_flags;
 #[path = "index_resolve_undo.rs"]
 mod index_resolve_undo;
+#[path = "index_restore.rs"]
+mod index_restore;
 #[path = "porcelain_replay.rs"]
 mod replay_worktree;
 pub use replay_worktree::{replay_control, replay_start, try_replay_control};
@@ -35,7 +37,7 @@ const STAGED_MAGIC: &[u8; 9] = b"UWGITIDX\x03";
 const FLAGS_MAGIC: &[u8; 9] = b"UWGITIDX\x04";
 const RESOLVE_MAGIC: &[u8; 9] = b"UWGITIDX\x05";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
-const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [-N|--intent-to-add] [--sparse] [--] PATHSPEC...; status DIR; commit DIR [-a|--all] [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--ignore-skip-worktree-bits] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
+const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [-N|--intent-to-add] [--sparse] [--] PATHSPEC...; status DIR; commit DIR [-a|--all] [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree|-W] [--overlay] [--ignore-skip-worktree-bits] [--output NEW_FILE] [--] [PATH...]; restore DIR [--ours|--theirs|--merge|-m|--ignore-unmerged] [--ignore-skip-worktree-bits] -- PATHSPEC...; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 type Files = BTreeMap<String, Vec<u8>>;
 type Worktree = BTreeMap<String, Option<Vec<u8>>>;
@@ -2880,14 +2882,8 @@ fn select_paths(
     wasm_git::pathspec::select(candidates, selectors)
 }
 fn restore(state: &State, args: &[String]) -> Result<String, String> {
-    if args
-        .iter()
-        .skip(2)
-        .take_while(|value| value.as_str() != "--")
-        .any(|value| matches!(value.as_str(), "--ours" | "--theirs"))
-    {
-        return index_plumbing::restore_side(state, args);
-    }
+    let mut conflict_mode = None;
+    let mut ignore_unmerged = false;
     let mut source = None;
     let mut staged = false;
     let mut work = false;
@@ -2914,9 +2910,17 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
                 source = Some(args.get(cursor).ok_or(USAGE)?.clone());
             }
             "--staged" if !staged => staged = true,
-            "--worktree" if !work => work = true,
+            "--worktree" | "-W" if !work => work = true,
             "--overlay" if !overlay => overlay = true,
             "--ignore-skip-worktree-bits" if !ignore_skip => ignore_skip = true,
+            "--ours" if conflict_mode.is_none() => conflict_mode = Some(index_restore::Mode::Ours),
+            "--theirs" if conflict_mode.is_none() => {
+                conflict_mode = Some(index_restore::Mode::Theirs)
+            }
+            "--merge" | "-m" if conflict_mode.is_none() => {
+                conflict_mode = Some(index_restore::Mode::Merge)
+            }
+            "--ignore-unmerged" if !ignore_unmerged => ignore_unmerged = true,
             "--output" if output.is_none() => {
                 cursor += 1;
                 output = Some(args.get(cursor).ok_or(USAGE)?.as_str());
@@ -2933,6 +2937,17 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
     }
     if literal && paths.is_empty() {
         return Err("restore requires at least one path after --".into());
+    }
+    if conflict_mode.is_some() || ignore_unmerged {
+        if source.is_some() || staged || output.is_some() {
+            return Err("conflict restore options require worktree restoration from the index; cannot combine with --source, --staged or --output".into());
+        }
+        return index_restore::restore(
+            state,
+            conflict_mode.unwrap_or(index_restore::Mode::IgnoreUnmerged),
+            ignore_skip,
+            &paths,
+        );
     }
     let old = state.index()?;
     let mut legacy_export = false;
@@ -3080,7 +3095,10 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
             return Err("intent-to-add has no image to restore; stage its content first".into());
         }
         if target.conflicts.contains_key(p) {
-            return Err("restore of unmerged paths requires --ours or --theirs".into());
+            return Err(
+                "restore of unmerged paths requires --ours, --theirs, --merge or --ignore-unmerged"
+                    .into(),
+            );
         }
         replacement.resolve_path(p);
         replacement.intents.remove(p);

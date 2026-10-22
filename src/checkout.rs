@@ -3,7 +3,7 @@
 
 use crate::{command_args, porcelain, repository, tree_output};
 
-const USAGE: &str = "checkout DIR BRANCH_OR_REV; checkout DIR --detach [REV]; checkout DIR --orphan NAME; checkout DIR -; checkout DIR -b NAME [REV]; checkout DIR -- PATH...; checkout DIR REV -- PATH...; checkout DIR REV NEW_FILE [--file PATH]. Revision path mode restores source-present paths into index/worktree, including tracked file/directory transitions, and preserves unrelated paths absent from that revision (overlay). Commit/tag checkout uses a true detached HEAD. Path replacement requires an explicit -- separator.";
+const USAGE: &str = "checkout DIR BRANCH_OR_REV; checkout DIR --detach [REV]; checkout DIR --orphan NAME; checkout DIR -; checkout DIR -b NAME [REV]; checkout DIR -- PATH...; checkout DIR [--ours|--theirs|--merge|-m] [--ignore-skip-worktree-bits] -- PATHSPEC...; checkout DIR REV -- PATH...; checkout DIR REV NEW_FILE [--file PATH]. Revision path mode restores source-present paths into index/worktree, including tracked file/directory transitions, and preserves unrelated paths absent from that revision (overlay). Commit/tag checkout uses a true detached HEAD. Path replacement requires an explicit -- separator.";
 
 pub fn run(args: &[String]) -> Result<String, String> {
     if command_args::help_requested(args) {
@@ -19,9 +19,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
         let mut forwarded = vec!["restore".to_owned(), args[1].clone()];
         match separator {
             2 => {}
-            3 if matches!(args[2].as_str(), "--ours" | "--theirs") => {
-                forwarded.push(args[2].clone())
-            }
             3 if !args[2].starts_with('-') => forwarded.extend([
                 "--source".into(),
                 args[2].clone(),
@@ -29,6 +26,15 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 "--worktree".into(),
                 "--overlay".into(),
             ]),
+            _ if args[2..separator].iter().all(|option| {
+                matches!(
+                    option.as_str(),
+                    "--ours" | "--theirs" | "-m" | "--merge" | "--ignore-skip-worktree-bits"
+                )
+            }) =>
+            {
+                forwarded.extend_from_slice(&args[2..separator])
+            }
             _ => return Err(USAGE.into()),
         }
         forwarded.push("--".into());

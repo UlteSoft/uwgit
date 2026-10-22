@@ -913,7 +913,7 @@ fn print_usage() {
         "  update-index <DIR> --refresh|--really-refresh [--ignore-missing] [--unmerged] [PATH...]"
     );
     eprintln!("  add <DIR> -N|--intent-to-add PATH... | add <DIR> --sparse PATH... | commit <DIR> -a -m MESSAGE");
-    eprintln!("  merge-index <DIR> --all|-- PATHSPEC... [--dry-run] | restore <DIR> --ours|--theirs -- PATHSPEC...");
+    eprintln!("  merge-index <DIR> --all|-- PATHSPEC... [--dry-run] | restore <DIR> --ours|--theirs|--merge|-m|--ignore-unmerged -- PATHSPEC...");
     eprintln!("  ls-tree <DIR> <REV> [-r] [--json|--name-only|--object-only] [-z] [-- PATH...]");
     eprintln!("  show-ref <DIR> [--head] [--heads|--tags] [--verify] [--quiet|--hash|--json] [PATTERN...]");
     eprintln!(

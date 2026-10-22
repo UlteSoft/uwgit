@@ -8,6 +8,10 @@
 - `checkout DIR BRANCH`、`checkout DIR -b NAME [REV]` 复用 switch 的工作区锁、分支检查和预检。
 - `checkout DIR -- PATH...` 从 index 恢复工作路径，index 和 HEAD 不变。
 - `checkout DIR REV -- PATH...` 从不可变修订读取所选路径，更新 index 与工作文件，HEAD 不变。
+- `checkout DIR -m|--merge -- PATHSPEC...` 从 index/所选撤回记录重建原生 Wasm 冲突工作文件，保留原始 unmerged stages。
+  先尝试 Wasm 合成，不能合成则明确报告并恢复 ours；缺失 stage 2/3 时整批拒绝。
+- `checkout DIR --ours|--theirs -- PATHSPEC...` 恢复所选原侧；混合选择普通路径时从 stage 0 恢复。
+  `--ignore-skip-worktree-bits` 可与这些路径选项组合；默认保持 skip 路径与撤回记录。
 - `checkout DIR REV NEW_FILE [--file PATH]` 保留旧的独占导出。恢复已有路径必须有真正的 `--`；导出目标本身名为 `--` 时写 `./--` 或绝对路径。
 - restore、checkout 路径模式与 reset 路径模式共用选择器，支持精确文件、目录前缀、`.`／`./`，及单次开头 `./`。
   单个末尾 `/` 只选择目录后代。每个显式参数必须匹配；任一未匹配、非法路径或空的显式分隔符选择都在写入前拒绝。
@@ -24,5 +28,6 @@ restore 新增 `--overlay`，默认仍为 [Git restore 的 no-overlay 规则](ht
 `--` 必须先排除单值选项的字面操作数：例如旧导出 `--file --` 的末尾是文件名值，
 而 `checkout DIR -- --file` 的末尾是工作路径。真正分隔符后的帮助或导出标志均按字面路径处理；真正帮助仍在仓库 I/O 前返回。
 
-没有增加 detached/orphan HEAD、upstream、冲突 sequencer 或隐式路径猜测。
+后续已加入 detached/orphan HEAD 与冲突队列，见 [HEAD 合同](head-and-pathspec.md) 和[原生队列](replay-queue.md)。
+冲突重建及撤回记录的详细边界见[索引与冲突 stages](index-stages.md#重建冲突工作副本)；仍无隐式路径猜测和分支切换的 `-m`。
 分支模式继续要求已建立的 index/worktree 干净；没有 index 的对象仓库不会因为切换分支自动物化工作文件。
