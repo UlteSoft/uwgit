@@ -199,6 +199,7 @@ fn main() {
     }
     if query_commands::handles(&args[1])
         || plumbing_commands::handles(&args[1])
+        || porcelain::index_command_handles(&args[1])
         || maintenance_commands::handles(&args[1])
         || args[1] == "worktree"
         || args[1] == "notes"
@@ -208,7 +209,9 @@ fn main() {
         || args[1] == "merge-base"
         || args[1] == "bisect"
     {
-        let output = if args[1] == "merge-base" {
+        let output = if porcelain::index_command_handles(&args[1]) {
+            porcelain::index_command(&args[1..])
+        } else if args[1] == "merge-base" {
             merge_base_commands::run(&args[1..])
         } else if diff_plumbing::handles(&args[1]) {
             diff_plumbing::run(&args[1..])
@@ -898,6 +901,12 @@ fn print_usage() {
     );
     eprintln!("  tag <DIR> [NAME [REV]|-d NAME] | reflog <DIR> | rev-parse <DIR> <REV>");
     eprintln!("  cat-file <DIR> <REV> | ls-files <DIR> | config <DIR> [KEY [VALUE]]");
+    eprintln!("  ls-files <DIR> [-s|--unmerged] [-m|-d|-o|-i|-k] [-t] [--exclude-standard] [-z|--json|--format STR] [-- PATHSPEC...]");
+    eprintln!("  checkout-index <DIR> [-a] [-f] [-n] [--prefix STR] [--stage 1|2|3|all] [--temp] [--stdin] [-z] [-- PATH...]");
+    eprintln!("  write-tree <DIR> [--prefix DIR/]");
+    eprintln!("  read-tree <DIR> [-m BASE [OURS] THEIRS|--empty|TREE] [-u] [-n] [--prefix DIR/]");
+    eprintln!("  update-index <DIR> [--add|--remove|--force-remove] PATH... | --cacheinfo MODE,ID,PATH | --index-info | --stdin [-z]");
+    eprintln!("  merge-index <DIR> --all|-- PATHSPEC... [--dry-run] | restore <DIR> --ours|--theirs -- PATHSPEC...");
     eprintln!("  ls-tree <DIR> <REV> [-r] [--json|--name-only|--object-only] [-z] [-- PATH...]");
     eprintln!("  show-ref <DIR> [--head] [--heads|--tags] [--verify] [--quiet|--hash|--json] [PATTERN...]");
     eprintln!(

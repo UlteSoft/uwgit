@@ -62,6 +62,163 @@ fn success(output: Output) -> Vec<u8> {
 fn wasm(value: u8) -> Vec<u8> {
     [b"\0asm\x01\0\0\0".as_slice(), &[0, 3, 1, b'x', value]].concat()
 }
+
+#[test]
+fn real_git_index_stages_and_native_wasm_stages_have_the_same_original_side_images() {
+    let temp = Temp::new();
+    let native = temp.path("native-stages");
+    let reference = temp.path("git-stages");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    let (mut native_ids, mut git_ids) = (Vec::new(), Vec::new());
+    for value in 1..=3 {
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), wasm(value)).unwrap();
+        }
+        success(uw(&["add", p(&native), "a.wasm"]));
+        success(uw(&["commit", p(&native), "-m", &format!("value {value}")]));
+        native_ids.push(
+            String::from_utf8(success(uw(&["rev-parse", p(&native), "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+        success(git(&reference, &["add", "a.wasm"]));
+        success(git(
+            &reference,
+            &["commit", "-m", &format!("value {value}")],
+        ));
+        git_ids.push(
+            String::from_utf8(success(git(&reference, &["rev-parse", "HEAD"])))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+    }
+    success(uw(&["reset", p(&native), "--hard", &native_ids[1]]));
+    success(git(&reference, &["reset", "--hard", &git_ids[1]]));
+    success(uw(&[
+        "read-tree",
+        p(&native),
+        "-m",
+        &native_ids[0],
+        &native_ids[1],
+        &native_ids[2],
+    ]));
+    success(git(
+        &reference,
+        &["read-tree", "-m", &git_ids[0], &git_ids[1], &git_ids[2]],
+    ));
+    let native_rows =
+        String::from_utf8(success(uw(&["ls-files", p(&native), "--unmerged"]))).unwrap();
+    let git_rows =
+        String::from_utf8(success(git(&reference, &["ls-files", "--unmerged"]))).unwrap();
+    assert_eq!(native_rows.lines().count(), 3);
+    assert_eq!(git_rows.lines().count(), 3);
+    for (native_row, git_row) in native_rows.lines().zip(git_rows.lines()) {
+        let (native_header, native_path) = native_row.split_once('\t').unwrap();
+        let (git_header, git_path) = git_row.split_once('\t').unwrap();
+        let n: Vec<_> = native_header.split_whitespace().collect();
+        let g: Vec<_> = git_header.split_whitespace().collect();
+        assert_eq!((n[0], n[2], native_path), (g[0], g[2], git_path));
+        let exported = temp.path(&format!("stage-{}.wasm", n[2]));
+        success(uw(&[
+            "cat-file",
+            p(&native),
+            n[1],
+            "--output",
+            p(&exported),
+        ]));
+        assert_eq!(
+            fs::read(exported).unwrap(),
+            success(git(&reference, &["cat-file", "blob", g[1]]))
+        );
+    }
+    let native_exports = String::from_utf8(success(uw(&[
+        "checkout-index",
+        p(&native),
+        "--stage=all",
+        "--all",
+    ])))
+    .unwrap();
+    let git_exports = String::from_utf8(success(git(
+        &reference,
+        &["checkout-index", "--stage=all", "--all"],
+    )))
+    .unwrap();
+    let (native_names, native_path) = native_exports.trim_end().split_once('\t').unwrap();
+    let (git_names, git_path) = git_exports.trim_end().split_once('\t').unwrap();
+    assert_eq!(native_path, git_path);
+    for (native_name, git_name) in native_names.split(' ').zip(git_names.split(' ')) {
+        assert_eq!(
+            fs::read(native.join(native_name)).unwrap(),
+            fs::read(reference.join(git_name)).unwrap()
+        );
+    }
+    success(uw(&["restore", p(&native), "--ours", "--", "a.wasm"]));
+    success(git(&reference, &["checkout", "--ours", "--", "a.wasm"]));
+    assert_eq!(
+        fs::read(native.join("a.wasm")).unwrap(),
+        fs::read(reference.join("a.wasm")).unwrap()
+    );
+    success(uw(&["add", p(&native), "a.wasm"]));
+    success(git(&reference, &["add", "a.wasm"]));
+    assert!(success(uw(&["ls-files", p(&native), "--unmerged"])).is_empty());
+    assert!(success(git(&reference, &["ls-files", "--unmerged"])).is_empty());
+    success(uw(&[
+        "checkout-index",
+        p(&native),
+        "--all",
+        "--prefix=.export-",
+    ]));
+    success(git(
+        &reference,
+        &["checkout-index", "--all", "--prefix=.export-"],
+    ));
+    assert_eq!(
+        fs::read(native.join(".export-a.wasm")).unwrap(),
+        fs::read(reference.join(".export-a.wasm")).unwrap()
+    );
+    for root in [&native, &reference] {
+        fs::write(root.join("a.wasm"), wasm(9)).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("ignored.log"), b"log").unwrap();
+    }
+    assert_eq!(
+        success(uw(&["ls-files", p(&native), "--modified"])),
+        success(git(&reference, &["ls-files", "--modified"]))
+    );
+    assert_eq!(
+        success(uw(&[
+            "ls-files",
+            p(&native),
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+            "*.log"
+        ])),
+        success(git(
+            &reference,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--",
+                "*.log"
+            ]
+        ))
+    );
+    for root in [&native, &reference] {
+        fs::remove_file(root.join("a.wasm")).unwrap();
+    }
+    assert_eq!(
+        success(uw(&["ls-files", p(&native), "--deleted"])),
+        success(git(&reference, &["ls-files", "--deleted"]))
+    );
+}
 #[test]
 fn real_git_and_native_wasm_history_agree_on_worktree_isolation_and_branch_leases() {
     let temp = Temp::new();

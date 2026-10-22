@@ -19,6 +19,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
         let mut forwarded = vec!["restore".to_owned(), args[1].clone()];
         match separator {
             2 => {}
+            3 if matches!(args[2].as_str(), "--ours" | "--theirs") => {
+                forwarded.push(args[2].clone())
+            }
             3 if !args[2].starts_with('-') => forwarded.extend([
                 "--source".into(),
                 args[2].clone(),

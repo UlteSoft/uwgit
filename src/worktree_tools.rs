@@ -87,6 +87,7 @@ pub fn clean(
     let _lock = state.lock()?;
     require_no_pending(&state.repo)?;
     let index = state.index()?.unwrap_or_else(Index::empty);
+    let controlled = controlled_paths(&index);
     state.repo.fsck()?;
     let pathspec = wasm_git::pathspec::Pathspec::new(selectors)?;
     let every = visible_paths(&state.repo.root, false)?;
@@ -110,11 +111,10 @@ pub fn clean(
         let metadata = fs::symlink_metadata(&full).map_err(|error| error.to_string())?;
         let is_dir = metadata.is_dir();
         if !selected.contains(path)
-            || index.files.contains_key(path)
+            || controlled.contains(path)
             || (is_dir
-                && index
-                    .files
-                    .keys()
+                && controlled
+                    .iter()
                     .any(|tracked| tracked.starts_with(&format!("{path}/"))))
         {
             continue;
@@ -134,9 +134,8 @@ pub fn clean(
             let mut permitted = true;
             for (position, _) in path.match_indices('/') {
                 let parent = &path[..position];
-                if !index
-                    .files
-                    .keys()
+                if !controlled
+                    .iter()
                     .any(|tracked| tracked.starts_with(&format!("{parent}/")))
                 {
                     permitted = false;
@@ -338,6 +337,7 @@ pub fn mergetool(
     if stage {
         let index = index.as_mut().ok_or("missing resolution index")?;
         for (path, bytes) in resolutions {
+            index.conflicts.remove(&path);
             if let Some(bytes) = bytes {
                 index.files.insert(path, bytes);
             } else {
@@ -384,6 +384,7 @@ pub fn squash_merge(root: &str, target: &str, message: Option<&str>) -> Result<S
             format: 2,
             files: files.clone(),
             legacy_path: planned.legacy_path.clone(),
+            conflicts: BTreeMap::new(),
         };
         validate_index(&replacement)?;
         let owned = tracked

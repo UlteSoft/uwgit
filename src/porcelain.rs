@@ -18,9 +18,13 @@ mod worktree_tools;
 pub use worktree_tools::clean;
 pub use worktree_tools::mergetool;
 pub use worktree_tools::squash_merge;
+#[path = "index_plumbing.rs"]
+mod index_plumbing;
+pub use index_plumbing::{index_command, index_command_handles};
 
 const OLD_MAGIC: &[u8; 9] = b"UWGITIDX\x01";
 const MAGIC: &[u8; 9] = b"UWGITIDX\x02";
+const STAGED_MAGIC: &[u8; 9] = b"UWGITIDX\x03";
 const WASM: &[u8; 8] = b"\0asm\x01\0\0\0";
 const USAGE: &str = "tree commands: add DIR [-A|-u] [-f] [-n] [--] PATHSPEC...; status DIR; commit DIR [--amend] [--allow-empty] [-m MESSAGE]; rm DIR [--cached] [-f] [--] [FILE...]; mv DIR [--] OLD NEW; restore DIR [--source REV] [--staged] [--worktree] [--overlay] [--output NEW_FILE] [--] [PATH...]; reset DIR [--soft|--mixed|--hard] [REV]; reset DIR [REV] -- PATH...; branch DIR [NAME [REV]|-d NAME|-D NAME|-m [OLD] NEW|-M [OLD] NEW|-c [OLD] NEW|-C [OLD] NEW|-f NAME [REV]|-r|-a|-vv|-u REMOTE/BRANCH [LOCAL_BRANCH]|--set-upstream-to REMOTE/BRANCH [LOCAL_BRANCH]|--unset-upstream [LOCAL_BRANCH]]; switch DIR NAME|-; switch DIR -c NAME [REV]; switch DIR --detach [REV]; switch DIR --orphan NAME; ls-files DIR; stash DIR [push [-m MESSAGE]|list|apply ID|pop ID|drop ID]; config DIR [KEY [VALUE]|--unset KEY]; tag DIR [NAME [REV]|-d NAME]; reflog DIR; rev-parse DIR REV (including @{upstream}, @{u}, NAME@{upstream}, NAME@{u}); cat-file DIR REV";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +37,25 @@ struct Index {
     format: u32,
     files: Files,
     legacy_path: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    conflicts: BTreeMap<String, ConflictStages>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictStages {
+    base: Option<Vec<u8>>,
+    ours: Option<Vec<u8>>,
+    theirs: Option<Vec<u8>>,
+}
+impl ConflictStages {
+    fn image(&self, stage: u8) -> Option<&Vec<u8>> {
+        match stage {
+            1 => self.base.as_ref(),
+            2 => self.ours.as_ref(),
+            3 => self.theirs.as_ref(),
+            _ => None,
+        }
+    }
 }
 impl Index {
     fn empty() -> Self {
@@ -40,6 +63,7 @@ impl Index {
             format: 2,
             files: BTreeMap::new(),
             legacy_path: None,
+            conflicts: BTreeMap::new(),
         }
     }
 }
@@ -141,24 +165,82 @@ fn validate_files(files: &Files) -> Result<(), String> {
     Ok(())
 }
 fn validate_index(index: &Index) -> Result<(), String> {
-    if index.format != 2 {
+    if !matches!(index.format, 2 | 3) || (index.format == 2 && !index.conflicts.is_empty()) {
         return Err("unsupported index format".into());
     }
     validate_files(&index.files)?;
+    for (path, stages) in &index.conflicts {
+        validate_tree_path(path)?;
+        if index.files.contains_key(path)
+            || (stages.base.is_none() && stages.ours.is_none() && stages.theirs.is_none())
+        {
+            return Err(
+                "index stage zero overlaps unmerged stages, or all stages are absent".into(),
+            );
+        }
+        for bytes in stages.base.iter().chain(&stages.ours).chain(&stages.theirs) {
+            validate_wasm(bytes)?;
+        }
+    }
+    // A directory/file conflict may span different stages, but each original
+    // side together with the resolved entries must still be a valid tree.
+    for stage in 1..=3 {
+        let paths: BTreeSet<_> = index
+            .files
+            .keys()
+            .chain(
+                index
+                    .conflicts
+                    .iter()
+                    .filter_map(|(path, images)| images.image(stage).map(|_| path)),
+            )
+            .map(String::as_str)
+            .collect();
+        for path in &paths {
+            if path
+                .match_indices('/')
+                .any(|(offset, _)| paths.contains(&path[..offset]))
+            {
+                return Err(format!(
+                    "index stage {stage} has a file/directory prefix collision"
+                ));
+            }
+        }
+    }
     if let Some(path) = &index.legacy_path {
         validate_tree_path(path)?;
     }
     Ok(())
 }
 fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
-    validate_index(index)?;
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&canonical(index)?);
+    let mut normalized = index.clone();
+    if !normalized.conflicts.is_empty() {
+        normalized.format = 3;
+    }
+    validate_index(&normalized)?;
+    let mut bytes = if normalized.format == 3 {
+        STAGED_MAGIC
+    } else {
+        MAGIC
+    }
+    .to_vec();
+    bytes.extend_from_slice(&canonical(&normalized)?);
     Ok(bytes)
 }
 fn decode_index(bytes: &[u8]) -> Result<Index, String> {
+    if let Some(payload) = bytes.strip_prefix(STAGED_MAGIC) {
+        let index: Index = decode_canonical(payload)?;
+        if index.format != 3 {
+            return Err("extended index magic/format mismatch".into());
+        }
+        validate_index(&index)?;
+        return Ok(index);
+    }
     if let Some(payload) = bytes.strip_prefix(MAGIC) {
         let index: Index = decode_canonical(payload)?;
+        if index.format != 2 {
+            return Err("index magic/format mismatch".into());
+        }
         validate_index(&index)?;
         return Ok(index);
     }
@@ -182,9 +264,26 @@ fn decode_index(bytes: &[u8]) -> Result<Index, String> {
         format: 2,
         files: BTreeMap::from([(path.clone(), bytes[split..].to_vec())]),
         legacy_path: Some(path),
+        conflicts: BTreeMap::new(),
     };
     validate_index(&index)?;
     Ok(index)
+}
+
+fn require_resolved_index(index: &Index) -> Result<(), String> {
+    if index.conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err("index has unresolved native Wasm stages; resolve them with add/rm or update-index before publishing a tree".into())
+    }
+}
+fn controlled_paths(index: &Index) -> BTreeSet<String> {
+    index
+        .files
+        .keys()
+        .chain(index.conflicts.keys())
+        .cloned()
+        .collect()
 }
 
 /// Validate an immutable operation backup without consulting mutable repository
@@ -214,6 +313,7 @@ pub fn validate_pending_baseline(
         return Ok(());
     };
     let index = decode_index(raw)?;
+    require_resolved_index(&index)?;
     if index.legacy_path.as_deref() != legacy_path {
         return Err("pending baseline index has a different legacy path".into());
     }
@@ -241,6 +341,7 @@ pub fn validate_pending_resolution_index(
     legacy_path: Option<&str>,
 ) -> Result<(), String> {
     let index = decode_index(raw)?;
+    require_resolved_index(&index)?;
     if index.files != *files || index.legacy_path.as_deref() != legacy_path {
         return Err(
             "pending resolution index bytes do not match its supplied files or legacy path".into(),
@@ -487,6 +588,7 @@ impl State {
             format: 2,
             files,
             legacy_path,
+            conflicts: BTreeMap::new(),
         };
         validate_index(&index)?;
         Ok(index)
@@ -588,6 +690,7 @@ impl State {
                                 format: 2,
                                 files: BTreeMap::from([(p.clone(), e.index.bytes)]),
                                 legacy_path: Some(p.clone()),
+                                conflicts: BTreeMap::new(),
                             },
                             worktree: BTreeMap::from([(p, e.worktree)]),
                         }
@@ -603,6 +706,7 @@ impl State {
         let mut previous = None;
         for e in &value.entries {
             validate_index(&e.index)?;
+            require_resolved_index(&e.index)?;
             if e.base.len() != 64
                 || !e
                     .base
@@ -718,13 +822,31 @@ pub fn run(args: &[String]) -> Result<String, String> {
 }
 
 /// Plumbing publishes immutable tree objects without moving HEAD or index.
-pub fn write_tree(root: &str) -> Result<String, String> {
+pub fn write_tree(root: &str, prefix: Option<&str>) -> Result<String, String> {
     let state = State::open(root)?;
     let _lock = state.lock()?;
     let index = state
         .index()?
         .ok_or("write-tree requires an existing index")?;
-    state.repo.create_files_tree(&index.files)
+    require_resolved_index(&index)?;
+    let Some(prefix) = prefix else {
+        return state.repo.create_files_tree(&index.files);
+    };
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    validate_tree_path(prefix)?;
+    let prefix = format!("{prefix}/");
+    let files: Files = index
+        .files
+        .iter()
+        .filter_map(|(path, bytes)| {
+            path.strip_prefix(&prefix)
+                .map(|relative| (relative.to_owned(), bytes.clone()))
+        })
+        .collect();
+    if files.is_empty() {
+        return Err("write-tree prefix does not name an indexed directory".into());
+    }
+    state.repo.create_files_tree(&files)
 }
 
 pub fn encode_worktree_index(files: &Files, legacy_path: Option<&str>) -> Result<Vec<u8>, String> {
@@ -732,6 +854,7 @@ pub fn encode_worktree_index(files: &Files, legacy_path: Option<&str>) -> Result
         format: 2,
         files: files.clone(),
         legacy_path: legacy_path.map(str::to_owned),
+        conflicts: BTreeMap::new(),
     })
 }
 
@@ -826,6 +949,7 @@ pub fn read_tree(root: &str, revision: Option<&str>) -> Result<String, String> {
             format: 2,
             files: snapshot.files,
             legacy_path: snapshot.legacy_path,
+            conflicts: BTreeMap::new(),
         }
     } else {
         Index::empty()
@@ -943,6 +1067,7 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
         .map(String::as_str);
     let mut index = state.starting_index(anchor)?;
     let mut candidates: BTreeSet<_> = index.files.keys().cloned().collect();
+    candidates.extend(index.conflicts.keys().cloned());
     if !update {
         for path in worktree_tools::visible_paths(&state.repo.root, !force)? {
             let full = state.worktree_path(&path)?;
@@ -953,7 +1078,8 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
     }
     let selected = select_paths(&candidates, &selectors)?;
     for path in &selected {
-        match state.worktree(path)? {
+        index.conflicts.remove(path);
+        match state.worktree_module(path)? {
             Some(bytes) => {
                 validate_wasm(&bytes)?;
                 index.files.insert(path.clone(), bytes);
@@ -963,6 +1089,7 @@ fn add(state: &State, paths: &[String]) -> Result<String, String> {
             }
         }
     }
+    validate_index(&index)?;
     if !dry_run && !selected.is_empty() {
         state.save_index(&index)?;
     }
@@ -1120,6 +1247,7 @@ fn status(state: &State) -> Result<String, String> {
         .keys()
         .cloned()
         .chain(index.files.keys().cloned())
+        .chain(index.conflicts.keys().cloned())
         .collect();
     let mut rows = Vec::new();
     let mut staged_any = false;
@@ -1130,24 +1258,32 @@ fn status(state: &State) -> Result<String, String> {
         let old = head.files.get(&p);
         let staged = index.files.get(&p);
         let current = worktree.get(&p).cloned().flatten();
-        let change = match (old, staged) {
-            (None, Some(_)) => "added",
-            (Some(_), None) => "deleted",
-            _ if old != staged => "modified",
-            _ => "clean",
+        let change = if index.conflicts.contains_key(&p) {
+            "unmerged"
+        } else {
+            match (old, staged) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "deleted",
+                _ if old != staged => "modified",
+                _ => "clean",
+            }
         };
-        let work = match (staged, current.as_ref()) {
-            (None, Some(_)) => "untracked",
-            (Some(_), None) => "deleted",
-            _ if current.as_ref() != staged => "modified",
-            _ => "clean",
+        let work = if index.conflicts.contains_key(&p) {
+            "unmerged"
+        } else {
+            match (staged, current.as_ref()) {
+                (None, Some(_)) => "untracked",
+                (Some(_), None) => "deleted",
+                _ if current.as_ref() != staged => "modified",
+                _ => "clean",
+            }
         };
         staged_any |= change != "clean";
         modified |= work == "modified";
         deleted |= work == "deleted";
         rows.push(json!({"path":p,"staged":change,"worktree":work}));
     }
-    let untracked = scan_untracked(state, &keys(&index.files))?;
+    let untracked = scan_untracked(state, &controlled_paths(index))?;
     let singleton = if index.files.len() == 1 {
         index.files.keys().next().cloned()
     } else {
@@ -1156,6 +1292,10 @@ fn status(state: &State) -> Result<String, String> {
     let mut report = json!({"format":2,"branch":snapshot.head,"detached":snapshot.detached(),"head":head_id,"index_present":actual.is_some(),"legacy_head_unmapped":unmapped,"legacy_head_byte_len":raw.as_ref().and_then(|r|r.legacy.as_ref().map(Vec::len)),"files":rows,"untracked":untracked,"tracked":singleton,"staged":staged_any,"worktree":if modified{"modified"}else if deleted{"deleted"}else if actual.is_none()&&index.files.is_empty(){"untracked"}else{"clean"}});
     if let Some(pending) = pending {
         report["pending"] = pending_status(&pending, &snapshot.head, head_id);
+    }
+    report["unmerged"] = json!(index.conflicts.iter().map(|(path,stages)|json!({"path":path,"stages":(1..=3).filter(|stage|stages.image(*stage).is_some()).collect::<Vec<_>>()})).collect::<Vec<_>>());
+    if !index.conflicts.is_empty() {
+        report["worktree"] = json!("unmerged");
     }
     json_text(&report)
 }
@@ -1205,6 +1345,7 @@ fn commit(state: &State, args: &[String]) -> Result<String, String> {
         .map(|id| state.revision_index(id, index.legacy_path.as_deref()))
         .transpose()?
         .unwrap_or_else(Index::empty);
+    require_resolved_index(&index)?;
     if !amend
         && !allow_empty
         && head
@@ -1382,6 +1523,9 @@ fn plan(
                 match value {
                     Observed::Absent => break,
                     Observed::Directory => {}
+                    // A missing child beneath a retained regular file needs
+                    // no filesystem update. This occurs in staged D/F sides.
+                    Observed::File(_) if replacement.is_none() => break,
                     Observed::File(_) if owned.contains(&prefix) && !present.contains(&prefix) => {
                         break
                     }
@@ -1405,7 +1549,11 @@ fn plan(
                             &mut directories,
                         )?;
                     }
-                    Observed::Directory if owned.contains(&p) && !has_descendant(&present, &p) => {
+                    Observed::Directory
+                        if owned.contains(&p)
+                            && !has_descendant(&present, &p)
+                            && !has_descendant(owned, &p) =>
+                    {
                         return Err(format!("tracked file was replaced by a directory: {p}"));
                     }
                     Observed::Directory => {}
@@ -1499,6 +1647,7 @@ fn apply_plan(state: &State, prepared: &WorktreePlan) -> Result<(), String> {
 fn clean_index(state: &State) -> Result<Option<Index>, String> {
     let index = state.index()?;
     if let Some(i) = &index {
+        require_resolved_index(i)?;
         let h = state
             .head()?
             .map(|id| state.revision_index(&id, i.legacy_path.as_deref()))
@@ -1525,6 +1674,7 @@ pub fn assert_worktree_target_safe(
         metadata: repo.root.join(".uwgit"),
     };
     if let Some(i) = state.index()? {
+        require_resolved_index(&i)?;
         plan(&state, &keys(&i.files), &files_worktree(files))?;
     }
     Ok(())
@@ -1547,6 +1697,7 @@ pub fn assert_worktree_revision_safe(
     let Some(index) = state.index()? else {
         return Ok(());
     };
+    require_resolved_index(&index)?;
     let mut files = revision.files.clone();
     if let Some(bytes) = &revision.legacy {
         let path = revision
@@ -1619,6 +1770,9 @@ pub fn with_no_pending(
     let state = State::open(root)?;
     let _lock = state.lock()?;
     require_no_pending(&state.repo)?;
+    if let Some(index) = state.index()? {
+        require_resolved_index(&index)?;
+    }
     operation(&state.repo)
 }
 
@@ -1680,6 +1834,7 @@ pub fn with_pending_index(
         "pending --continue requires an existing complete index; stage the full resolution first",
     )?;
     let index = decode_index(&raw)?;
+    require_resolved_index(&index)?;
     operation(
         &state.repo,
         Some(PendingIndex {
@@ -1820,6 +1975,7 @@ pub fn with_index_resolution(
         .index()?
         .ok_or("resolved-index operation requires an existing index")?;
     validate_index(&index)?;
+    require_resolved_index(&index)?;
     operation(&state.repo, &index.files, index.legacy_path.as_deref())
 }
 pub struct FileDiffSnapshot {
@@ -1833,6 +1989,7 @@ pub fn diff_snapshot(root: &str, cached: bool) -> Result<Vec<FileDiffSnapshot>, 
     let state = State::open(root)?;
     let _lock = state.lock()?;
     let index = state.starting_index(None)?;
+    require_resolved_index(&index)?;
     let snapshot = state.repo.state()?;
     let head = snapshot.tip();
     let (old, new, old_kind, new_kind) = if cached {
@@ -1875,6 +2032,7 @@ pub fn diff_index_snapshot(
     let state = State::open(root)?;
     let _lock = state.lock()?;
     let index = state.starting_index(None)?;
+    require_resolved_index(&index)?;
     let old = state.revision_index(revision, index.legacy_path.as_deref())?;
     let new = if cached {
         files_worktree(&index.files)
@@ -2173,7 +2331,7 @@ fn chosen_paths(index: &Index, paths: Vec<String>) -> Result<Vec<String>, String
     let mut unique = BTreeSet::new();
     for p in &paths {
         validate_tree_path(p)?;
-        if !index.files.contains_key(p) {
+        if !index.files.contains_key(p) && !index.conflicts.contains_key(p) {
             return Err(format!("path is not tracked: {p}"));
         }
         if !unique.insert(p.clone()) {
@@ -2208,6 +2366,12 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
         .transpose()?
         .unwrap_or_else(Index::empty);
     for p in &paths {
+        if index.conflicts.contains_key(p) {
+            if !force {
+                return Err("unmerged removal requires explicit --force".into());
+            }
+            continue;
+        }
         let b = index.files.get(p).ok_or("missing tracked path")?;
         let current = state.worktree(p)?;
         if !force
@@ -2231,6 +2395,7 @@ fn remove(state: &State, args: &[String]) -> Result<String, String> {
     };
     for p in &paths {
         index.files.remove(p);
+        index.conflicts.remove(p);
     }
     validate_index(&index)?;
     if let Some(changes) = changes {
@@ -2282,6 +2447,14 @@ fn select_paths(
     wasm_git::pathspec::select(candidates, selectors)
 }
 fn restore(state: &State, args: &[String]) -> Result<String, String> {
+    if args
+        .iter()
+        .skip(2)
+        .take_while(|value| value.as_str() != "--")
+        .any(|value| matches!(value.as_str(), "--ours" | "--theirs"))
+    {
+        return index_plumbing::restore_side(state, args);
+    }
     let mut source = None;
     let mut staged = false;
     let mut work = false;
@@ -2428,6 +2601,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
             .files
             .keys()
             .cloned()
+            .chain(replacement.conflicts.keys().cloned())
             .chain(target.files.keys().cloned())
             .collect()
     };
@@ -2444,6 +2618,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
         let removals: Vec<_> = replacement
             .files
             .keys()
+            .chain(replacement.conflicts.keys())
             .filter(|path| {
                 has_descendant(&selected, path)
                     || path
@@ -2455,12 +2630,16 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
         selected.extend(removals);
     }
     let mut desired = if work {
-        state.snapshot_worktree(replacement.files.keys().cloned())?
+        state.snapshot_worktree(controlled_paths(&replacement))?
     } else {
         Worktree::new()
     };
     for p in &selected {
         validate_tree_path(p)?;
+        if target.conflicts.contains_key(p) {
+            return Err("restore of unmerged paths requires --ours or --theirs".into());
+        }
+        replacement.conflicts.remove(p);
         match target.files.get(p) {
             Some(b) => {
                 replacement.files.insert(p.clone(), b.clone());
@@ -2479,7 +2658,7 @@ fn restore(state: &State, args: &[String]) -> Result<String, String> {
     replacement.legacy_path = legacy_path;
     validate_index(&replacement)?;
     if work {
-        let owned = old.as_ref().map(|i| keys(&i.files)).unwrap_or_default();
+        let owned = old.as_ref().map(controlled_paths).unwrap_or_default();
         let changes = plan(state, &owned, &desired)?;
         apply_plan(state, &changes)?;
     }
@@ -2547,7 +2726,7 @@ fn reset(state: &State, args: &[String]) -> Result<String, String> {
     let changes = if mode == "--hard" {
         Some(plan(
             state,
-            &old.as_ref().map(|i| keys(&i.files)).unwrap_or_default(),
+            &old.as_ref().map(controlled_paths).unwrap_or_default(),
             &files_worktree(&target.as_ref().ok_or("missing reset tree")?.files),
         )?)
     } else {
@@ -2612,15 +2791,11 @@ fn merge_file(
     }
     match (base, ours, theirs) {
         (Some(b), Some(o), Some(t)) => wasm_git::merge::merge(b, o, t)
-            .map_err(|e| format!("stash merge unavailable for {path}: {e}"))?
+            .map_err(|e| format!("Wasm merge unavailable for {path}: {e}"))?
             .bytes
             .map(Some)
-            .ok_or_else(|| {
-                format!("stash conflict at {path}; index/worktree unchanged, stash retained")
-            }),
-        _ => Err(format!(
-            "stash add/delete conflict at {path}; stash retained"
-        )),
+            .ok_or_else(|| format!("Wasm conflict at {path}")),
+        _ => Err(format!("Wasm add/delete conflict at {path}")),
     }
 }
 fn merge_trees(base: &Files, ours: &Files, theirs: &Worktree) -> Result<Worktree, String> {
@@ -2668,6 +2843,7 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
                 || (args.len() == 5 && args[3] == "-m") =>
         {
             let index = state.index()?.ok_or("no index to stash")?;
+            require_resolved_index(&index)?;
             let base = state.head()?.ok_or("cannot stash before first commit")?;
             let target = state.revision_index(&base, index.legacy_path.as_deref())?;
             let paths: BTreeSet<_> = index
@@ -2753,6 +2929,7 @@ fn stash(state: &State, args: &[String]) -> Result<String, String> {
                     .filter_map(|(p, b)| b.map(|b| (p, b)))
                     .collect(),
                 legacy_path: ours.legacy_path.or_else(|| e.index.legacy_path.clone()),
+                conflicts: BTreeMap::new(),
             };
             validate_index(&target)?;
             let changes = plan(state, &keys(&current.files), &worktree)?;

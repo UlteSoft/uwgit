@@ -1782,32 +1782,43 @@ impl Repository {
     }
 
     pub fn archive_files(&self, revision: &str) -> RepositoryResult<ArchiveSnapshot> {
+        self.archive_batch(&[revision.into()])?
+            .pop()
+            .ok_or("missing archive snapshot".into())
+    }
+
+    pub fn archive_batch(&self, revisions: &[String]) -> RepositoryResult<Vec<ArchiveSnapshot>> {
         let _lock = self.lock()?;
         let snapshot = self.snapshot()?;
-        let selected = snapshot_query_tree(&snapshot, revision)?;
-        let mut files = BTreeMap::new();
-        for entry in selected.entries {
-            let Some(Object::Wasm(bytes)) = snapshot.objects.get(&entry.object_id) else {
-                return Err(format!("missing archive Wasm object {}", entry.object_id));
-            };
-            files.insert(entry.path, bytes.clone());
-        }
-        let legacy = selected
-            .legacy
-            .map(|object| match snapshot.objects.get(&object.object_id) {
-                Some(Object::Wasm(bytes)) => Ok(bytes.clone()),
-                _ => Err("missing archive legacy Wasm object".to_owned()),
+        revisions
+            .iter()
+            .map(|revision| {
+                let selected = snapshot_query_tree(&snapshot, revision)?;
+                let mut files = BTreeMap::new();
+                for entry in selected.entries {
+                    let Some(Object::Wasm(bytes)) = snapshot.objects.get(&entry.object_id) else {
+                        return Err(format!("missing archive Wasm object {}", entry.object_id));
+                    };
+                    files.insert(entry.path, bytes.clone());
+                }
+                let legacy = selected
+                    .legacy
+                    .map(|object| match snapshot.objects.get(&object.object_id) {
+                        Some(Object::Wasm(bytes)) => Ok(bytes.clone()),
+                        _ => Err("missing archive legacy Wasm object".to_owned()),
+                    })
+                    .transpose()?;
+                Ok(ArchiveSnapshot {
+                    object_id: selected.object_id,
+                    kind: selected.kind,
+                    commit: selected.commit,
+                    tree: selected.tree,
+                    legacy_path: selected.legacy_path,
+                    legacy,
+                    files,
+                })
             })
-            .transpose()?;
-        Ok(ArchiveSnapshot {
-            object_id: selected.object_id,
-            kind: selected.kind,
-            commit: selected.commit,
-            tree: selected.tree,
-            legacy_path: selected.legacy_path,
-            legacy,
-            files,
-        })
+            .collect()
     }
 
     /// Select local lightweight tags from one verified snapshot. The caller's

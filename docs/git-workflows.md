@@ -38,7 +38,7 @@ add、rm、mv、restore 支持 `--` 路径分隔符；它后面的参数全部�
 | `init DIR` | 创建仓库，拒绝覆盖已有 .uwgit。 |
 | `add DIR FILE...` | 一次预读并检查全部路径，然后发布完整 index；任一参数失败不暂存前面的文件。文件的全部原字节进入 index。 |
 | `status DIR` | JSON format 2，files 按路径列出 staged added/deleted/modified/clean 与工作文件 clean/modified/deleted/untracked；同时列出未跟踪的普通 Core Wasm 文件。 |
-| `ls-files DIR` | 每行一个已建立 index 的路径，按路径排序；没有本地 index 时为空。 |
+| `ls-files DIR` | 列出已建立 index 的路径和实际 stages；支持工作区筛选、格式及忽略规则，见[索引合同](index-stages.md)。没有本地 index 时为空。 |
 | `commit DIR -m MESSAGE` | 提交整个 index，创建 format 2 tree commit；没有变化时报错。 |
 | `commit DIR --allow-empty -m MESSAGE` | 允许不变的树；新仓库也能显式提交真正的空树。 |
 | `commit DIR --amend [-m MESSAGE]` | 用当前 index 替换最新提交，保留其父列表；缺少消息时保留原消息。没有 index 时从已命名 HEAD 树读取。 |
@@ -101,7 +101,7 @@ wasm-git reset ./history -- modules/a.wasm
 
 旧 `checkout DIR REV NEW_FILE [--file PATH]` 仍是独占导出语法；从修订还原已有路径必须明确写 `REV -- PATH`。
 若旧导出的目标本身名为 `--`，使用 `./--` 或绝对路径，避免与路径分隔符混淆。
-分隔符后的 `--file`、`--help` 等都是字面路径，不触发导出或帮助。没有 index 的对象仓库仍不因分支切换自动建立工作区；detached HEAD 和根据文件是否存在猜测模式尚未支持。
+分隔符后的 `--file`、`--help` 等都是字面路径，不触发导出或帮助。没有 index 的对象仓库仍不因分支切换自动建立工作区；detached HEAD 已支持，根据文件是否存在猜测 checkout 模式仍不支持。
 
 reset 缺省 REV 为 HEAD。clone 没有 index 时的普通历史操作保持对象仓库模式，不自动创建工作文件；
 显式 restore --staged --worktree 或 reset --hard 可建立工作区。
@@ -343,3 +343,5 @@ unmerged index stages、交互 rebase、annotated tag、提交签名与自动 GC
 默认冲突不建立操作记录，abort/continue 只用于已显式录制的操作。checkout 已提供显式分支与路径入口，并保留独占导出用法。
 完整已支持/部分支持/缺失矩阵、当前安全用法及实施优先级见 [Git 命令覆盖与当前缺口](git-command-coverage.md)。
 SHA-256 表示内容完整性，不证明作者身份或行为。审计范围见 [README](../README.md)、[patch](patch.md)、[trace](trace.md)。
+
+索引未解决 stages、`restore/checkout --ours/--theirs`、`read-tree -m`、`update-index`、`checkout-index` 和底层列表合同见[原生索引](index-stages.md)。未解决项不能用作完整提交树。

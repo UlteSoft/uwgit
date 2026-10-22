@@ -35,7 +35,11 @@ enum Command {
         nul: bool,
     },
     /// Write the current complete index as immutable objects, keeping HEAD.
-    WriteTree { dir: String },
+    WriteTree {
+        dir: String,
+        #[arg(long)]
+        prefix: Option<String>,
+    },
     /// Replace only the index from a commit/tree, or an explicit empty tree.
     ReadTree {
         dir: String,
@@ -159,7 +163,9 @@ pub fn run(args: &[String]) -> RepositoryResult<QueryOutput> {
             }
             Repository::open(dir)?.create_tree_object(entries)?
         }
-        Command::WriteTree { dir } => crate::porcelain::write_tree(&dir)?,
+        Command::WriteTree { dir, prefix } => {
+            crate::porcelain::write_tree(&dir, prefix.as_deref())?
+        }
         Command::ReadTree {
             dir,
             empty: _,
