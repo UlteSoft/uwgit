@@ -11,6 +11,56 @@ pub enum MergeBaseMode {
 }
 
 impl Repository {
+    /// Hash original index images without installing objects. Prefixes are
+    /// unique across the verified store and every supplied unpublished image,
+    /// including callers' unselected conflict and resolve-undo sides.
+    pub fn query_wasm_image_ids(
+        &self,
+        images: &[&[u8]],
+        minimum: usize,
+    ) -> RepositoryResult<Vec<(String, String)>> {
+        if minimum > 64 {
+            return Err("native object abbreviation must be in 0..=64".into());
+        }
+        let _lock = self.lock()?;
+        let snapshot = self.snapshot()?;
+        let mut all: BTreeSet<String> = snapshot.objects.keys().cloned().collect();
+        let mut selected = Vec::new();
+        for bytes in images {
+            validate_wasm_header(bytes)?;
+            let id = object_id(&encode_object(WASM_KIND, bytes)?);
+            all.insert(id.clone());
+            selected.push(id);
+        }
+        let ordered: Vec<_> = all.iter().collect();
+        let mut shortened = BTreeMap::new();
+        for (position, id) in ordered.iter().enumerate() {
+            let mut length = if minimum == 0 { 64 } else { minimum.max(4) };
+            // Only lexical neighbors can share a longer prefix than these.
+            for other in position
+                .checked_sub(1)
+                .and_then(|i| ordered.get(i))
+                .into_iter()
+                .chain(ordered.get(position + 1))
+            {
+                let shared = id
+                    .bytes()
+                    .zip(other.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                length = length.max(shared + 1);
+            }
+            shortened.insert(id.to_string(), id[..length].to_owned());
+        }
+        Ok(selected
+            .into_iter()
+            .map(|id| {
+                let prefix = shortened[&id].clone();
+                (id, prefix)
+            })
+            .collect())
+    }
+
     pub fn symbolic_head(&self, new: Option<&str>, message: &str) -> RepositoryResult<String> {
         if let Some(branch) = new {
             validate_ref_name(branch)?;

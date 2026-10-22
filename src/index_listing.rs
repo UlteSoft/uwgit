@@ -1,6 +1,8 @@
 //! Index/worktree listings share native path admission and never publish data.
 use super::*;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+#[path = "index_listing_details.rs"]
+mod details;
 
 #[derive(clap::Args)]
 pub(super) struct Args {
@@ -22,6 +24,16 @@ pub(super) struct Args {
     killed: bool,
     #[arg(long)]
     resolve_undo: bool,
+    #[arg(long)]
+    directory: bool,
+    #[arg(long)]
+    no_empty_directory: bool,
+    #[arg(long)]
+    eol: bool,
+    #[arg(long, conflicts_with_all=["stage","unmerged"])]
+    with_tree: Option<String>,
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="12")]
+    abbrev: Option<usize>,
     #[arg(short = 't')]
     tags: bool,
     #[arg(short = 'v', conflicts_with_all=["tags","monitor_tags","format"])]
@@ -42,7 +54,7 @@ pub(super) struct Args {
     exclude_per_directory: Vec<String>,
     #[arg(short = 'z')]
     nul: bool,
-    #[arg(long, conflicts_with_all=["stage","unmerged","others","killed","resolve_undo","tags","json"])]
+    #[arg(long, conflicts_with_all=["stage","unmerged","others","killed","resolve_undo","eol","tags","json"])]
     format: Option<String>,
     #[arg(long)]
     json: bool,
@@ -115,6 +127,14 @@ impl Rules {
         Ok(())
     }
     fn excluded(&mut self, state: &State, path: &str) -> Result<bool, String> {
+        self.excluded_kind(state, path, false)
+    }
+    fn excluded_kind(
+        &mut self,
+        state: &State,
+        path: &str,
+        directory: bool,
+    ) -> Result<bool, String> {
         self.directory(state, "")?;
         let mut ancestors = vec![state.repo.root.clone()];
         let mut prefix = String::new();
@@ -124,7 +144,7 @@ impl Rules {
                 prefix.push('/');
             }
             prefix.push_str(component);
-            let is_dir = number + 1 < components.len();
+            let is_dir = directory || number + 1 < components.len();
             let full = state.repo.root.join(&prefix);
             let explicit = self.extra.matched_path_or_any_parents(&full, is_dir);
             let mut decision = if explicit.is_ignore() {
@@ -163,6 +183,8 @@ struct Row<'a> {
     bytes: Option<&'a Vec<u8>>,
     reason: char,
     undo: bool,
+    directory: bool,
+    historical: bool,
 }
 #[derive(Clone)]
 enum Field {
@@ -187,7 +209,15 @@ fn format_fields(format: &str) -> Result<Vec<Field>, String> {
                 .ok_or("unterminated index format atom")?;
             if !matches!(
                 atom,
-                "objectmode" | "objectname" | "objecttype" | "objectsize" | "stage" | "path"
+                "objectmode"
+                    | "objectname"
+                    | "objecttype"
+                    | "objectsize"
+                    | "stage"
+                    | "path"
+                    | "eolinfo:index"
+                    | "eolinfo:worktree"
+                    | "eolattr"
             ) {
                 return Err(format!("unsupported native index field: {atom}"));
             }
@@ -216,6 +246,9 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
     if options.nul && options.json {
         return Err("-z requires text output".into());
     }
+    if options.abbrev.is_some_and(|minimum| minimum > 64) {
+        return Err("--abbrev requires a number in 0..=64; zero prints complete native IDs".into());
+    }
     let has_excludes = options.exclude_standard
         || !options.excludes.is_empty()
         || !options.exclude_from.is_empty()
@@ -229,9 +262,30 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
     let mut rules = Rules::new(state, &options)?;
     let index = state.index()?.unwrap_or_else(Index::empty);
     let controlled = controlled_paths(&index);
+    let historical = options
+        .with_tree
+        .as_deref()
+        .map(|revision| state.repo.archive_files(revision))
+        .transpose()?;
+    if historical
+        .as_ref()
+        .is_some_and(|tree| tree.legacy.is_some())
+    {
+        return Err("ls-files --with-tree requires a named native tree".into());
+    }
+    let historical_files = historical.as_ref().map(|tree| &tree.files);
+    let view_paths: BTreeSet<_> = controlled
+        .iter()
+        .cloned()
+        .chain(
+            historical_files
+                .into_iter()
+                .flat_map(|files| files.keys().cloned()),
+        )
+        .collect();
     let pathspec = wasm_git::pathspec::Pathspec::new(&options.paths)?;
     if options.error_unmatch {
-        pathspec.select(&controlled)?;
+        pathspec.select(&view_paths)?;
     }
     let cached = !options.unmerged
         && (options.cached
@@ -280,6 +334,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                         'H'
                     },
                     undo: false,
+                    directory: false,
+                    historical: false,
                 });
             }
             if options.deleted && current.is_none() {
@@ -289,6 +345,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     bytes: Some(bytes),
                     reason: 'R',
                     undo: false,
+                    directory: false,
+                    historical: false,
                 });
             }
             if options.modified && current.as_ref() != Some(bytes) {
@@ -298,6 +356,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     bytes: Some(bytes),
                     reason: 'C',
                     undo: false,
+                    directory: false,
+                    historical: false,
                 });
             }
         }
@@ -309,6 +369,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     bytes: None,
                     reason: if index.skipped(path) { 'S' } else { 'H' },
                     undo: false,
+                    directory: false,
+                    historical: false,
                 });
             }
             if options.deleted && current.is_none() && !index.hidden(path) {
@@ -318,6 +380,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     bytes: None,
                     reason: 'R',
                     undo: false,
+                    directory: false,
+                    historical: false,
                 });
             }
             if options.modified && current.is_some() && !index.hidden(path) {
@@ -327,47 +391,53 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     bytes: None,
                     reason: 'C',
                     undo: false,
+                    directory: false,
+                    historical: false,
+                });
+            }
+        }
+    }
+    if let Some(files) = historical_files {
+        for (path, bytes) in files {
+            if controlled.contains(path)
+                || !pathspec.matches(path)
+                || (options.ignored && !rules.excluded(state, path)?)
+            {
+                continue;
+            }
+            let current = if options.deleted || options.modified {
+                state.worktree_module(path)?
+            } else {
+                None
+            };
+            for reason in [
+                cached.then_some('H'),
+                (options.deleted && current.is_none()).then_some('R'),
+                (options.modified && current.as_ref() != Some(bytes)).then_some('C'),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                rows.push(Row {
+                    path: path.clone(),
+                    stage: None,
+                    bytes: Some(bytes),
+                    reason,
+                    undo: false,
+                    directory: false,
+                    historical: true,
                 });
             }
         }
     }
     if options.others || options.killed {
-        for path in worktree_tools::visible_paths(&state.repo.root, false)? {
-            if controlled.contains(&path) || !pathspec.matches(&path) {
-                continue;
-            }
-            let full = state.worktree_path(&path)?;
-            let metadata = fs::symlink_metadata(&full).map_err(|e| e.to_string())?;
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                continue;
-            }
-            if rules.excluded(state, &path)? != options.ignored {
-                continue;
-            }
-            if options.others {
-                rows.push(Row {
-                    path: path.clone(),
-                    stage: None,
-                    bytes: None,
-                    reason: '?',
-                    undo: false,
-                });
-            }
-            if options.killed
-                && (has_descendant(&controlled, &path)
-                    || path
-                        .match_indices('/')
-                        .any(|(offset, _)| controlled.contains(&path[..offset])))
-            {
-                rows.push(Row {
-                    path,
-                    stage: None,
-                    bytes: None,
-                    reason: 'K',
-                    undo: false,
-                });
-            }
-        }
+        rows.extend(details::worktree_rows(
+            state,
+            &options,
+            &mut rules,
+            &view_paths,
+            &pathspec,
+        )?);
     }
     if options.resolve_undo {
         for (path, stages) in &index.resolve_undo {
@@ -382,6 +452,8 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                         bytes: Some(bytes),
                         reason: 'U',
                         undo: true,
+                        directory: false,
+                        historical: false,
                     });
                 }
             }
@@ -404,15 +476,41 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
     {
         rows.dedup_by(|a, b| a.path == b.path);
     }
+    let needs_eol = options.eol
+        || format.as_ref().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| matches!(field, Field::Atom(atom) if atom.starts_with("eol")))
+        });
+    let mut images: Vec<&[u8]> = rows
+        .iter()
+        .filter_map(|row| row.bytes.map(Vec::as_slice))
+        .collect();
+    if options.abbrev.is_some_and(|minimum| minimum != 0) {
+        images.extend(index.files.values().map(Vec::as_slice));
+        for stages in index.conflicts.values().chain(index.resolve_undo.values()) {
+            images.extend((1..=3).filter_map(|stage| stages.image(stage).map(Vec::as_slice)));
+        }
+        if let Some(files) = historical_files {
+            images.extend(files.values().map(Vec::as_slice));
+        }
+    }
+    let mut image_ids = state
+        .repo
+        .query_wasm_image_ids(&images, options.abbrev.unwrap_or(0))?
+        .into_iter();
+    let mut work_eol = BTreeMap::new();
     let mut output = String::new();
     let mut json_rows = Vec::new();
     for row in rows {
-        let id = row
+        let identity = row
             .bytes
-            .map(|bytes| state.repo.hash_payload("wasm", bytes, false))
-            .transpose()?;
-        let monitor = !row.undo && index_flags::monitor_valid(state, &index, &row.path)?;
-        let assume = !row.undo
+            .map(|_| image_ids.next().expect("one identity per selected image"));
+        let id = identity.as_ref().map(|(id, _)| id);
+        let abbreviation = identity.as_ref().map(|(_, abbreviation)| abbreviation);
+        let flags = !row.undo && !row.historical && !row.directory;
+        let monitor = flags && index_flags::monitor_valid(state, &index, &row.path)?;
+        let assume = flags
             && index
                 .flags
                 .get(&row.path)
@@ -423,6 +521,42 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
             json_row["intent_to_add"] = json!(false);
             json_row["skip_worktree"] = json!(false);
         }
+        if row.directory {
+            json_row["directory"] = json!(true);
+        }
+        if row.historical {
+            json_row["source"] = json!("tree");
+            json_row["source_object"] = json!(historical.as_ref().map(|tree| &tree.object_id));
+            json_row["index_entry"] = json!(false);
+            json_row["object_may_be_unpublished"] = json!(false);
+            json_row["intent_to_add"] = json!(false);
+            json_row["skip_worktree"] = json!(false);
+        }
+        if options.abbrev.is_some() {
+            json_row["object_abbrev"] = json!(abbreviation);
+        }
+        let (index_eol, actual_eol) = if needs_eol && !row.undo {
+            let index_eol = if row.historical {
+                ""
+            } else {
+                details::index_eol(row.bytes)?
+            };
+            let actual = if row.directory {
+                ""
+            } else if let Some(value) = work_eol.get(&row.path) {
+                *value
+            } else {
+                let value = details::worktree_eol(state, &row.path)?;
+                work_eol.insert(row.path.clone(), value);
+                value
+            };
+            json_row["eol_index"] = json!(index_eol);
+            json_row["eol_worktree"] = json!(actual);
+            json_row["eol_attribute"] = json!("");
+            (index_eol, actual)
+        } else {
+            ("", "")
+        };
         json_rows.push(json_row);
         if let Some(fields) = &format {
             for field in fields {
@@ -430,7 +564,7 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                     Field::Text(text) => output.push_str(text),
                     Field::Atom(atom) => output.push_str(&match atom.as_str() {
                         "path" => row.path.clone(),
-                        "objectname" => id.clone().unwrap_or_default(),
+                        "objectname" => abbreviation.cloned().unwrap_or_default(),
                         "objectmode" => "100644".into(),
                         "objecttype" => if row.bytes.is_some() {
                             "wasm"
@@ -442,7 +576,13 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                             .bytes
                             .map(|bytes| bytes.len().to_string())
                             .unwrap_or_else(|| "-".into()),
-                        "stage" => row.stage.unwrap_or_default().to_string(),
+                        "stage" => row
+                            .stage
+                            .map(|stage| stage.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        "eolinfo:index" => index_eol.into(),
+                        "eolinfo:worktree" => actual_eol.into(),
+                        "eolattr" => String::new(),
                         _ => unreachable!("validated fields"),
                     }),
                 }
@@ -458,19 +598,30 @@ pub(super) fn run(state: &State, options: Args) -> Result<QueryOutput, String> {
                 output.push(' ');
             }
             if options.stage || options.unmerged || row.undo {
-                if let (Some(id), Some(stage)) = (&id, row.stage) {
+                if let (Some(id), Some(stage)) = (abbreviation, row.stage) {
                     output.push_str(&format!("100644 {id} {stage}\t"));
                 }
                 if !row.undo && index.intents.contains(&row.path) {
                     output.push_str("100644 - 0\t");
                 }
             }
+            if options.eol && !row.undo {
+                output.push_str(&format!(
+                    "i/{index_eol:<5} w/{actual_eol:<5} attr/{:<17}\t",
+                    ""
+                ));
+            }
             output.push_str(&row.path);
         }
         output.push(if options.nul { '\0' } else { '\n' });
     }
     if options.json {
-        QueryOutput::json(json!({"entries":json_rows,"index_format":index.format}))
+        let mut report = json!({"entries":json_rows,"index_format":index.format});
+        if needs_eol {
+            report["eol_policy"] =
+                json!("original_bytes_no_conversion; Git attributes are not applied");
+        }
+        QueryOutput::json(report)
     } else {
         Ok(QueryOutput::new(output, 0))
     }

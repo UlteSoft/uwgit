@@ -65,6 +65,197 @@ fn wasm(value: u8) -> Vec<u8> {
 }
 
 #[test]
+fn native_directory_listing_and_selection_match_independent_git_worktrees() {
+    let temp = Temp::new();
+    let native = temp.path("native-directories");
+    let reference = temp.path("git-directories");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    for root in [&native, &reference] {
+        fs::create_dir_all(root.join("tracked")).unwrap();
+        fs::write(root.join("tracked/a.wasm"), wasm(1)).unwrap();
+    }
+    success(uw(&["add", p(&native), "tracked/a.wasm"]));
+    success(git(&reference, &["add", "tracked/a.wasm"]));
+    for root in [&native, &reference] {
+        for dir in ["empty", "onlyempty/deep", "ignored-empty"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "d/a.wasm",
+            "d/sub/b.wasm",
+            "d/note.txt",
+            "onlyignored/a.tmp",
+            "tracked/extra/a.wasm",
+            "visible/a.tmp",
+            "visible/b.wasm",
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"raw\n").unwrap();
+        }
+        fs::write(root.join(".gitignore"), b"*.tmp\nignored-empty/\n").unwrap();
+    }
+    let queries = [
+        vec!["--others", "--directory"],
+        vec!["--others", "--directory", "--no-empty-directory"],
+        vec!["--others", "--directory", "--exclude-standard"],
+        vec![
+            "--others",
+            "--directory",
+            "--exclude-standard",
+            "--no-empty-directory",
+        ],
+        vec!["--others", "--directory", "--exclude-standard", "-t", "-z"],
+        vec![
+            "--others",
+            "--directory",
+            "--exclude-standard",
+            "--",
+            "d/a.wasm",
+        ],
+        vec!["--others", "--directory", "--exclude-standard", "--", "d/"],
+        vec![
+            "--others",
+            "--directory",
+            "--exclude-standard",
+            "--",
+            "*.wasm",
+        ],
+        vec![
+            "--others",
+            "--directory",
+            "--exclude-standard",
+            "--",
+            "d",
+            ":(exclude)d/a.wasm",
+        ],
+        vec![
+            "--others",
+            "--directory",
+            "--exclude-standard",
+            "--",
+            "tracked",
+        ],
+        vec!["--directory"],
+        vec!["--others", "--no-empty-directory", "--exclude-standard"],
+    ];
+    for query in queries {
+        let mut native_args = vec!["ls-files", p(&native)];
+        native_args.extend_from_slice(&query);
+        let mut git_args = vec!["ls-files"];
+        git_args.extend_from_slice(&query);
+        assert_eq!(
+            success(uw(&native_args)),
+            success(git(&reference, &git_args)),
+            "{query:?}"
+        );
+    }
+}
+
+#[test]
+fn native_raw_eol_observations_and_format_atoms_match_git_without_conversion_attributes() {
+    let temp = Temp::new();
+    let native = temp.path("native-eol");
+    let reference = temp.path("git-eol");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    for root in [&native, &reference] {
+        fs::write(root.join("a.wasm"), wasm(1)).unwrap();
+    }
+    success(uw(&["add", p(&native), "a.wasm"]));
+    success(git(&reference, &["add", "a.wasm"]));
+    success(uw(&[
+        "update-index",
+        p(&native),
+        "--assume-unchanged",
+        "a.wasm",
+    ]));
+    success(git(
+        &reference,
+        &["update-index", "--assume-unchanged", "a.wasm"],
+    ));
+    let cases = vec![
+        vec![],
+        b"plain".to_vec(),
+        b"one\n".to_vec(),
+        b"one\r\n".to_vec(),
+        b"one\r\ntwo\n".to_vec(),
+        b"one\rtwo".to_vec(),
+        b"one\r".to_vec(),
+        b"one\0two\n".to_vec(),
+        b"\x01\n".to_vec(),
+        b"text\x1a".to_vec(),
+        "原始字节\n".as_bytes().to_vec(),
+        [vec![b'x'; 65535], b"\r\n".to_vec()].concat(),
+    ];
+    for bytes in cases {
+        for root in [&native, &reference] {
+            fs::write(root.join("a.wasm"), &bytes).unwrap();
+        }
+        for query in [
+            vec!["--eol"],
+            vec!["--format=%(eolinfo:index)|%(eolinfo:worktree)|%(eolattr)|%(path)"],
+        ] {
+            let mut native_args = vec!["ls-files", p(&native)];
+            native_args.extend_from_slice(&query);
+            let mut git_args = vec!["ls-files"];
+            git_args.extend_from_slice(&query);
+            assert_eq!(
+                success(uw(&native_args)),
+                success(git(&reference, &git_args)),
+                "{query:?}, input {} bytes",
+                bytes.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn native_with_tree_names_and_admission_match_git_without_publishing_index_changes() {
+    let temp = Temp::new();
+    let native = temp.path("native-with-tree");
+    let reference = temp.path("git-with-tree");
+    success(uw(&["init", p(&native)]));
+    fs::create_dir(&reference).unwrap();
+    success(git(&reference, &["init", "-b", "main"]));
+    for root in [&native, &reference] {
+        for file in ["a.wasm", "gone.wasm"] {
+            fs::write(root.join(file), wasm(1)).unwrap();
+        }
+    }
+    success(uw(&["add", p(&native), "a.wasm", "gone.wasm"]));
+    success(uw(&["commit", p(&native), "-m", "source tree"]));
+    success(git(&reference, &["add", "a.wasm", "gone.wasm"]));
+    success(git(&reference, &["commit", "-m", "source tree"]));
+    success(uw(&["rm", p(&native), "--cached", "gone.wasm"]));
+    success(git(&reference, &["rm", "--cached", "gone.wasm"]));
+    for query in [
+        vec!["--with-tree=HEAD"],
+        vec!["--with-tree=HEAD", "-z"],
+        vec!["--with-tree=HEAD", "--others"],
+        vec!["--with-tree=HEAD", "--error-unmatch", "--", "gone.wasm"],
+        vec!["--with-tree=HEAD", "--format=%(path)", "--", "gone.wasm"],
+    ] {
+        let before = fs::read(native.join(".uwgit/index")).unwrap();
+        let git_before = fs::read(reference.join(".git/index")).unwrap();
+        let mut native_args = vec!["ls-files", p(&native)];
+        native_args.extend_from_slice(&query);
+        let mut git_args = vec!["ls-files"];
+        git_args.extend_from_slice(&query);
+        assert_eq!(
+            success(uw(&native_args)),
+            success(git(&reference, &git_args)),
+            "{query:?}"
+        );
+        assert_eq!(fs::read(native.join(".uwgit/index")).unwrap(), before);
+        assert_eq!(fs::read(reference.join(".git/index")).unwrap(), git_before);
+    }
+}
+
+#[test]
 fn native_resolve_undo_matches_git_for_all_original_side_masks_and_deleted_resolutions() {
     fn input(root: &Path, native: bool, args: &[&str], bytes: &[u8]) -> Output {
         let mut command = if native {

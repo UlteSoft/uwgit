@@ -47,6 +47,10 @@ wasm-git ls-files DIR --others --exclude-standard
 wasm-git ls-files DIR --others --ignored --exclude-standard
 wasm-git ls-files DIR --killed -t
 wasm-git ls-files DIR --format='%(objecttype) %(objectname) %(stage)%x09%(path)'
+wasm-git ls-files DIR --others --directory --no-empty-directory --exclude-standard
+wasm-git ls-files DIR --stage --abbrev=8
+wasm-git ls-files DIR --with-tree HEAD --error-unmatch -- modules/removed.wasm
+wasm-git ls-files DIR --eol
 ```
 
 `-m/--modified` 比较工作原字节与对应 stage，删除也算修改；`-d/--deleted` 选择工作侧缺席的模块。
@@ -62,9 +66,50 @@ wasm-git ls-files DIR --format='%(objecttype) %(objectname) %(stage)%x09%(path)'
 
 列表查询默认允许没有匹配的选择器，以空结果表示；`--error-unmatch` 要求每个正向选择器在 index 内匹配。
 这个只读查询合同不放宽 add/restore/read-tree 等写命令的严格选择规则。
-`--format` 支持 objectmode、objecttype、objectname、objectsize、stage、path，及 `%%`、ASCII `%xNN`；
-objecttype 是真实的 wasm。未知字段或 modifier 拒绝，不生成 EOL/作者等不存在的信息。
-它不能组合 stage/unmerged、others/killed、resolve-undo、标签或 JSON 输出。
+`--format` 支持 objectmode、objecttype、objectname、objectsize、stage、path、eolinfo:index、eolinfo:worktree、eolattr，及 `%%`、ASCII `%xNN`；
+objecttype 是真实的 wasm。未知字段或 modifier 拒绝，不生成作者等未保存的信息。
+它不能组合 stage/unmerged、others/killed、resolve-undo、eol、标签或 JSON 输出。
+
+### 目录、唯一缩写与历史树视图
+
+`--others --directory` 将整体未受控、符合当前选择和忽略规则的目录折叠为带末尾 `/` 的一行。
+已暂存、intent 或未解决路径占用的目录不会整层折叠，但其未受控子目录可以折叠。
+精确子文件或只匹配文件名的 glob 会继续列该文件；明确选择目录时可输出目录行。
+精确路径查询不加载无关子目录的排除文件；目录折叠只加载判定所需子树的规则。
+`--no-empty-directory` 只在 directory/others 组合中生效，省略没有符合当前选择和忽略类别的普通文件的目录。
+默认允许空目录和只有忽略内容的未忽略目录，指定 exclude-standard 后仍保护已忽略父目录。
+ignored 模式可折叠明确忽略的目录或全部可见文件都被忽略的目录，每个目录只输出一行；这与 Git 某些 ignored/directory 组合的重复行行为不同。
+含未检查的嵌套仓库、symlink 或特殊文件时，祖先不折叠，继续列出可检查的普通文件；不跟随这些边界。
+目录 JSON 标记 `directory: true`，没有对象 ID、stage 或 Wasm 图像；这些目录不是新建的树对象。
+
+`--abbrev[=N]` 缩写 stage/resolve-undo 输出和 format 的 objectname。省略 N 时使用 12，范围 0..64；
+非零最少 4 位，0 使用完整 64 位原生 ID。前缀在已验证对象库的所有对象种类和完整索引图像中唯一，
+包括没有选中的 stages、resolve-undo 以及尚未发布的 stage 0；重复图像不制造歧义。
+发生碰撞时自动延长到可区分的最短长度，不为缩写发布对象。JSON 始终保留完整 object_id，并另给 object_abbrev。
+
+`--with-tree REV` 从一次已验证的命名 commit/tree 视图补入当前 index 缺失的路径，支持修订解析和直接树 ID。
+同名的真实 index 条目、flags、intent 或 conflict 优先；不保存新 index，不物化文件，不移动 HEAD。
+error-unmatch 使用真实 index 与历史树路径的并集，未匹配仍在输出任何行前失败。
+树补充项在 JSON 中标记 `source: "tree"`、`source_object`、`index_entry: false` 和 null stage，format 的 stage 为 `-`。
+不同来源的文件/目录前缀可同时出现在这个查询视图中，不会成为可发布的冲突索引。
+with-tree 与 stage/unmerged 互斥；旧未命名历史没有可猜测的路径，明确拒绝。
+
+### 原字节 EOL 观察
+
+`--eol` 为各普通来源行附上 `i/INDEX w/WORK attr/`；可与 stage、标签、NUL 或 JSON 组合。
+format 的 `%(eolinfo:index)`、`%(eolinfo:worktree)` 和 `%(eolattr)` 提供同一观察；format 与 --eol 互斥。
+原字节分为 `none`、`lf`、`crlf`、`mixed` 或二进制 `-text`，包含 NUL 的 Wasm 图像因此为 `-text`。
+裸 CR 和较高比例的非文本控制字节也为 `-text`；文件末尾的 DOS EOF 不单独算二进制证据。
+工作文件按流读取，跨块 CRLF 不拆开；不做转码、行尾规范化或模块重写。
+
+EOL 始终观察真实工作文件，包含 assume/skip 路径上的脏字节。缺席、目录、symlink 或非普通工作侧为空；
+symlink 父路径也不跟随。intent 没有索引图像，因此 i/ 为空；历史树补充项同样不伪装为索引内容。
+resolve-undo 的文本行继续只显示真实 side/ID，不附工作侧 EOL。
+uwgit 的 Wasm 模型没有文本转换属性：eolattr/attr 为空，`.gitattributes`、Git 全局配置及 autocrlf 不参与转换。
+JSON 的 eol_index/eol_worktree/eol_attribute 和 eol_policy 明确给出这个范围；它不是属性或内容规范化实现。
+
+只读回归见 [index_listing_cli.rs](../tests/index_listing_cli.rs)，包含完整失败保持、未发布/跨对象种类碰撞、边界目录、
+历史树来源及原字节观察；[独立 Git 对照](../tests/git_reference_cli.rs) 覆盖普通目录折叠、选择器、原字节 EOL 与历史路径准入。
 
 ## 从索引物化及导出
 
@@ -143,7 +188,7 @@ clean 将未解决路径视为受控文件，不能当作 untracked 删除。
 老客户端不认识格式 3 时必须拒绝，不能丢弃 stages。不可变 Wasm/tree/commit 对象编码和 ID 不变。
 
 stages 可由 read-tree、update-index 或录制的 merge/pick/revert/rebase 队列建立。
-索引 flags、intent-to-add 见[索引标志](index-flags.md)；稀疏 index、ls-files 的 directory/abbrev/EOL 等剩余选项仍见[能力矩阵](git-command-coverage.md)。
+索引 flags、intent-to-add 见[索引标志](index-flags.md)；稀疏 index、Git 属性转换和其他剩余选项仍见[能力矩阵](git-command-coverage.md)。
 接口参考 [Git ls-files](https://git-scm.com/docs/git-ls-files) 与 [Git checkout-index](https://git-scm.com/docs/git-checkout-index)，对象及数据持久化继续使用 uwgit。
 
 索引 version 4、assume/skip/图像有效性标志、intent-to-add 与 commit -a 见[原生索引标志](index-flags.md)。

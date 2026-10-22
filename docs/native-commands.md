@@ -24,6 +24,7 @@ wasm-git rev-list DIR --count OLD..NEW
 
 `write-tree` 从完整且没有未解决项的 index 发布不可变对象，不移动 HEAD 或修改 index。`read-tree` 默认只替换 index；另支持 `-m BASE [OURS] THEIRS` 原生 stages、`--prefix`、`-u` 和 dry-run。`ls-files` 筛选/格式、`checkout-index` 原字节物化与临时侧图像、`update-index`、原生 `merge-index` 及 `restore/checkout --ours/--theirs` 的完整合同见[索引与冲突 stages](index-stages.md)。旧未命名模块需先通过现有 restore 流程建立明确路径。
 冲突解决另保存原生 version 5 撤回记录；`ls-files --resolve-undo`、`update-index --unresolve/--clear-resolve-undo` 只查询或修改 index，保留工作 Wasm 字节。范围见[索引撤回](index-stages.md#解决记录与索引撤回)。
+ls-files 另支持目录折叠、跨对象及未发布图像的唯一缩写、with-tree 历史路径补充、原字节 EOL 和对应 format atoms；这些只读查询不转换 Wasm 内容。范围见[索引查询](index-stages.md#目录唯一缩写与历史树视图)。
 
 `commit-tree` 不更新引用；可重复 `-p`、`-m`，消息之间保留空行。`update-ref` 的旧值是原子比较条件；64 个零代表要求引用不存在。引用必须指向实际 commit；已检出的分支受保护。单引用和 `--stdin` 批量更新都使用共享锁下的持久事务；支持 update/create/delete/verify、NUL、start/prepare/commit/abort、--batch-updates/-0 逐项拒绝，以及中断后的引用/upstream/reflog 幂等恢复。完整协议、限制与验证见[引用事务](ref-transactions.md)。
 
